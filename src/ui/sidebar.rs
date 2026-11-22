@@ -229,6 +229,7 @@ pub fn render_sidebar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> impl Into
                 let rel = hit.rel_path.clone();
                 let line = hit.line_text.clone();
                 let line_num = hit.line_num;
+                let is_title = hit.is_title_match;
 
                 div()
                     .id(("search-hit", ix))
@@ -248,20 +249,31 @@ pub fn render_sidebar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> impl Into
                             .child(
                                 h_flex()
                                     .justify_between()
+                                    .gap_2()
                                     .child(
                                         div()
+                                            .flex_1()
+                                            .min_w_0()
                                             .text_xs()
                                             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                                             .text_color(hex_color(kd::BLUE))
                                             .truncate()
                                             .child(rel),
                                     )
-                                    .child(
+                                    .child(if is_title {
                                         div()
+                                            .flex_shrink_0()
+                                            .text_xs()
+                                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                            .text_color(hex_color(kd::GREEN))
+                                            .child("Title")
+                                    } else {
+                                        div()
+                                            .flex_shrink_0()
                                             .text_xs()
                                             .text_color(fg_muted)
-                                            .child(format!("L{line_num}")),
-                                    ),
+                                            .child(format!("L{line_num}"))
+                                    }),
                             )
                             .child(
                                 div()
@@ -273,6 +285,7 @@ pub fn render_sidebar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> impl Into
                     )
             });
 
+            let has_query = app.search_input.read(cx).value().trim().chars().count() >= 2;
             v_flex()
                 .flex_1()
                 .min_h_0()
@@ -299,7 +312,11 @@ pub fn render_sidebar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> impl Into
                                 .p_3()
                                 .text_xs()
                                 .text_color(fg_muted)
-                                .child("Type 2+ characters to search across notes, Typst docs, CSVs, and configs.")
+                                .child(if has_query {
+                                    "No title or content matches found."
+                                } else {
+                                    "Type 2+ characters to search titles and contents across notes, Typst docs, CSVs, and configs."
+                                })
                                 .into_any_element()
                         } else {
                             v_flex().gap_0p5().children(hit_rows).into_any_element()

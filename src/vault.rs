@@ -193,6 +193,7 @@ pub struct SearchHit {
     pub rel_path: String,
     pub line_num: usize,
     pub line_text: String,
+    pub is_title_match: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -630,18 +631,69 @@ fn extract_wikilink_targets(line: &str) -> Vec<String> {
     out
 }
 
+fn first_preview_line(content: &str, is_md: bool) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut start_idx = 0;
+
+    if is_md && lines.first().is_some_and(|l| l.trim() == "---") {
+        for (i, line) in lines.iter().enumerate().skip(1) {
+            if line.trim() == "---" || line.trim() == "..." {
+                start_idx = i + 1;
+                break;
+            }
+        }
+    }
+
+    lines
+        .iter()
+        .skip(start_idx)
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .map(|l| l.chars().take(140).collect())
+}
+
+fn score_title_match(
+    rel_path: &str,
+    name: &str,
+    stem: &str,
+    q: &str,
+    q_tokens: &[&str],
+) -> Option<i32> {
+    let name_l = name.to_lowercase();
+    let stem_l = stem.to_lowercase();
+    let rel_l = rel_path.to_lowercase();
+
+    if stem_l == q || name_l == q {
+        Some(10_000)
+    } else if stem_l.starts_with(q) || name_l.starts_with(q) {
+        Some(5_000 - (name_l.len() as i32))
+    } else if let Some(pos) = name_l.find(q) {
+        Some(3_000 - (pos as i32 * 4) - (name_l.len() as i32))
+    } else if q_tokens.len() > 1 && q_tokens.iter().all(|t| name_l.contains(t)) {
+        Some(2_000 - (name_l.len() as i32))
+    } else if let Some(pos) = rel_l.find(q) {
+        Some(1_500 - (pos as i32 * 2) - (rel_l.len() as i32))
+    } else if q_tokens.len() > 1 && q_tokens.iter().all(|t| rel_l.contains(t)) {
+        Some(1_000 - (rel_l.len() as i32))
+    } else {
+        None
+    }
+}
+
 pub fn search_content(
     root: &Path,
     query: &str,
     show_hidden: bool,
     max_hits: usize,
 ) -> Vec<SearchHit> {
-    let q = query.trim().to_ascii_lowercase();
-    if q.len() < 2 {
+    let q = query.trim().to_lowercase();
+    if q.chars().count() < 2 || max_hits == 0 {
         return Vec::new();
     }
+    let q_tokens: Vec<&str> = q.split_whitespace().collect();
 
-    let mut hits = Vec::new();
+    let mut title_hits: Vec<(i32, SearchHit)> = Vec::new();
+    let mut content_hits: Vec<SearchHit> = Vec::new();
     let is_unity = is_unity_project(root);
     let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
         let name = e.file_name().to_string_lossy();
@@ -657,45 +709,97 @@ pub fn search_content(
             continue;
         }
         let path = entry.path();
-        let kind = detect_file_kind(path);
-        if matches!(kind, FileKind::Image)
-            || path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("xlsx"))
-        {
-            continue;
-        }
-        if let Ok(meta) = entry.metadata()
-            && meta.len() > 2 * 1024 * 1024
-        {
-            continue;
-        }
-        let Ok(content) = fs::read_to_string(path) else {
-            continue;
-        };
         let rel_path = path
             .strip_prefix(root)
             .unwrap_or(path)
             .to_string_lossy()
             .to_string();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(name);
+        let title_score = score_title_match(&rel_path, name, stem, &q, &q_tokens);
 
-        for (idx, line) in content.lines().enumerate() {
-            if line.to_ascii_lowercase().contains(&q) {
-                hits.push(SearchHit {
+        let kind = detect_file_kind(path);
+        let is_image = matches!(kind, FileKind::Image);
+        let is_xlsx = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("xlsx"));
+        let within_size = entry
+            .metadata()
+            .map(|m| m.len() <= 2 * 1024 * 1024)
+            .unwrap_or(false);
+
+        let content_opt = if !is_image
+            && !is_xlsx
+            && within_size
+            && (title_score.is_some() || content_hits.len() < max_hits)
+        {
+            fs::read_to_string(path).ok()
+        } else {
+            None
+        };
+
+        if let Some(score) = title_score {
+            let is_md = matches!(kind, FileKind::Markdown | FileKind::Mdx);
+            let line_text = content_opt
+                .as_deref()
+                .and_then(|c| first_preview_line(c, is_md))
+                .unwrap_or_else(|| {
+                    if is_image {
+                        "Image".to_string()
+                    } else if is_xlsx {
+                        "Spreadsheet".to_string()
+                    } else {
+                        "Title match".to_string()
+                    }
+                });
+            title_hits.push((
+                score,
+                SearchHit {
                     path: path.to_path_buf(),
                     rel_path: rel_path.clone(),
-                    line_num: idx + 1,
-                    line_text: line.trim().chars().take(140).collect(),
-                });
-                if hits.len() >= max_hits {
-                    return hits;
+                    line_num: 0,
+                    line_text,
+                    is_title_match: true,
+                },
+            ));
+        }
+
+        if content_hits.len() < max_hits
+            && let Some(content) = content_opt.as_deref()
+        {
+            for (idx, line) in content.lines().enumerate() {
+                if line.to_lowercase().contains(&q) {
+                    content_hits.push(SearchHit {
+                        path: path.to_path_buf(),
+                        rel_path: rel_path.clone(),
+                        line_num: idx + 1,
+                        line_text: line.trim().chars().take(140).collect(),
+                        is_title_match: false,
+                    });
+                    if content_hits.len() >= max_hits {
+                        break;
+                    }
                 }
             }
         }
     }
 
-    hits
+    title_hits.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.rel_path.to_lowercase().cmp(&b.1.rel_path.to_lowercase()))
+    });
+
+    let mut out: Vec<SearchHit> = title_hits.into_iter().map(|(_, hit)| hit).collect();
+    out.extend(content_hits);
+    out.truncate(max_hits);
+    out
 }
 
 pub fn extract_headings(content: &str, is_typst: bool) -> Vec<OutlineHeading> {
@@ -938,5 +1042,67 @@ mod tests {
         assert!(!is_ignored_dir_for_root("Library", 2, true, false));
         assert!(!is_ignored_dir_for_root("Library", 1, false, false));
         assert!(is_ignored_dir_for_root("obj", 2, false, false));
+    }
+
+    #[test]
+    fn searches_both_titles_and_content_with_title_priority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Exact title match without query in body (plus YAML frontmatter preview skip)
+        fs::write(
+            root.join("Alpha.md"),
+            "---\ntags: [notes]\n---\n\nFirst body summary line\n",
+        )
+        .unwrap();
+
+        // Partial title match
+        fs::write(root.join("AlphaNotes.md"), "Body does not mention it").unwrap();
+
+        // Multi-word filename match with underscore
+        fs::write(root.join("Raid_Prep.md"), "Flasks and food\n").unwrap();
+
+        // Image filename match (no text body)
+        fs::write(root.join("alpha_banner.png"), [0x89, 0x50, 0x4E, 0x47]).unwrap();
+
+        // Content-only match
+        fs::write(
+            root.join("Zed.md"),
+            "Mentioning alpha inside content only\nAnother alpha line\n",
+        )
+        .unwrap();
+
+        let hits = search_content(root, "alpha", false, 20);
+        assert!(hits.len() >= 4);
+
+        // Title hits rank ahead of content hits, exact match first
+        assert_eq!(hits[0].rel_path, "Alpha.md");
+        assert!(hits[0].is_title_match);
+        assert_eq!(hits[0].line_num, 0);
+        assert_eq!(hits[0].line_text, "First body summary line");
+
+        assert!(hits[1].is_title_match);
+        assert_eq!(hits[1].rel_path, "AlphaNotes.md");
+
+        assert!(hits.iter().any(|h| h.is_title_match && h.rel_path == "alpha_banner.png" && h.line_text == "Image"));
+        assert!(hits.iter().any(|h| !h.is_title_match && h.rel_path == "Zed.md" && h.line_num == 1));
+
+        // Multi-word title match on underscore filename
+        let multi = search_content(root, "raid prep", false, 10);
+        assert_eq!(multi.len(), 1);
+        assert!(multi[0].is_title_match);
+        assert_eq!(multi[0].rel_path, "Raid_Prep.md");
+
+        // Title match still surfaces even when max_hits would otherwise be exhausted by content matches
+        fs::write(
+            root.join("aaa_filler.md"),
+            "omega 1\nomega 2\nomega 3\nomega 4\nomega 5\n",
+        )
+        .unwrap();
+        fs::write(root.join("zzz_omega.md"), "no keyword in body\n").unwrap();
+        let capped = search_content(root, "omega", false, 3);
+        assert_eq!(capped.len(), 3);
+        assert!(capped[0].is_title_match);
+        assert_eq!(capped[0].rel_path, "zzz_omega.md");
     }
 }

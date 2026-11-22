@@ -7,10 +7,46 @@ use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{Sizable as _, h_flex};
 use gpui_kit::{
-    Context, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton, ParentElement,
-    SharedString, StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _, px,
+    AppContext as _, Context, FontWeight, Hsla, InteractiveElement as _, IntoElement,
+    MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled,
+    Window, div, prelude::FluentBuilder as _, px,
 };
 use std::path::Path;
+
+#[derive(Clone)]
+struct DraggedWorkspace {
+    from_idx: usize,
+    name: String,
+    accent: Hsla,
+}
+
+struct DraggedWorkspacePreview {
+    name: String,
+    accent: Hsla,
+}
+
+impl Render for DraggedWorkspacePreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .h(px(28.))
+            .px_3()
+            .gap_1p5()
+            .items_center()
+            .rounded(px(6.))
+            .bg(hex_color(kd::BG_SIDEBAR))
+            .border_1()
+            .border_color(self.accent)
+            .opacity(0.92)
+            .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(self.accent))
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(hex_color(kd::FG))
+                    .child(self.name.clone()),
+            )
+    }
+}
 
 pub fn preset_accent_color(preset: WorkspacePreset) -> Hsla {
     match preset {
@@ -59,6 +95,7 @@ pub fn render_workspace_bar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> imp
         let dirty = app.workspace_has_dirty_tabs(idx);
         let ws_id = ws.id.clone();
         let ws_name = ws.name.clone();
+        let ws_name_drag = ws.name.clone();
         let ws_name_menu = ws.name.clone();
         let ws_name_ren = ws.name.clone();
         let ws_root_tip = ws.root.display().to_string();
@@ -82,6 +119,37 @@ pub fn render_workspace_bar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> imp
             })
             .bg(if is_active { active_bg } else { deep_bg })
             .hover(move |s| if is_active { s } else { s.bg(panel_bg) })
+            .on_drag(
+                DraggedWorkspace {
+                    from_idx: idx,
+                    name: ws_name_drag,
+                    accent,
+                },
+                |drag, _, _, cx| {
+                    cx.new(|_| DraggedWorkspacePreview {
+                        name: drag.name.clone(),
+                        accent: drag.accent,
+                    })
+                },
+            )
+            .drag_over::<DraggedWorkspace>(move |style, drag, _, _| {
+                if drag.from_idx == idx {
+                    style
+                } else if drag.from_idx > idx {
+                    style
+                        .border_l_2()
+                        .border_color(hex_color(kd::BLUE))
+                        .bg(panel_bg)
+                } else {
+                    style
+                        .border_r_2()
+                        .border_color(hex_color(kd::BLUE))
+                        .bg(panel_bg)
+                }
+            })
+            .on_drop(cx.listener(move |this, drag: &DraggedWorkspace, _, cx| {
+                this.reorder_workspace(drag.from_idx, idx, cx);
+            }))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.switch_workspace(idx, window, cx);
             }))
@@ -222,27 +290,46 @@ pub fn render_workspace_bar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> imp
                         .gap_1()
                         .items_end()
                         .overflow_x_scrollbar()
-                        .children(ws_tabs),
-                )
-                .child(
-                    div().pb(px(3.)).flex_shrink_0().child(
-                        Button::new("ws-add-btn")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Plus)
-                            .tooltip("New Workspace (Ctrl+Alt+N)")
-                            .on_click({
-                                let app_add = app_entity.clone();
-                                move |_, window, cx| {
-                                    modals::open_new_workspace_dialog(
-                                        app_add.clone(),
-                                        default_add_root.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                }
-                            }),
-                    ),
+                        .children(ws_tabs)
+                        .child(
+                            div()
+                                .pb(px(3.))
+                                .flex_shrink_0()
+                                .on_drop(cx.listener(move |this, drag: &DraggedWorkspace, _, cx| {
+                                    let last = this.workspaces.len().saturating_sub(1);
+                                    this.reorder_workspace(drag.from_idx, last, cx);
+                                }))
+                                .child(
+                                    Button::new("ws-add-btn")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Plus)
+                                        .tooltip("New Workspace (Ctrl+Alt+N)")
+                                        .on_click({
+                                            let app_add = app_entity.clone();
+                                            move |_, window, cx| {
+                                                modals::open_new_workspace_dialog(
+                                                    app_add.clone(),
+                                                    default_add_root.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .h_full()
+                                .drag_over::<DraggedWorkspace>(move |style, _, _, _| {
+                                    style.border_l_2().border_color(hex_color(kd::BLUE))
+                                })
+                                .on_drop(cx.listener(move |this, drag: &DraggedWorkspace, _, cx| {
+                                    let last = this.workspaces.len().saturating_sub(1);
+                                    this.reorder_workspace(drag.from_idx, last, cx);
+                                })),
+                        ),
                 ),
         )
         .child(

@@ -1039,6 +1039,13 @@ impl VKarmaApp {
         cx.notify();
     }
 
+    pub fn reorder_workspace(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if reorder_with_active(&mut self.workspaces, &mut self.active_workspace, from, to) {
+            self.persist_workspaces();
+            cx.notify();
+        }
+    }
+
     pub fn remove_workspace(
         &mut self,
         idx: usize,
@@ -1141,7 +1148,7 @@ impl VKarmaApp {
     }
 
     pub fn run_vault_search(&mut self, query: String, cx: &mut Context<Self>) {
-        if query.trim().len() < 2 {
+        if query.trim().chars().count() < 2 {
             self.search_hits.clear();
             cx.notify();
             return;
@@ -1149,6 +1156,7 @@ impl VKarmaApp {
         let root = self.workspace_root.clone();
         let show_hidden = self.config.show_hidden_files;
         let ws_gen = self.workspace_gen;
+        let query_snap = query.clone();
 
         cx.spawn(async move |this, cx| {
             let hits = cx
@@ -1156,7 +1164,9 @@ impl VKarmaApp {
                 .spawn(async move { search_content(&root, &query, show_hidden, 200) })
                 .await;
             let _ = this.update(cx, |app, cx| {
-                if app.workspace_gen == ws_gen {
+                if app.workspace_gen == ws_gen
+                    && app.search_input.read(cx).value().as_ref() == query_snap.as_str()
+                {
                     app.search_hits = hits;
                     cx.notify();
                 }
@@ -4260,6 +4270,27 @@ fn splice_list_diff(
     live_scrollbar.splice_blocks(prefix..old_end, Arc::clone(new_blocks), prefix..new_end);
 }
 
+pub(crate) fn reorder_with_active<T>(
+    items: &mut Vec<T>,
+    active: &mut usize,
+    from: usize,
+    to: usize,
+) -> bool {
+    if from >= items.len() || to >= items.len() || from == to {
+        return false;
+    }
+    let item = items.remove(from);
+    items.insert(to, item);
+    if *active == from {
+        *active = to;
+    } else if from < *active && *active <= to {
+        *active -= 1;
+    } else if to <= *active && *active < from {
+        *active += 1;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4313,5 +4344,41 @@ mod tests {
         assert_eq!(h.entries.len(), MAX_NAV_HISTORY);
         assert_eq!(h.entries.first().unwrap().path, PathBuf::from("/tmp/doc-12.md"));
         assert!(!h.can_forward());
+    }
+
+    #[test]
+    fn reorder_with_active_updates_order_and_tracks_active_index() {
+        // Drag inactive item right across active
+        let mut items = vec!["A", "B", "C", "D"];
+        let mut active = 1; // "B"
+        assert!(reorder_with_active(&mut items, &mut active, 0, 2));
+        assert_eq!(items, vec!["B", "C", "A", "D"]);
+        assert_eq!(items[active], "B");
+        assert_eq!(active, 0);
+
+        // Drag active item right to the end
+        assert!(reorder_with_active(&mut items, &mut active, 0, 3));
+        assert_eq!(items, vec!["C", "A", "D", "B"]);
+        assert_eq!(items[active], "B");
+        assert_eq!(active, 3);
+
+        // Drag active item left
+        assert!(reorder_with_active(&mut items, &mut active, 3, 1));
+        assert_eq!(items, vec!["C", "B", "A", "D"]);
+        assert_eq!(items[active], "B");
+        assert_eq!(active, 1);
+
+        // Drag inactive item from right to left across active
+        assert!(reorder_with_active(&mut items, &mut active, 3, 0));
+        assert_eq!(items, vec!["D", "C", "B", "A"]);
+        assert_eq!(items[active], "B");
+        assert_eq!(active, 2);
+
+        // Same-index and out-of-bounds are no-ops
+        assert!(!reorder_with_active(&mut items, &mut active, 2, 2));
+        assert!(!reorder_with_active(&mut items, &mut active, 0, 99));
+        assert!(!reorder_with_active(&mut items, &mut active, 99, 0));
+        assert_eq!(items, vec!["D", "C", "B", "A"]);
+        assert_eq!(active, 2);
     }
 }
