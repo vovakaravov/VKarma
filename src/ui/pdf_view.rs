@@ -14,6 +14,7 @@ use std::process::{Command, Stdio};
 pub fn render_pdf_tab(
     side: PaneSide,
     tab: &super::DocumentTab,
+    zen_mode: bool,
     cx: &mut Context<VKarmaApp>,
 ) -> impl IntoElement {
     let TabKind::Pdf {
@@ -196,7 +197,7 @@ pub fn render_pdf_tab(
     v_flex()
         .size_full()
         .bg(hex_color(kd::BG_DEEP))
-        .child(header)
+        .when(!zen_mode, |this| this.child(header))
         .when_some(last_error, |this, err| {
             this.child(
                 div()

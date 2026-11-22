@@ -59,6 +59,8 @@ pub fn render_right_panel(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> impl 
                     TabKind::Markdown { headings, .. }
                     | TabKind::Typst { headings, .. }
                     | TabKind::Fountain { headings, .. } => headings.clone(),
+                    TabKind::Office { doc, .. } => doc.headings.clone(),
+                    TabKind::Epub { view, .. } => view.read(cx).outline_headings(),
                     _ => Vec::new(),
                 },
                 None => Vec::new(),

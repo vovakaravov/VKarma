@@ -2,7 +2,7 @@ use super::{NewItemTemplate, PaneSide, QuickSwitcherState, TabKind, VKarmaApp, f
 use crate::config::WorkspacePreset;
 use crate::spreadsheet::SpreadsheetDoc;
 use crate::theme::{hex_alpha, hex_color, kd};
-use crate::vault::{create_new_file, create_new_folder, delete_entry, rename_entry};
+use crate::vault::{create_new_file, create_new_folder, delete_entry};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
@@ -253,6 +253,33 @@ pub fn open_new_item_dialog(
                         .unwrap_or("Note");
                     create_new_file(&dest, &format!("# {title}\n\n"))
                 }
+                NewItemTemplate::Canvas => {
+                    let mut doc = crate::formats::canvas::CanvasDoc::default();
+                    let title = dest
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Canvas");
+                    doc.add_text_node(0.0, 0.0, format!("# {title}\n\nDouble-click to edit card."));
+                    create_new_file(&dest, &doc.to_json_pretty())
+                }
+                NewItemTemplate::Kanban => {
+                    let title = dest
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Board");
+                    let starter = format!(
+                        "# {title}\n\n## Todo\n- [ ] First task\n\n## Doing\n\n## Done\n"
+                    );
+                    create_new_file(&dest, &starter)
+                }
+                NewItemTemplate::Mermaid => {
+                    let starter = "flowchart TD\n    A[Start] --> B{Ready?}\n    B -->|Yes| C([Launch])\n    B -->|No| D[(Revise)]\n";
+                    create_new_file(&dest, starter)
+                }
+                NewItemTemplate::Svg => {
+                    let starter = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"240\" height=\"160\" viewBox=\"0 0 240 160\">\n  <rect x=\"20\" y=\"20\" width=\"200\" height=\"120\" rx=\"14\" fill=\"#222020\" stroke=\"#8ba4b0\" stroke-width=\"3\"/>\n  <text x=\"120\" y=\"86\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"18\" fill=\"#c5c9c5\">VKarma SVG</text>\n</svg>\n";
+                    create_new_file(&dest, starter)
+                }
                 NewItemTemplate::Typst => {
                     let title = dest
                         .file_stem()
@@ -335,98 +362,6 @@ pub fn open_new_item_dialog(
                         Button::new("new-item-ok")
                             .primary()
                             .label("Create")
-                            .on_click(move |_, window, cx| {
-                                submit_btn(window, cx);
-                            }),
-                    ),
-            )
-    });
-}
-
-pub fn open_rename_dialog(
-    app_entity: Entity<VKarmaApp>,
-    target: PathBuf,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let cur_name = target
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_string();
-    let name_input = cx.new(|cx| InputState::new(window, cx).default_value(cur_name.clone()));
-    let initial_focus = Cell::new(true);
-    let submitted = Rc::new(Cell::new(false));
-
-    let submit: Rc<dyn Fn(&mut Window, &mut App)> = {
-        let input_ok = name_input.clone();
-        let app_ok = app_entity.clone();
-        let old_path = target.clone();
-        let done = submitted.clone();
-        Rc::new(move |window, cx| {
-            if done.get() {
-                return;
-            }
-            let new_name = input_ok.read(cx).value().trim().to_string();
-            if new_name.is_empty() {
-                return;
-            }
-            match rename_entry(&old_path, &new_name) {
-                Ok(new_path) => {
-                    done.set(true);
-                    window.close_dialog(cx);
-                    app_ok.update(cx, |app, cx| {
-                        for tab in app
-                            .left_pane
-                            .tabs
-                            .iter_mut()
-                            .chain(app.right_pane.iter_mut().flat_map(|p| p.tabs.iter_mut()))
-                        {
-                            if tab.path == old_path {
-                                tab.path = new_path.clone();
-                                tab.title = new_name.clone();
-                                tab.rel_path = new_path
-                                    .strip_prefix(&app.workspace_root)
-                                    .unwrap_or(&new_path)
-                                    .to_string_lossy()
-                                    .to_string();
-                            }
-                        }
-                        app.refresh_vault_index(cx);
-                    });
-                }
-                Err(err) => {
-                    app_ok.update(cx, |app, cx| {
-                        app.toast_err(format!("{err}"), window, cx);
-                    });
-                }
-            }
-        })
-    };
-    let enter_sub = subscribe_submit_on_enter(&name_input, submit.clone(), window, cx);
-
-    window.open_dialog(cx, move |dialog, window, cx| {
-        let _ = &enter_sub;
-        if initial_focus.replace(false) {
-            name_input.focus_handle(cx).focus(window, cx);
-        }
-        let submit_btn = submit.clone();
-
-        dialog
-            .title(format!("Rename '{cur_name}'"))
-            .w(px(440.))
-            .child(Input::new(&name_input))
-            .footer(
-                DialogFooter::new()
-                    .child(
-                        Button::new("rename-cancel")
-                            .label("Cancel")
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                    )
-                    .child(
-                        Button::new("rename-ok")
-                            .primary()
-                            .label("Rename")
                             .on_click(move |_, window, cx| {
                                 submit_btn(window, cx);
                             }),

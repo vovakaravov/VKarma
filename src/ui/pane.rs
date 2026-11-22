@@ -1,6 +1,8 @@
 use super::{
-    NewItemTemplate, PaneSide, TabKind, VKarmaApp, code_view, fountain_view, markdown_view, modals,
-    pdf_view, spreadsheet_view, tab_badge_and_color, typst_view,
+    NewItemTemplate, PaneSide, TabKind, VKarmaApp, archive_view, audio_view, canvas_view,
+    code_view, epub_view, font_view, fountain_view, kanban_view, markdown_view, mermaid_view,
+    modals, office_view, pdf_view, spreadsheet_view, sqlite_view, subtitle_view, svg_view,
+    tab_badge_and_color, typst_view,
 };
 use crate::theme::{hex_alpha, hex_color, kd};
 use gpui_kit::assets::IconName;
@@ -160,6 +162,39 @@ pub fn render_pane(
             TabKind::Markdown { .. } => {
                 markdown_view::render_markdown_tab(app, side, tab, cx).into_any_element()
             }
+            TabKind::Canvas { .. } => {
+                canvas_view::render_canvas_tab(app, side, tab, cx).into_any_element()
+            }
+            TabKind::Kanban { .. } => {
+                kanban_view::render_kanban_tab(app, side, tab, cx).into_any_element()
+            }
+            TabKind::Subtitle { .. } => {
+                subtitle_view::render_subtitle_tab(app, side, tab, cx).into_any_element()
+            }
+            TabKind::Svg { .. } => {
+                svg_view::render_svg_tab(app, side, tab, cx).into_any_element()
+            }
+            TabKind::Mermaid { .. } => {
+                mermaid_view::render_mermaid_tab(app, side, tab, cx).into_any_element()
+            }
+            TabKind::Office { .. } => {
+                office_view::render_office_tab(app, side, tab, cx).into_any_element()
+            }
+            TabKind::Epub { .. } => {
+                epub_view::render_epub_tab(app, tab, cx).into_any_element()
+            }
+            TabKind::Sqlite { .. } => {
+                sqlite_view::render_sqlite_tab(app, tab, cx).into_any_element()
+            }
+            TabKind::Archive { .. } => {
+                archive_view::render_archive_tab(app, tab, cx).into_any_element()
+            }
+            TabKind::Audio { .. } => {
+                audio_view::render_audio_tab(app, tab, cx).into_any_element()
+            }
+            TabKind::Font { .. } => {
+                font_view::render_font_tab(app, tab, cx).into_any_element()
+            }
             TabKind::Typst { .. } => {
                 typst_view::render_typst_tab(app, side, tab, cx).into_any_element()
             }
@@ -170,9 +205,15 @@ pub fn render_pane(
                 spreadsheet_view::render_spreadsheet_tab(app, side, tab, window, cx)
                     .into_any_element()
             }
-            TabKind::Code { .. } => code_view::render_code_tab(side, tab, cx).into_any_element(),
-            TabKind::Image { .. } => code_view::render_image_tab(tab, cx).into_any_element(),
-            TabKind::Pdf { .. } => pdf_view::render_pdf_tab(side, tab, cx).into_any_element(),
+            TabKind::Code { .. } => {
+                code_view::render_code_tab(side, tab, app.zen_mode, cx).into_any_element()
+            }
+            TabKind::Image { .. } => {
+                code_view::render_image_tab(tab, app.zen_mode, cx).into_any_element()
+            }
+            TabKind::Pdf { .. } => {
+                pdf_view::render_pdf_tab(side, tab, app.zen_mode, cx).into_any_element()
+            }
         },
         None => render_empty_pane(app, side, cx).into_any_element(),
     };
@@ -190,7 +231,7 @@ pub fn render_pane(
                 }
             }),
         )
-        .child(tab_bar)
+        .when(!app.zen_mode, |this| this.child(tab_bar))
         .child(div().flex_1().min_h_0().w_full().child(active_content))
         .into_any_element()
 }

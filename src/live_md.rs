@@ -1,0 +1,2500 @@
+use std::ops::Range;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineBlockContext {
+    Frontmatter {
+        is_delim: bool,
+        is_first: bool,
+        is_last: bool,
+    },
+    CodeFence {
+        is_open: bool,
+        is_close: bool,
+        lang: Option<String>,
+        is_first: bool,
+        is_last: bool,
+    },
+    Table {
+        is_header: bool,
+        is_delim: bool,
+        is_first: bool,
+        is_last: bool,
+    },
+    Callout {
+        kind: String,
+        is_header: bool,
+        is_first: bool,
+        is_last: bool,
+    },
+    Blockquote {
+        depth: u8,
+        prefix_bytes: usize,
+        is_first: bool,
+        is_last: bool,
+    },
+    Heading {
+        level: u8,
+        prefix_bytes: usize,
+    },
+    SceneBreak,
+    ImageEmbed {
+        target: String,
+        alt: String,
+    },
+    TaskItem {
+        indent_cols: usize,
+        checked: bool,
+        prefix_bytes: usize,
+        checkbox_byte: usize,
+    },
+    ListItem {
+        indent_cols: usize,
+        ordered: bool,
+        marker: String,
+        prefix_bytes: usize,
+    },
+    MdxBlock {
+        is_first: bool,
+        is_last: bool,
+    },
+    Blank,
+    Paragraph,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocLine {
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub ctx: LineBlockContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InlineStyle {
+    pub bold: bool,
+    pub italic: bool,
+    pub strikethrough: bool,
+    pub code: bool,
+    pub highlight: bool,
+    pub link: bool,
+    pub wikilink: bool,
+    pub syntax_muted: bool,
+    pub heading_level: u8,
+    pub monospace: bool,
+    pub dim: bool,
+    pub callout_title: bool,
+    pub checked_task: bool,
+    pub bullet_marker: bool,
+    pub table_pipe: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StyledSpan {
+    pub range: Range<usize>,
+    pub style: InlineStyle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OffsetSegment {
+    Verbatim { raw: Range<usize>, disp: Range<usize> },
+    Hidden { raw: Range<usize>, disp_pos: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkTarget {
+    Wikilink(String),
+    Url(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedLink {
+    pub disp_range: Range<usize>,
+    pub raw_range: Range<usize>,
+    pub target: LinkTarget,
+    pub concealed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrefixVisual {
+    None,
+    Bullet {
+        indent_cols: usize,
+    },
+    Checkbox {
+        indent_cols: usize,
+        checked: bool,
+        raw_checkbox_byte: usize,
+    },
+    SceneBreakRule,
+    CodeFenceBar {
+        lang: Option<String>,
+        is_open: bool,
+    },
+    CalloutBadge {
+        kind: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedLine {
+    pub display_text: String,
+    pub spans: Vec<StyledSpan>,
+    pub segments: Vec<OffsetSegment>,
+    pub links: Vec<ProjectedLink>,
+    pub prefix_visual: PrefixVisual,
+    pub raw_len: usize,
+}
+
+impl ProjectedLine {
+    /// Maps a line-local UTF-8 byte offset in the raw line to the projected display text.
+    pub fn raw_to_display(&self, raw_byte: usize) -> usize {
+        let rb = raw_byte.min(self.raw_len);
+        for seg in &self.segments {
+            match seg {
+                OffsetSegment::Verbatim { raw, disp } => {
+                    if rb >= raw.start && rb <= raw.end {
+                        let d = disp.start + (rb - raw.start);
+                        return clamp_char_boundary(&self.display_text, d);
+                    }
+                }
+                OffsetSegment::Hidden { raw, disp_pos } => {
+                    if rb >= raw.start && rb <= raw.end {
+                        return clamp_char_boundary(&self.display_text, *disp_pos);
+                    }
+                }
+            }
+        }
+        self.display_text.len()
+    }
+
+    /// Maps a UTF-8 byte offset in `display_text` back to the raw line.
+    pub fn display_to_raw(&self, raw_line: &str, disp_byte: usize) -> usize {
+        let db = disp_byte.min(self.display_text.len());
+        for seg in &self.segments {
+            if let OffsetSegment::Verbatim { raw, disp } = seg
+                && db >= disp.start
+                && db <= disp.end
+            {
+                let r = raw.start + (db - disp.start);
+                return clamp_char_boundary(raw_line, r);
+            }
+        }
+        for seg in &self.segments {
+            if let OffsetSegment::Hidden { raw, disp_pos } = seg
+                && db <= *disp_pos
+            {
+                return clamp_char_boundary(raw_line, raw.end);
+            }
+        }
+        raw_line.len()
+    }
+}
+
+pub fn clamp_char_boundary(s: &str, byte_idx: usize) -> usize {
+    let mut idx = byte_idx.min(s.len());
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+pub fn utf8_to_utf16_offset(s: &str, utf8_byte: usize) -> usize {
+    let clamped = clamp_char_boundary(s, utf8_byte);
+    s[..clamped].encode_utf16().count()
+}
+
+pub fn utf16_to_utf8_offset(s: &str, utf16_units: usize) -> usize {
+    let mut cur_utf16 = 0usize;
+    for (byte_ix, ch) in s.char_indices() {
+        if cur_utf16 >= utf16_units {
+            return byte_ix;
+        }
+        cur_utf16 += ch.len_utf16();
+    }
+    s.len()
+}
+
+/// Classifies every line of a Markdown/MDX document into block contexts with exact raw byte spans.
+pub fn classify_document_lines(raw: &str, is_mdx: bool) -> Vec<DocLine> {
+    struct Span<'a> {
+        start: usize,
+        end: usize,
+        text: &'a str,
+    }
+
+    let mut lines = Vec::new();
+    let mut cursor = 0usize;
+    for chunk in raw.split('\n') {
+        let clean = chunk.trim_end_matches('\r');
+        lines.push(Span {
+            start: cursor,
+            end: cursor + clean.len(),
+            text: clean,
+        });
+        cursor += chunk.len() + 1;
+    }
+
+    let mut out = Vec::with_capacity(lines.len());
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        let trimmed = lines[i].text.trim();
+
+        // 1. YAML Frontmatter at line 0 when closed later.
+        if i == 0 && trimmed == "---" {
+            if let Some(close_idx) = (1..lines.len()).find(|&j| {
+                let t = lines[j].text.trim();
+                t == "---" || t == "..."
+            }) {
+                for j in 0..=close_idx {
+                    out.push(DocLine {
+                        byte_start: lines[j].start,
+                        byte_end: lines[j].end,
+                        ctx: LineBlockContext::Frontmatter {
+                            is_delim: j == 0 || j == close_idx,
+                            is_first: j == 0,
+                            is_last: j == close_idx,
+                        },
+                    });
+                }
+                i = close_idx + 1;
+                continue;
+            }
+        }
+
+        // 2. Fenced code block (``` or ~~~).
+        if let Some((fence_ch, fence_len, lang)) = parse_fence_open(trimmed) {
+            let close_idx = ((i + 1)..lines.len())
+                .find(|&j| is_fence_close(lines[j].text.trim(), fence_ch, fence_len))
+                .unwrap_or(lines.len() - 1);
+            for j in i..=close_idx {
+                let is_open = j == i;
+                let is_close = j == close_idx
+                    && j > i
+                    && is_fence_close(lines[j].text.trim(), fence_ch, fence_len);
+                out.push(DocLine {
+                    byte_start: lines[j].start,
+                    byte_end: lines[j].end,
+                    ctx: LineBlockContext::CodeFence {
+                        is_open,
+                        is_close,
+                        lang: if is_open { lang.clone() } else { None },
+                        is_first: j == i,
+                        is_last: j == close_idx,
+                    },
+                });
+            }
+            i = close_idx + 1;
+            continue;
+        }
+
+        // 3. Markdown GFM table.
+        if has_table_pipe(trimmed)
+            && !trimmed.is_empty()
+            && i + 1 < lines.len()
+            && is_table_delimiter(lines[i + 1].text)
+        {
+            let mut end_idx = i + 1;
+            while end_idx + 1 < lines.len()
+                && is_table_continuation_line(lines[end_idx + 1].text, is_mdx)
+            {
+                end_idx += 1;
+            }
+            for j in i..=end_idx {
+                out.push(DocLine {
+                    byte_start: lines[j].start,
+                    byte_end: lines[j].end,
+                    ctx: LineBlockContext::Table {
+                        is_header: j == i,
+                        is_delim: j == i + 1,
+                        is_first: j == i,
+                        is_last: j == end_idx,
+                    },
+                });
+            }
+            i = end_idx + 1;
+            continue;
+        }
+
+        // 4. Callouts and blockquotes (contiguous > lines).
+        if trimmed.starts_with('>') {
+            let mut end_idx = i;
+            while end_idx + 1 < lines.len() && lines[end_idx + 1].text.trim_start().starts_with('>')
+            {
+                end_idx += 1;
+            }
+            let callout_kind = parse_callout_kind(trimmed);
+            for j in i..=end_idx {
+                let (depth, prefix_bytes) = parse_quote_prefix(lines[j].text);
+                let ctx = if let Some(ref kind) = callout_kind {
+                    LineBlockContext::Callout {
+                        kind: kind.clone(),
+                        is_header: j == i,
+                        is_first: j == i,
+                        is_last: j == end_idx,
+                    }
+                } else {
+                    LineBlockContext::Blockquote {
+                        depth,
+                        prefix_bytes,
+                        is_first: j == i,
+                        is_last: j == end_idx,
+                    }
+                };
+                out.push(DocLine {
+                    byte_start: lines[j].start,
+                    byte_end: lines[j].end,
+                    ctx,
+                });
+            }
+            i = end_idx + 1;
+            continue;
+        }
+
+        // 5. MDX imports, exports, or JSX blocks.
+        if is_mdx && starts_mdx_block(trimmed) {
+            let line_strs: Vec<&str> = lines.iter().map(|l| l.text).collect();
+            let end_idx = find_mdx_block_end(&line_strs, i);
+            for j in i..=end_idx {
+                out.push(DocLine {
+                    byte_start: lines[j].start,
+                    byte_end: lines[j].end,
+                    ctx: LineBlockContext::MdxBlock {
+                        is_first: j == i,
+                        is_last: j == end_idx,
+                    },
+                });
+            }
+            i = end_idx + 1;
+            continue;
+        }
+
+        // 6. Single line.
+        let ctx = classify_single_line(lines[i].text);
+        out.push(DocLine {
+            byte_start: lines[i].start,
+            byte_end: lines[i].end,
+            ctx,
+        });
+        i += 1;
+    }
+
+    out
+}
+
+fn classify_single_line(line: &str) -> LineBlockContext {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return LineBlockContext::Blank;
+    }
+    let leading_ws = line.len() - line.trim_start_matches([' ', '\t']).len();
+    if let Some((level, after_prefix)) = parse_atx_heading_with_len(&line[leading_ws..]) {
+        return LineBlockContext::Heading {
+            level,
+            prefix_bytes: leading_ws + after_prefix,
+        };
+    }
+    if is_scene_break(trimmed) {
+        return LineBlockContext::SceneBreak;
+    }
+    if let Some((target, alt)) = parse_image_embed(trimmed) {
+        return LineBlockContext::ImageEmbed { target, alt };
+    }
+    if let Some(prefix) = parse_list_or_task_prefix(line) {
+        if let Some(cb_off) = prefix.checkbox_byte {
+            return LineBlockContext::TaskItem {
+                indent_cols: indent_columns(line),
+                checked: prefix.checked,
+                prefix_bytes: prefix.prefix_len,
+                checkbox_byte: cb_off,
+            };
+        }
+        return LineBlockContext::ListItem {
+            indent_cols: indent_columns(line),
+            ordered: prefix.ordered,
+            marker: prefix.marker_display,
+            prefix_bytes: prefix.prefix_len,
+        };
+    }
+    LineBlockContext::Paragraph
+}
+
+fn indent_columns(line: &str) -> usize {
+    let mut cols = 0usize;
+    for b in line.bytes() {
+        match b {
+            b' ' => cols += 1,
+            b'\t' => cols += 4,
+            _ => break,
+        }
+    }
+    cols / 2
+}
+
+pub fn list_indent_px_from_cols(indent_cols: usize) -> f32 {
+    indent_cols as f32 * 20.0
+}
+
+fn parse_callout_kind(trimmed: &str) -> Option<String> {
+    let after = trimmed.strip_prefix('>')?.trim_start();
+    let rest = after.strip_prefix("[!")?;
+    let end = rest.find(']')?;
+    let kind = rest[..end].trim();
+    if kind.is_empty() {
+        None
+    } else {
+        Some(kind.to_ascii_lowercase())
+    }
+}
+
+fn parse_quote_prefix(line: &str) -> (u8, usize) {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0u8;
+    while i < bytes.len() {
+        let mut ws = i;
+        while ws < bytes.len() && matches!(bytes[ws], b' ' | b'\t') {
+            ws += 1;
+        }
+        if bytes.get(ws) == Some(&b'>') {
+            depth = depth.saturating_add(1);
+            i = ws + 1;
+            if bytes.get(i) == Some(&b' ') {
+                i += 1;
+            }
+        } else {
+            break;
+        }
+    }
+    (depth.max(1), i)
+}
+
+struct ProjectionBuilder<'a> {
+    raw: &'a str,
+    raw_pos: usize,
+    display_text: String,
+    spans: Vec<StyledSpan>,
+    segments: Vec<OffsetSegment>,
+    links: Vec<ProjectedLink>,
+}
+
+impl<'a> ProjectionBuilder<'a> {
+    fn new(raw: &'a str) -> Self {
+        Self {
+            raw,
+            raw_pos: 0,
+            display_text: String::with_capacity(raw.len()),
+            spans: Vec::new(),
+            segments: Vec::new(),
+            links: Vec::new(),
+        }
+    }
+
+    fn push_hidden(&mut self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let end = (self.raw_pos + len).min(self.raw.len());
+        let disp_pos = self.display_text.len();
+        self.segments.push(OffsetSegment::Hidden {
+            raw: self.raw_pos..end,
+            disp_pos,
+        });
+        self.raw_pos = end;
+    }
+
+    fn push_verbatim(&mut self, len: usize, style: InlineStyle) {
+        if len == 0 {
+            return;
+        }
+        let end = clamp_char_boundary(self.raw, self.raw_pos + len);
+        if end <= self.raw_pos {
+            return;
+        }
+        let slice = &self.raw[self.raw_pos..end];
+        let disp_start = self.display_text.len();
+        self.display_text.push_str(slice);
+        let disp_end = self.display_text.len();
+
+        if let Some(last) = self.spans.last_mut()
+            && last.style == style
+            && last.range.end == disp_start
+        {
+            last.range.end = disp_end;
+        } else {
+            self.spans.push(StyledSpan {
+                range: disp_start..disp_end,
+                style,
+            });
+        }
+
+        if let Some(OffsetSegment::Verbatim { raw, disp }) = self.segments.last_mut()
+            && raw.end == self.raw_pos
+            && disp.end == disp_start
+        {
+            raw.end = end;
+            disp.end = disp_end;
+        } else {
+            self.segments.push(OffsetSegment::Verbatim {
+                raw: self.raw_pos..end,
+                disp: disp_start..disp_end,
+            });
+        }
+
+        self.raw_pos = end;
+    }
+}
+
+fn range_touched(cursor: &Option<Range<usize>>, start: usize, end: usize) -> bool {
+    let Some(c) = cursor else {
+        return false;
+    };
+    c.start <= end && c.end >= start
+}
+
+/// Projects a single raw document line into display text, styles, offset map, and prefix decorations.
+pub fn project_line(
+    raw_line: &str,
+    ctx: &LineBlockContext,
+    cursor_on_line: Option<Range<usize>>,
+) -> ProjectedLine {
+    let mut b = ProjectionBuilder::new(raw_line);
+    let mut prefix_visual = PrefixVisual::None;
+    let cursor_present = cursor_on_line.is_some();
+
+    match ctx {
+        LineBlockContext::Blank => {}
+        LineBlockContext::Frontmatter { is_delim, .. } => {
+            let style = InlineStyle {
+                monospace: true,
+                dim: !*is_delim,
+                syntax_muted: *is_delim,
+                ..Default::default()
+            };
+            b.push_verbatim(raw_line.len(), style);
+        }
+        LineBlockContext::CodeFence {
+            is_open,
+            is_close,
+            lang,
+            ..
+        } => {
+            if (*is_open || *is_close) && !cursor_present {
+                b.push_hidden(raw_line.len());
+                prefix_visual = PrefixVisual::CodeFenceBar {
+                    lang: lang.clone(),
+                    is_open: *is_open,
+                };
+            } else {
+                let style = InlineStyle {
+                    monospace: true,
+                    syntax_muted: *is_open || *is_close,
+                    ..Default::default()
+                };
+                b.push_verbatim(raw_line.len(), style);
+            }
+        }
+        LineBlockContext::MdxBlock { .. } => {
+            let style = InlineStyle {
+                monospace: true,
+                syntax_muted: !cursor_present,
+                ..Default::default()
+            };
+            b.push_verbatim(raw_line.len(), style);
+        }
+        LineBlockContext::SceneBreak => {
+            if cursor_present {
+                b.push_verbatim(
+                    raw_line.len(),
+                    InlineStyle {
+                        syntax_muted: true,
+                        ..Default::default()
+                    },
+                );
+            } else {
+                b.push_hidden(raw_line.len());
+                prefix_visual = PrefixVisual::SceneBreakRule;
+            }
+        }
+        LineBlockContext::ImageEmbed { .. } => {
+            if cursor_present {
+                b.push_verbatim(
+                    raw_line.len(),
+                    InlineStyle {
+                        monospace: true,
+                        syntax_muted: true,
+                        ..Default::default()
+                    },
+                );
+            } else {
+                b.push_hidden(raw_line.len());
+            }
+        }
+        LineBlockContext::Table {
+            is_header,
+            is_delim,
+            ..
+        } => {
+            let base = InlineStyle {
+                monospace: true,
+                bold: *is_header,
+                dim: *is_delim,
+                ..Default::default()
+            };
+            if *is_delim {
+                b.push_verbatim(raw_line.len(), base);
+            } else {
+                emit_table_row(&mut b, base, &cursor_on_line);
+            }
+        }
+        LineBlockContext::Heading {
+            level,
+            prefix_bytes,
+        } => {
+            let base = InlineStyle {
+                heading_level: *level,
+                bold: true,
+                ..Default::default()
+            };
+            if cursor_present {
+                b.push_verbatim(
+                    *prefix_bytes,
+                    InlineStyle {
+                        heading_level: *level,
+                        syntax_muted: true,
+                        ..Default::default()
+                    },
+                );
+            } else {
+                b.push_hidden(*prefix_bytes);
+            }
+            emit_inline(&mut b, raw_line.len(), base, &cursor_on_line);
+        }
+        LineBlockContext::TaskItem {
+            indent_cols,
+            checked,
+            prefix_bytes,
+            checkbox_byte,
+        } => {
+            let reveal_prefix = range_touched(&cursor_on_line, 0, *prefix_bytes);
+            if reveal_prefix {
+                b.push_verbatim(
+                    *prefix_bytes,
+                    InlineStyle {
+                        syntax_muted: true,
+                        ..Default::default()
+                    },
+                );
+            } else {
+                b.push_hidden(*prefix_bytes);
+                prefix_visual = PrefixVisual::Checkbox {
+                    indent_cols: *indent_cols,
+                    checked: *checked,
+                    raw_checkbox_byte: *checkbox_byte,
+                };
+            }
+            let base = InlineStyle {
+                checked_task: *checked && !cursor_present,
+                strikethrough: *checked && !cursor_present,
+                ..Default::default()
+            };
+            emit_inline(&mut b, raw_line.len(), base, &cursor_on_line);
+        }
+        LineBlockContext::ListItem {
+            indent_cols,
+            ordered,
+            prefix_bytes,
+            ..
+        } => {
+            if *ordered {
+                let ws_len = raw_line.len() - raw_line.trim_start_matches([' ', '\t']).len();
+                if range_touched(&cursor_on_line, 0, *prefix_bytes) {
+                    b.push_verbatim(
+                        *prefix_bytes,
+                        InlineStyle {
+                            bullet_marker: true,
+                            ..Default::default()
+                        },
+                    );
+                } else {
+                    b.push_hidden(ws_len);
+                    b.push_verbatim(
+                        prefix_bytes.saturating_sub(ws_len),
+                        InlineStyle {
+                            bullet_marker: true,
+                            ..Default::default()
+                        },
+                    );
+                }
+            } else if range_touched(&cursor_on_line, 0, *prefix_bytes) {
+                b.push_verbatim(
+                    *prefix_bytes,
+                    InlineStyle {
+                        syntax_muted: true,
+                        ..Default::default()
+                    },
+                );
+            } else {
+                b.push_hidden(*prefix_bytes);
+                prefix_visual = PrefixVisual::Bullet {
+                    indent_cols: *indent_cols,
+                };
+            }
+            emit_inline(&mut b, raw_line.len(), InlineStyle::default(), &cursor_on_line);
+        }
+        LineBlockContext::Callout {
+            kind, is_header, ..
+        } => {
+            let (_, quote_len) = parse_quote_prefix(raw_line);
+            if *is_header {
+                if let Some(rel_end) = raw_line[quote_len..].find(']') {
+                    let marker_end = (quote_len + rel_end + 1
+                        + usize::from(raw_line.as_bytes().get(quote_len + rel_end + 1) == Some(&b' ')))
+                    .min(raw_line.len());
+                    if cursor_present {
+                        b.push_verbatim(
+                            marker_end,
+                            InlineStyle {
+                                syntax_muted: true,
+                                callout_title: true,
+                                bold: true,
+                                ..Default::default()
+                            },
+                        );
+                    } else {
+                        b.push_hidden(marker_end);
+                        prefix_visual = PrefixVisual::CalloutBadge { kind: kind.clone() };
+                    }
+                    emit_inline(
+                        &mut b,
+                        raw_line.len(),
+                        InlineStyle {
+                            callout_title: true,
+                            bold: true,
+                            ..Default::default()
+                        },
+                        &cursor_on_line,
+                    );
+                } else {
+                    emit_inline(&mut b, raw_line.len(), InlineStyle::default(), &cursor_on_line);
+                }
+            } else {
+                if range_touched(&cursor_on_line, 0, quote_len) {
+                    b.push_verbatim(
+                        quote_len,
+                        InlineStyle {
+                            syntax_muted: true,
+                            ..Default::default()
+                        },
+                    );
+                } else {
+                    b.push_hidden(quote_len);
+                }
+                emit_inline(&mut b, raw_line.len(), InlineStyle::default(), &cursor_on_line);
+            }
+        }
+        LineBlockContext::Blockquote { prefix_bytes, .. } => {
+            if range_touched(&cursor_on_line, 0, *prefix_bytes) {
+                b.push_verbatim(
+                    *prefix_bytes,
+                    InlineStyle {
+                        syntax_muted: true,
+                        italic: true,
+                        ..Default::default()
+                    },
+                );
+            } else {
+                b.push_hidden(*prefix_bytes);
+            }
+            emit_inline(
+                &mut b,
+                raw_line.len(),
+                InlineStyle {
+                    italic: true,
+                    dim: true,
+                    ..Default::default()
+                },
+                &cursor_on_line,
+            );
+        }
+        LineBlockContext::Paragraph => {
+            emit_inline(&mut b, raw_line.len(), InlineStyle::default(), &cursor_on_line);
+        }
+    }
+
+    if b.raw_pos < raw_line.len() {
+        b.push_verbatim(raw_line.len() - b.raw_pos, InlineStyle::default());
+    }
+
+    ProjectedLine {
+        display_text: b.display_text,
+        spans: b.spans,
+        segments: b.segments,
+        links: b.links,
+        prefix_visual,
+        raw_len: raw_line.len(),
+    }
+}
+
+fn emit_table_row(
+    b: &mut ProjectionBuilder<'_>,
+    base: InlineStyle,
+    cursor: &Option<Range<usize>>,
+) {
+    let raw = b.raw;
+    while b.raw_pos < raw.len() {
+        let start = b.raw_pos;
+        if raw.as_bytes()[start] == b'|' {
+            b.push_verbatim(
+                1,
+                InlineStyle {
+                    table_pipe: true,
+                    syntax_muted: true,
+                    ..base
+                },
+            );
+            continue;
+        }
+        let rel_pipe = raw[start..].find('|').unwrap_or(raw.len() - start);
+        emit_inline(b, start + rel_pipe, base, cursor);
+    }
+}
+
+fn emit_inline(
+    b: &mut ProjectionBuilder<'_>,
+    end_limit: usize,
+    base: InlineStyle,
+    cursor: &Option<Range<usize>>,
+) {
+    let raw = b.raw;
+    let limit = end_limit.min(raw.len());
+
+    while b.raw_pos < limit {
+        let i = b.raw_pos;
+        let rem = &raw[i..limit];
+        let bytes = rem.as_bytes();
+
+        // Escaped ASCII punctuation: \* \[ \` etc.
+        if bytes[0] == b'\\' && rem.len() >= 2 && bytes[1].is_ascii_punctuation() {
+            if range_touched(cursor, i, i + 2) {
+                b.push_verbatim(
+                    1,
+                    InlineStyle {
+                        syntax_muted: true,
+                        ..base
+                    },
+                );
+                b.push_verbatim(1, base);
+            } else {
+                b.push_hidden(1);
+                b.push_verbatim(1, base);
+            }
+            continue;
+        }
+
+        // 1. Inline code: `...`
+        if bytes[0] == b'`' {
+            let tick_len = bytes.iter().take_while(|&&c| c == b'`').count();
+            let delim = &rem[..tick_len];
+            if let Some(close_rel) = rem[tick_len..].find(delim) {
+                let inner_len = close_rel;
+                let tok_end = i + tick_len + inner_len + tick_len;
+                let touched = range_touched(cursor, i, tok_end);
+                let code_style = InlineStyle {
+                    code: true,
+                    monospace: true,
+                    ..base
+                };
+                if touched {
+                    b.push_verbatim(
+                        tick_len,
+                        InlineStyle {
+                            syntax_muted: true,
+                            monospace: true,
+                            ..base
+                        },
+                    );
+                    b.push_verbatim(inner_len, code_style);
+                    b.push_verbatim(
+                        tick_len,
+                        InlineStyle {
+                            syntax_muted: true,
+                            monospace: true,
+                            ..base
+                        },
+                    );
+                } else {
+                    b.push_hidden(tick_len);
+                    b.push_verbatim(inner_len, code_style);
+                    b.push_hidden(tick_len);
+                }
+                continue;
+            }
+        }
+
+        // 2. Wikilink: [[target|alias]] or [[target]]
+        if rem.starts_with("[[")
+            && let Some(close_rel) = rem[2..].find("]]")
+        {
+            let inner = &rem[2..2 + close_rel];
+            if !inner.is_empty() && !inner.contains("[[") {
+                let tok_end = i + 2 + close_rel + 2;
+                let touched = range_touched(cursor, i, tok_end);
+                let pipe_rel = inner.rfind('|');
+                let target_raw = pipe_rel.map(|p| &inner[..p]).unwrap_or(inner);
+                let target = LinkTarget::Wikilink(target_raw.trim().to_string());
+                let link_style = InlineStyle {
+                    wikilink: true,
+                    link: true,
+                    ..base
+                };
+
+                if touched {
+                    let disp_start = b.display_text.len();
+                    b.push_verbatim(
+                        2,
+                        InlineStyle {
+                            syntax_muted: true,
+                            ..base
+                        },
+                    );
+                    if let Some(p) = pipe_rel {
+                        b.push_verbatim(
+                            p + 1,
+                            InlineStyle {
+                                syntax_muted: true,
+                                ..base
+                            },
+                        );
+                        b.push_verbatim(inner.len() - (p + 1), link_style);
+                    } else {
+                        b.push_verbatim(inner.len(), link_style);
+                    }
+                    b.push_verbatim(
+                        2,
+                        InlineStyle {
+                            syntax_muted: true,
+                            ..base
+                        },
+                    );
+                    let disp_end = b.display_text.len();
+                    b.links.push(ProjectedLink {
+                        disp_range: disp_start..disp_end,
+                        raw_range: i..tok_end,
+                        target,
+                        concealed: false,
+                    });
+                } else {
+                    if let Some(p) = pipe_rel {
+                        b.push_hidden(2 + p + 1);
+                        let disp_start = b.display_text.len();
+                        b.push_verbatim(inner.len() - (p + 1), link_style);
+                        let disp_end = b.display_text.len();
+                        b.push_hidden(2);
+                        b.links.push(ProjectedLink {
+                            disp_range: disp_start..disp_end,
+                            raw_range: i..tok_end,
+                            target,
+                            concealed: true,
+                        });
+                    } else {
+                        b.push_hidden(2);
+                        let disp_start = b.display_text.len();
+                        b.push_verbatim(inner.len(), link_style);
+                        let disp_end = b.display_text.len();
+                        b.push_hidden(2);
+                        b.links.push(ProjectedLink {
+                            disp_range: disp_start..disp_end,
+                            raw_range: i..tok_end,
+                            target,
+                            concealed: true,
+                        });
+                    }
+                }
+                continue;
+            }
+        }
+
+        // 3. Inline Markdown link: [label](url)
+        if bytes[0] == b'['
+            && !rem.starts_with("[[")
+            && let Some(mid_rel) = rem[1..].find("](")
+        {
+            let after_mid = &rem[1 + mid_rel + 2..];
+            if let Some(url_len) = find_closing_paren(after_mid) {
+                let label_len = mid_rel;
+                let url_str = &after_mid[..url_len];
+                let tok_end = i + 1 + label_len + 2 + url_len + 1;
+                let touched = range_touched(cursor, i, tok_end);
+                let link_style = InlineStyle { link: true, ..base };
+                let target = LinkTarget::Url(url_str.trim().to_string());
+
+                if touched {
+                    let disp_start = b.display_text.len();
+                    b.push_verbatim(
+                        1,
+                        InlineStyle {
+                            syntax_muted: true,
+                            ..base
+                        },
+                    );
+                    b.push_verbatim(label_len, link_style);
+                    b.push_verbatim(
+                        2 + url_len + 1,
+                        InlineStyle {
+                            syntax_muted: true,
+                            ..base
+                        },
+                    );
+                    let disp_end = b.display_text.len();
+                    b.links.push(ProjectedLink {
+                        disp_range: disp_start..disp_end,
+                        raw_range: i..tok_end,
+                        target,
+                        concealed: false,
+                    });
+                } else {
+                    b.push_hidden(1);
+                    let disp_start = b.display_text.len();
+                    emit_inline(b, i + 1 + label_len, link_style, cursor);
+                    let disp_end = b.display_text.len();
+                    b.push_hidden(2 + url_len + 1);
+                    b.links.push(ProjectedLink {
+                        disp_range: disp_start..disp_end,
+                        raw_range: i..tok_end,
+                        target,
+                        concealed: true,
+                    });
+                }
+                continue;
+            }
+        }
+
+        // 4. ***Bold+Italic***
+        if rem.starts_with("***")
+            && let Some(inner_len) = find_delim_close(rem, "***", false)
+        {
+            emit_delim_span(
+                b,
+                3,
+                inner_len,
+                InlineStyle {
+                    bold: true,
+                    italic: true,
+                    ..base
+                },
+                cursor,
+            );
+            continue;
+        }
+
+        // 5. **Bold** / __Bold__
+        if rem.starts_with("**")
+            && let Some(inner_len) = find_delim_close(rem, "**", false)
+        {
+            emit_delim_span(
+                b,
+                2,
+                inner_len,
+                InlineStyle { bold: true, ..base },
+                cursor,
+            );
+            continue;
+        }
+        if rem.starts_with("__")
+            && left_word_ok(raw, i)
+            && let Some(inner_len) = find_delim_close(rem, "__", true)
+        {
+            emit_delim_span(
+                b,
+                2,
+                inner_len,
+                InlineStyle { bold: true, ..base },
+                cursor,
+            );
+            continue;
+        }
+
+        // 6. *Italic* / _Italic_
+        if rem.starts_with('*')
+            && !rem.starts_with("**")
+            && let Some(inner_len) = find_delim_close(rem, "*", false)
+        {
+            emit_delim_span(
+                b,
+                1,
+                inner_len,
+                InlineStyle {
+                    italic: true,
+                    ..base
+                },
+                cursor,
+            );
+            continue;
+        }
+        if rem.starts_with('_')
+            && !rem.starts_with("__")
+            && left_word_ok(raw, i)
+            && let Some(inner_len) = find_delim_close(rem, "_", true)
+        {
+            emit_delim_span(
+                b,
+                1,
+                inner_len,
+                InlineStyle {
+                    italic: true,
+                    ..base
+                },
+                cursor,
+            );
+            continue;
+        }
+
+        // 7. ~~Strikethrough~~
+        if rem.starts_with("~~")
+            && let Some(inner_len) = find_delim_close(rem, "~~", false)
+        {
+            emit_delim_span(
+                b,
+                2,
+                inner_len,
+                InlineStyle {
+                    strikethrough: true,
+                    ..base
+                },
+                cursor,
+            );
+            continue;
+        }
+
+        // 8. ==Highlight==
+        if rem.starts_with("==")
+            && let Some(inner_len) = find_delim_close(rem, "==", false)
+        {
+            emit_delim_span(
+                b,
+                2,
+                inner_len,
+                InlineStyle {
+                    highlight: true,
+                    ..base
+                },
+                cursor,
+            );
+            continue;
+        }
+
+        // Plain character run up to next interesting ASCII marker.
+        let ch = rem.chars().next().unwrap();
+        let mut step = ch.len_utf8();
+        while i + step < limit {
+            let b0 = raw.as_bytes()[i + step];
+            if matches!(
+                b0,
+                b'\\' | b'`' | b'[' | b'*' | b'_' | b'~' | b'='
+            ) {
+                break;
+            }
+            let next_ch = raw[i + step..limit].chars().next().unwrap();
+            step += next_ch.len_utf8();
+        }
+        b.push_verbatim(step, base);
+    }
+}
+
+fn emit_delim_span(
+    b: &mut ProjectionBuilder<'_>,
+    delim_len: usize,
+    inner_len: usize,
+    inner_style: InlineStyle,
+    cursor: &Option<Range<usize>>,
+) {
+    let start = b.raw_pos;
+    let tok_end = start + delim_len + inner_len + delim_len;
+    let touched = range_touched(cursor, start, tok_end);
+    if touched {
+        b.push_verbatim(
+            delim_len,
+            InlineStyle {
+                syntax_muted: true,
+                ..inner_style
+            },
+        );
+        emit_inline(b, start + delim_len + inner_len, inner_style, cursor);
+        b.push_verbatim(
+            delim_len,
+            InlineStyle {
+                syntax_muted: true,
+                ..inner_style
+            },
+        );
+    } else {
+        b.push_hidden(delim_len);
+        emit_inline(b, start + delim_len + inner_len, inner_style, cursor);
+        b.push_hidden(delim_len);
+    }
+}
+
+fn find_closing_paren(s: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (idx, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    return Some(idx);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn left_word_ok(raw: &str, idx: usize) -> bool {
+    raw[..idx]
+        .chars()
+        .next_back()
+        .is_none_or(|c| !c.is_alphanumeric())
+}
+
+fn right_word_ok(s: &str, after_idx: usize) -> bool {
+    s[after_idx..]
+        .chars()
+        .next()
+        .is_none_or(|c| !c.is_alphanumeric())
+}
+
+fn find_delim_close(rem: &str, delim: &str, word_guard: bool) -> Option<usize> {
+    let dlen = delim.len();
+    let after = &rem[dlen..];
+    if after.is_empty() || after.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut search_from = 0usize;
+    while let Some(rel) = after[search_from..].find(delim) {
+        let close_start = search_from + rel;
+        if close_start == 0 {
+            search_from = close_start + dlen;
+            continue;
+        }
+        let inner = &after[..close_start];
+        if inner.chars().next_back().is_some_and(char::is_whitespace) {
+            search_from = close_start + 1;
+            continue;
+        }
+        let after_close = close_start + dlen;
+        if delim == "*" && after[after_close..].starts_with('*') {
+            search_from = close_start + 1;
+            continue;
+        }
+        if delim == "_" && after[after_close..].starts_with('_') {
+            search_from = close_start + 1;
+            continue;
+        }
+        if word_guard && !right_word_ok(after, after_close) {
+            search_from = close_start + 1;
+            continue;
+        }
+        return Some(close_start);
+    }
+    None
+}
+
+fn parse_fence_open(trimmed: &str) -> Option<(char, usize, Option<String>)> {
+    let first = trimmed.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let count = trimmed.chars().take_while(|&c| c == first).count();
+    if count < 3 {
+        return None;
+    }
+    let info = trimmed[count..].trim();
+    if first == '`' && info.contains('`') {
+        return None;
+    }
+    let lang = if info.is_empty() {
+        None
+    } else {
+        info.split_whitespace().next().map(str::to_string)
+    };
+    Some((first, count, lang))
+}
+
+fn is_fence_close(trimmed: &str, fence_ch: char, min_len: usize) -> bool {
+    let count = trimmed.chars().take_while(|&c| c == fence_ch).count();
+    count >= min_len && trimmed[count..].trim().is_empty()
+}
+
+fn is_table_delimiter(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() || !t.contains('-') {
+        return false;
+    }
+    if !t.contains('|') && !t.contains("---") {
+        return false;
+    }
+    t.chars()
+        .all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
+}
+
+fn has_table_pipe(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 1;
+            if let Some(ch) = s[i..].chars().next() {
+                i += ch.len_utf8();
+            }
+        } else if bytes[i] >= 0x80 {
+            if let Some(ch) = s[i..].chars().next() {
+                i += ch.len_utf8();
+            } else {
+                i += 1;
+            }
+        } else if s[i..].starts_with("[[")
+            && let Some(close) = s[i + 2..].find("]]")
+        {
+            i += 2 + close + 2;
+        } else if bytes[i] == b'|' {
+            return true;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+fn is_table_continuation_line(line: &str, is_mdx: bool) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty()
+        || parse_fence_open(trimmed).is_some()
+        || trimmed.starts_with('>')
+        || parse_atx_heading_with_len(trimmed).is_some()
+        || is_scene_break(trimmed)
+        || parse_image_embed(trimmed).is_some()
+        || parse_list_or_task_prefix(line).is_some()
+        || (is_mdx && starts_mdx_block(trimmed))
+    {
+        return false;
+    }
+    has_table_pipe(trimmed)
+}
+
+fn parse_atx_heading_with_len(trimmed: &str) -> Option<(u8, usize)> {
+    let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let after = &trimmed[hashes..];
+    let ws = after.bytes().take_while(|b| matches!(b, b' ' | b'\t')).count();
+    if ws == 0 {
+        return None;
+    }
+    Some((hashes as u8, hashes + ws))
+}
+
+fn is_scene_break(trimmed: &str) -> bool {
+    let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.len() < 3 {
+        return false;
+    }
+    let mut chars = compact.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    matches!(first, '*' | '-' | '_') && chars.all(|c| c == first)
+}
+
+fn parse_image_embed(trimmed: &str) -> Option<(String, String)> {
+    if let Some(inner) = trimmed.strip_prefix("![[").and_then(|s| s.strip_suffix("]]"))
+        && !inner.is_empty()
+        && !inner.contains("[[")
+        && !inner.contains("]]")
+    {
+        let (target, alt) = inner.split_once('|').unwrap_or((inner, ""));
+        return Some((target.trim().to_string(), alt.trim().to_string()));
+    }
+    if let Some(after) = trimmed.strip_prefix("![")
+        && let Some(close_bracket) = after.find("](")
+    {
+        let alt = &after[..close_bracket];
+        let after_paren = &after[close_bracket + 2..];
+        if let Some(close_paren) = after_paren.rfind(')')
+            && close_paren == after_paren.len() - 1
+        {
+            return Some((
+                after_paren[..close_paren].trim().to_string(),
+                alt.trim().to_string(),
+            ));
+        }
+    }
+    None
+}
+
+fn parse_jsx_tag_name(trimmed: &str) -> Option<&str> {
+    let rest = trimmed.strip_prefix('<')?;
+    if rest.starts_with('/') || rest.starts_with('!') || rest.starts_with('?') {
+        return None;
+    }
+    let name_len = rest
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'-' | b'.'))
+        .count();
+    if name_len == 0 {
+        return None;
+    }
+    let name = &rest[..name_len];
+    let next_ok = matches!(
+        rest.as_bytes().get(name_len),
+        None | Some(b' ' | b'\t' | b'/' | b'>')
+    );
+    if !next_ok {
+        return None;
+    }
+    let first = name.as_bytes()[0];
+    if first.is_ascii_uppercase()
+        || name.eq_ignore_ascii_case("video")
+        || name.eq_ignore_ascii_case("iframe")
+    {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+fn starts_mdx_block(trimmed: &str) -> bool {
+    trimmed.starts_with("import ")
+        || trimmed.starts_with("export ")
+        || parse_jsx_tag_name(trimmed).is_some()
+}
+
+fn find_mdx_block_end(lines: &[&str], start: usize) -> usize {
+    let trimmed = lines[start].trim();
+    if trimmed.starts_with("import ") || trimmed.starts_with("export ") {
+        return start;
+    }
+    let Some(tag) = parse_jsx_tag_name(trimmed) else {
+        return start;
+    };
+    let closing = format!("</{tag}>");
+    if trimmed.ends_with("/>") || trimmed.contains(&closing) {
+        return start;
+    }
+    let limit = (start + 40).min(lines.len() - 1);
+    let mut saw_blank = false;
+    for j in (start + 1)..=limit {
+        let t = lines[j].trim();
+        if t.is_empty() {
+            saw_blank = true;
+            continue;
+        }
+        if saw_blank && parse_atx_heading_with_len(t).is_some() {
+            return start;
+        }
+        if t.ends_with("/>") || t.contains(&closing) {
+            return j;
+        }
+    }
+    start
+}
+
+struct ListOrTaskPrefix {
+    prefix_len: usize,
+    ordered: bool,
+    marker_display: String,
+    checked: bool,
+    checkbox_byte: Option<usize>,
+    next_prefix: String,
+}
+
+fn parse_list_or_task_prefix(line: &str) -> Option<ListOrTaskPrefix> {
+    let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let indent = &line[..indent_len];
+    let rest = &line[indent_len..];
+    let bytes = rest.as_bytes();
+
+    if bytes.len() >= 2 && matches!(bytes[0], b'-' | b'*' | b'+') && bytes[1] == b' ' {
+        let marker = &rest[..1];
+        let after_marker = &rest[2..];
+        if let Some((task_len, checked)) = parse_task_marker(after_marker) {
+            return Some(ListOrTaskPrefix {
+                prefix_len: indent_len + 2 + task_len,
+                ordered: false,
+                marker_display: marker.to_string(),
+                checked,
+                checkbox_byte: Some(indent_len + 3),
+                next_prefix: format!("{indent}{marker} [ ] "),
+            });
+        }
+        return Some(ListOrTaskPrefix {
+            prefix_len: indent_len + 2,
+            ordered: false,
+            marker_display: marker.to_string(),
+            checked: false,
+            checkbox_byte: None,
+            next_prefix: format!("{indent}{marker} "),
+        });
+    }
+
+    let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits > 0
+        && digits + 1 < bytes.len()
+        && matches!(bytes[digits], b'.' | b')')
+        && bytes[digits + 1] == b' '
+    {
+        let num: usize = rest[..digits].parse().unwrap_or(1);
+        let delim = bytes[digits] as char;
+        let base_len = digits + 2;
+        let after_marker = &rest[base_len..];
+        if let Some((task_len, checked)) = parse_task_marker(after_marker) {
+            return Some(ListOrTaskPrefix {
+                prefix_len: indent_len + base_len + task_len,
+                ordered: true,
+                marker_display: rest[..base_len].to_string(),
+                checked,
+                checkbox_byte: Some(indent_len + base_len + 1),
+                next_prefix: format!("{indent}{}{delim} [ ] ", num + 1),
+            });
+        }
+        return Some(ListOrTaskPrefix {
+            prefix_len: indent_len + base_len,
+            ordered: true,
+            marker_display: rest[..base_len].to_string(),
+            checked: false,
+            checkbox_byte: None,
+            next_prefix: format!("{indent}{}{delim} ", num + 1),
+        });
+    }
+
+    None
+}
+
+fn parse_task_marker(after_marker: &str) -> Option<(usize, bool)> {
+    let bytes = after_marker.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0] == b'['
+        && matches!(bytes[1], b' ' | b'x' | b'X')
+        && bytes[2] == b']'
+    {
+        let checked = matches!(bytes[1], b'x' | b'X');
+        match bytes.get(3) {
+            Some(b' ') => Some((4, checked)),
+            None => Some((3, checked)),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditKind {
+    InsertChar,
+    Delete,
+    Atomic,
+    Ime,
+}
+
+#[derive(Debug, Clone)]
+struct UndoSnapshot {
+    text: String,
+    anchor: usize,
+    head: usize,
+}
+
+/// Unified Markdown document buffer with continuous cursor/selection, undo/redo coalescing, and smart edits.
+pub struct LiveDocBuffer {
+    pub text: String,
+    pub lines: Vec<DocLine>,
+    pub is_mdx: bool,
+    pub version: u64,
+    pub anchor: usize,
+    pub head: usize,
+    pub marked_range: Option<Range<usize>>,
+    undo_stack: Vec<UndoSnapshot>,
+    redo_stack: Vec<UndoSnapshot>,
+    last_edit: Option<(EditKind, Instant)>,
+}
+
+impl LiveDocBuffer {
+    pub fn new(raw: String, is_mdx: bool) -> Self {
+        let lines = classify_document_lines(&raw, is_mdx);
+        Self {
+            text: raw,
+            lines,
+            is_mdx,
+            version: 1,
+            anchor: 0,
+            head: 0,
+            marked_range: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            last_edit: None,
+        }
+    }
+
+    pub fn selection_range(&self) -> Range<usize> {
+        self.anchor.min(self.head)..self.anchor.max(self.head)
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.anchor != self.head
+    }
+
+    pub fn selected_text(&self) -> &str {
+        let r = self.selection_range();
+        &self.text[r]
+    }
+
+    pub fn set_cursor(&mut self, byte: usize, extend: bool) {
+        let pos = clamp_char_boundary(&self.text, byte);
+        self.head = pos;
+        if !extend {
+            self.anchor = pos;
+        }
+    }
+
+    pub fn set_selection(&mut self, anchor: usize, head: usize) {
+        self.anchor = clamp_char_boundary(&self.text, anchor);
+        self.head = clamp_char_boundary(&self.text, head);
+    }
+
+    pub fn line_index_for_byte(&self, byte: usize) -> usize {
+        let b = byte.min(self.text.len());
+        match self.lines.binary_search_by(|l| {
+            if b < l.byte_start {
+                std::cmp::Ordering::Greater
+            } else if b > l.byte_end {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        }) {
+            Ok(ix) => ix,
+            Err(ix) => ix.min(self.lines.len().saturating_sub(1)),
+        }
+    }
+
+    pub fn line_str(&self, line_ix: usize) -> &str {
+        if let Some(l) = self.lines.get(line_ix) {
+            &self.text[l.byte_start..l.byte_end]
+        } else {
+            ""
+        }
+    }
+
+    pub fn cursor_line_col(&self) -> (usize, usize) {
+        let li = self.line_index_for_byte(self.head);
+        let col_bytes = self
+            .head
+            .saturating_sub(self.lines.get(li).map_or(0, |l| l.byte_start));
+        let col_chars = self.line_str(li)[..col_bytes.min(self.line_str(li).len())]
+            .chars()
+            .count();
+        (li, col_chars)
+    }
+
+    pub fn byte_from_line_col(&self, line_0based: usize, col_chars: usize) -> usize {
+        let li = line_0based.min(self.lines.len().saturating_sub(1));
+        let Some(dl) = self.lines.get(li) else {
+            return 0;
+        };
+        let slice = &self.text[dl.byte_start..dl.byte_end];
+        let rel = slice
+            .char_indices()
+            .nth(col_chars)
+            .map(|(idx, _)| idx)
+            .unwrap_or(slice.len());
+        dl.byte_start + rel
+    }
+
+    fn record_undo(&mut self, kind: EditKind) {
+        let now = Instant::now();
+        let coalesce = match (kind, self.last_edit) {
+            (EditKind::InsertChar, Some((EditKind::InsertChar, prev)))
+            | (EditKind::Delete, Some((EditKind::Delete, prev))) => {
+                now.duration_since(prev) < Duration::from_millis(650)
+            }
+            (EditKind::Ime, Some((EditKind::Ime, _))) => true,
+            _ => false,
+        };
+        if !coalesce || self.undo_stack.is_empty() {
+            if self.undo_stack.len() >= 250 {
+                self.undo_stack.remove(0);
+            }
+            self.undo_stack.push(UndoSnapshot {
+                text: self.text.clone(),
+                anchor: self.anchor,
+                head: self.head,
+            });
+        }
+        self.redo_stack.clear();
+        self.last_edit = Some((kind, now));
+    }
+
+    pub fn break_undo_coalescing(&mut self) {
+        self.last_edit = None;
+    }
+
+    pub fn reset_text(&mut self, raw: String, line_0based: usize, col_chars: usize) {
+        self.text = raw;
+        self.lines = classify_document_lines(&self.text, self.is_mdx);
+        self.version = self.version.wrapping_add(1);
+        self.marked_range = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_edit = None;
+        let b = self.byte_from_line_col(line_0based, col_chars);
+        self.anchor = b;
+        self.head = b;
+    }
+
+    pub fn replace_range(&mut self, range: Range<usize>, replacement: &str, kind: EditKind) {
+        let start = clamp_char_boundary(&self.text, range.start.min(range.end));
+        let end = clamp_char_boundary(&self.text, range.start.max(range.end));
+        self.record_undo(kind);
+        self.text.replace_range(start..end, replacement);
+        let new_caret = start + replacement.len();
+        self.anchor = new_caret;
+        self.head = new_caret;
+        self.lines = classify_document_lines(&self.text, self.is_mdx);
+        self.version = self.version.wrapping_add(1);
+    }
+
+    pub fn insert_text(&mut self, s: &str) {
+        if self.has_selection() {
+            let wrap = match s {
+                "*" => Some(("*", "*")),
+                "_" => Some(("_", "_")),
+                "`" => Some(("`", "`")),
+                "~" => Some(("~", "~")),
+                "=" => Some(("=", "=")),
+                "[" => Some(("[", "]")),
+                "(" => Some(("(", ")")),
+                "\"" => Some(("\"", "\"")),
+                _ => None,
+            };
+            if let Some((open, close)) = wrap {
+                let sel = self.selection_range();
+                let inner = self.text[sel.clone()].to_string();
+                let wrapped = format!("{open}{inner}{close}");
+                let inner_start = sel.start + open.len();
+                let inner_end = inner_start + inner.len();
+                self.replace_range(sel, &wrapped, EditKind::Atomic);
+                self.anchor = inner_start;
+                self.head = inner_end;
+                return;
+            }
+        }
+        let kind = if s.chars().count() == 1 && !s.contains('\n') {
+            EditKind::InsertChar
+        } else {
+            EditKind::Atomic
+        };
+        let sel = self.selection_range();
+        self.replace_range(sel, s, kind);
+    }
+
+    pub fn smart_enter(&mut self) {
+        if self.has_selection() {
+            let sel = self.selection_range();
+            self.replace_range(sel, "\n", EditKind::Atomic);
+            return;
+        }
+        let li = self.line_index_for_byte(self.head);
+        let Some(dl) = self.lines.get(li).cloned() else {
+            self.replace_range(self.head..self.head, "\n", EditKind::Atomic);
+            return;
+        };
+        let line_text = &self.text[dl.byte_start..dl.byte_end];
+        let local_pos = self.head.saturating_sub(dl.byte_start).min(line_text.len());
+        let before = &line_text[..local_pos];
+        let after = &line_text[local_pos..];
+
+        // Auto-expand opening code fence if Enter pressed at end of ```lang line.
+        if after.trim().is_empty()
+            && let Some((fence_ch, fence_len, _)) = parse_fence_open(before.trim())
+            && !matches!(
+                dl.ctx,
+                LineBlockContext::CodeFence { is_open: false, .. }
+            )
+        {
+            let indent_len = before.len() - before.trim_start().len();
+            let indent = &before[..indent_len];
+            let closing: String = std::iter::repeat_n(fence_ch, fence_len).collect();
+            let inserted = format!("\n\n{indent}{closing}");
+            let caret = self.head + 1;
+            self.replace_range(self.head..self.head, &inserted, EditKind::Atomic);
+            self.set_cursor(caret, false);
+            return;
+        }
+
+        // Continue or terminate list / task prefix.
+        if let Some(prefix) = parse_list_or_task_prefix(line_text) {
+            let remainder = line_text[prefix.prefix_len..].trim();
+            if remainder.is_empty() && after.trim().is_empty() && local_pos >= prefix.prefix_len {
+                self.replace_range(dl.byte_start..dl.byte_end, "", EditKind::Atomic);
+                return;
+            }
+            if local_pos >= prefix.prefix_len {
+                let inserted = format!("\n{}", prefix.next_prefix);
+                self.replace_range(self.head..self.head, &inserted, EditKind::Atomic);
+                return;
+            }
+        }
+
+        // Continue blockquote if line starts with > and cursor is after quote prefix.
+        if line_text.trim_start().starts_with('>') {
+            let (_, qlen) = parse_quote_prefix(line_text);
+            let remainder = line_text[qlen..].trim();
+            if remainder.is_empty() && after.trim().is_empty() && local_pos >= qlen {
+                self.replace_range(dl.byte_start..dl.byte_end, "", EditKind::Atomic);
+                return;
+            }
+            if local_pos >= qlen {
+                let qprefix = &line_text[..qlen];
+                let inserted = format!("\n{qprefix}");
+                self.replace_range(self.head..self.head, &inserted, EditKind::Atomic);
+                return;
+            }
+        }
+
+        self.replace_range(self.head..self.head, "\n", EditKind::Atomic);
+    }
+
+    pub fn backspace(&mut self, by_word: bool) {
+        if self.has_selection() {
+            let sel = self.selection_range();
+            self.replace_range(sel, "", EditKind::Delete);
+            return;
+        }
+        if self.head == 0 {
+            return;
+        }
+        let target = if by_word {
+            prev_word_boundary(&self.text, self.head)
+        } else {
+            let mut prev = prev_char_boundary(&self.text, self.head);
+            if self.text.as_bytes()[prev] == b'\n'
+                && prev > 0
+                && self.text.as_bytes()[prev - 1] == b'\r'
+            {
+                prev -= 1;
+            }
+            prev
+        };
+        self.replace_range(target..self.head, "", EditKind::Delete);
+    }
+
+    pub fn delete(&mut self, by_word: bool) {
+        if self.has_selection() {
+            let sel = self.selection_range();
+            self.replace_range(sel, "", EditKind::Delete);
+            return;
+        }
+        if self.head >= self.text.len() {
+            return;
+        }
+        let target = if by_word {
+            next_word_boundary(&self.text, self.head)
+        } else {
+            let mut next = next_char_boundary(&self.text, self.head);
+            if self.text.as_bytes().get(self.head) == Some(&b'\r')
+                && self.text.as_bytes().get(next) == Some(&b'\n')
+            {
+                next += 1;
+            }
+            next
+        };
+        self.replace_range(self.head..target, "", EditKind::Delete);
+    }
+
+    pub fn indent_lines(&mut self, outdent: bool) {
+        let sel = self.selection_range();
+        let first_li = self.line_index_for_byte(sel.start);
+        let last_li = if sel.end > sel.start
+            && self
+                .lines
+                .get(self.line_index_for_byte(sel.end))
+                .is_some_and(|l| l.byte_start == sel.end)
+        {
+            self.line_index_for_byte(sel.end).saturating_sub(1)
+        } else {
+            self.line_index_for_byte(sel.end)
+        }
+        .max(first_li);
+
+        if first_li == last_li && !self.has_selection() && !outdent {
+            self.replace_range(self.head..self.head, "  ", EditKind::Atomic);
+            return;
+        }
+
+        let block_start = self.lines[first_li].byte_start;
+        let block_end = self.lines[last_li].byte_end;
+        let mut rebuilt = String::new();
+        for ix in first_li..=last_li {
+            if ix > first_li {
+                rebuilt.push('\n');
+            }
+            let line = self.line_str(ix);
+            if outdent {
+                if let Some(rest) = line.strip_prefix('\t') {
+                    rebuilt.push_str(rest);
+                } else if let Some(rest) = line.strip_prefix("  ") {
+                    rebuilt.push_str(rest);
+                } else if let Some(rest) = line.strip_prefix(' ') {
+                    rebuilt.push_str(rest);
+                } else {
+                    rebuilt.push_str(line);
+                }
+            } else {
+                rebuilt.push_str("  ");
+                rebuilt.push_str(line);
+            }
+        }
+        let end_after = block_start + rebuilt.len();
+        self.replace_range(block_start..block_end, &rebuilt, EditKind::Atomic);
+        if first_li == last_li && outdent && !rebuilt.is_empty() {
+            let line_end = self.lines[first_li].byte_end;
+            self.set_cursor(line_end, false);
+        } else {
+            self.set_selection(block_start, end_after);
+        }
+    }
+
+    pub fn toggle_wrap(&mut self, marker: &str) {
+        let sel = self.selection_range();
+        let mlen = marker.len();
+        if sel.start >= mlen
+            && sel.end + mlen <= self.text.len()
+            && &self.text[sel.start - mlen..sel.start] == marker
+            && &self.text[sel.end..sel.end + mlen] == marker
+        {
+            let inner = self.text[sel.clone()].to_string();
+            let new_start = sel.start - mlen;
+            let new_end = new_start + inner.len();
+            self.replace_range(sel.start - mlen..sel.end + mlen, &inner, EditKind::Atomic);
+            self.set_selection(new_start, new_end);
+        } else if self.has_selection() {
+            let inner = self.text[sel.clone()].to_string();
+            let wrapped = format!("{marker}{inner}{marker}");
+            let new_start = sel.start + mlen;
+            let new_end = new_start + inner.len();
+            self.replace_range(sel, &wrapped, EditKind::Atomic);
+            self.set_selection(new_start, new_end);
+        } else {
+            let paired = format!("{marker}{marker}");
+            let caret = self.head + mlen;
+            self.replace_range(self.head..self.head, &paired, EditKind::Atomic);
+            self.set_cursor(caret, false);
+        }
+    }
+
+    pub fn insert_or_wrap_link(&mut self) {
+        let sel = self.selection_range();
+        if self.has_selection() {
+            let label = self.text[sel.clone()].to_string();
+            let formatted = format!("[{label}](url)");
+            let url_start = sel.start + 1 + label.len() + 2;
+            let url_end = url_start + 3;
+            self.replace_range(sel, &formatted, EditKind::Atomic);
+            self.set_selection(url_start, url_end);
+        } else {
+            let template = "[](url)";
+            let caret = self.head + 1;
+            self.replace_range(self.head..self.head, template, EditKind::Atomic);
+            self.set_cursor(caret, false);
+        }
+    }
+
+    pub fn toggle_task_on_line(&mut self, line_ix: usize) -> bool {
+        let Some(dl) = self.lines.get(line_ix).cloned() else {
+            return false;
+        };
+        let LineBlockContext::TaskItem {
+            checked,
+            checkbox_byte,
+            ..
+        } = dl.ctx
+        else {
+            return false;
+        };
+        let abs = dl.byte_start + checkbox_byte;
+        if abs >= dl.byte_end {
+            return false;
+        }
+        let saved_anchor = self.anchor;
+        let saved_head = self.head;
+        let replacement = if checked { " " } else { "x" };
+        self.replace_range(abs..abs + 1, replacement, EditKind::Atomic);
+        self.anchor = clamp_char_boundary(&self.text, saved_anchor);
+        self.head = clamp_char_boundary(&self.text, saved_head);
+        true
+    }
+
+    pub fn move_left(&mut self, by_word: bool, extend: bool) {
+        self.break_undo_coalescing();
+        if !extend && self.has_selection() && !by_word {
+            let start = self.selection_range().start;
+            self.set_cursor(start, false);
+            return;
+        }
+        let target = if by_word {
+            prev_word_boundary(&self.text, self.head)
+        } else {
+            prev_char_boundary(&self.text, self.head)
+        };
+        self.set_cursor(target, extend);
+    }
+
+    pub fn move_right(&mut self, by_word: bool, extend: bool) {
+        self.break_undo_coalescing();
+        if !extend && self.has_selection() && !by_word {
+            let end = self.selection_range().end;
+            self.set_cursor(end, false);
+            return;
+        }
+        let target = if by_word {
+            next_word_boundary(&self.text, self.head)
+        } else {
+            next_char_boundary(&self.text, self.head)
+        };
+        self.set_cursor(target, extend);
+    }
+
+    pub fn move_line_start(&mut self, extend: bool) {
+        self.break_undo_coalescing();
+        let li = self.line_index_for_byte(self.head);
+        let target = self.lines.get(li).map_or(0, |l| l.byte_start);
+        self.set_cursor(target, extend);
+    }
+
+    pub fn move_line_end(&mut self, extend: bool) {
+        self.break_undo_coalescing();
+        let li = self.line_index_for_byte(self.head);
+        let target = self
+            .lines
+            .get(li)
+            .map_or(self.text.len(), |l| l.byte_end);
+        self.set_cursor(target, extend);
+    }
+
+    pub fn select_word_at(&mut self, byte_offset: usize) {
+        let pos = clamp_char_boundary(&self.text, byte_offset);
+        if self.text.is_empty() {
+            self.set_cursor(0, false);
+            return;
+        }
+        let ch = self.text[pos..].chars().next();
+        if ch.is_some_and(is_word_char) {
+            let mut s = pos;
+            while s > 0 {
+                let prev = prev_char_boundary(&self.text, s);
+                if self.text[prev..s].chars().next().is_some_and(is_word_char) {
+                    s = prev;
+                } else {
+                    break;
+                }
+            }
+            let mut e = pos;
+            while e < self.text.len() {
+                let next = next_char_boundary(&self.text, e);
+                if self.text[e..next].chars().next().is_some_and(is_word_char) {
+                    e = next;
+                } else {
+                    break;
+                }
+            }
+            self.set_selection(s, e);
+        } else if pos < self.text.len() {
+            let next = next_char_boundary(&self.text, pos);
+            self.set_selection(pos, next);
+        }
+    }
+
+    pub fn select_line_at(&mut self, byte_offset: usize) {
+        let li = self.line_index_for_byte(byte_offset);
+        if let Some(dl) = self.lines.get(li) {
+            self.set_selection(dl.byte_start, dl.byte_end);
+        }
+    }
+
+    pub fn select_all(&mut self) {
+        self.set_selection(0, self.text.len());
+    }
+
+    pub fn undo(&mut self) -> bool {
+        let Some(prev) = self.undo_stack.pop() else {
+            return false;
+        };
+        self.redo_stack.push(UndoSnapshot {
+            text: self.text.clone(),
+            anchor: self.anchor,
+            head: self.head,
+        });
+        self.text = prev.text;
+        self.anchor = clamp_char_boundary(&self.text, prev.anchor);
+        self.head = clamp_char_boundary(&self.text, prev.head);
+        self.lines = classify_document_lines(&self.text, self.is_mdx);
+        self.version = self.version.wrapping_add(1);
+        self.marked_range = None;
+        self.last_edit = None;
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(next) = self.redo_stack.pop() else {
+            return false;
+        };
+        self.undo_stack.push(UndoSnapshot {
+            text: self.text.clone(),
+            anchor: self.anchor,
+            head: self.head,
+        });
+        self.text = next.text;
+        self.anchor = clamp_char_boundary(&self.text, next.anchor);
+        self.head = clamp_char_boundary(&self.text, next.head);
+        self.lines = classify_document_lines(&self.text, self.is_mdx);
+        self.version = self.version.wrapping_add(1);
+        self.marked_range = None;
+        self.last_edit = None;
+        true
+    }
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn prev_char_boundary(s: &str, pos: usize) -> usize {
+    let p = clamp_char_boundary(s, pos);
+    s[..p].char_indices().next_back().map_or(0, |(idx, _)| idx)
+}
+
+fn next_char_boundary(s: &str, pos: usize) -> usize {
+    let p = clamp_char_boundary(s, pos);
+    s[p..]
+        .chars()
+        .next()
+        .map_or(s.len(), |ch| p + ch.len_utf8())
+}
+
+fn prev_word_boundary(s: &str, pos: usize) -> usize {
+    let mut p = clamp_char_boundary(s, pos);
+    while p > 0 {
+        let prev = prev_char_boundary(s, p);
+        let ch = s[prev..p].chars().next().unwrap();
+        if ch == '\n' {
+            return if p == pos { prev } else { p };
+        }
+        if !ch.is_whitespace() {
+            break;
+        }
+        p = prev;
+    }
+    if p == 0 {
+        return 0;
+    }
+    let first_is_word = s[prev_char_boundary(s, p)..p]
+        .chars()
+        .next()
+        .is_some_and(is_word_char);
+    while p > 0 {
+        let prev = prev_char_boundary(s, p);
+        let ch = s[prev..p].chars().next().unwrap();
+        if ch.is_whitespace() || is_word_char(ch) != first_is_word {
+            break;
+        }
+        p = prev;
+    }
+    p
+}
+
+fn next_word_boundary(s: &str, pos: usize) -> usize {
+    let mut p = clamp_char_boundary(s, pos);
+    while p < s.len() {
+        let ch = s[p..].chars().next().unwrap();
+        if ch == '\n' {
+            return if p == pos { p + 1 } else { p };
+        }
+        if !ch.is_whitespace() {
+            break;
+        }
+        p += ch.len_utf8();
+    }
+    if p >= s.len() {
+        return s.len();
+    }
+    let first_is_word = s[p..].chars().next().is_some_and(is_word_char);
+    while p < s.len() {
+        let ch = s[p..].chars().next().unwrap();
+        if ch.is_whitespace() || is_word_char(ch) != first_is_word {
+            break;
+        }
+        p += ch.len_utf8();
+    }
+    p
+}
+
+/// Prefix-sum table tracking exact / estimated vertical line heights for O(log N) scroll lookups.
+pub struct LineHeightTable {
+    heights: Vec<f32>,
+    prefix: Vec<f32>,
+    dirty: bool,
+}
+
+impl LineHeightTable {
+    pub fn from_lines(lines: &[DocLine], raw: &str, est_col_width: f32) -> Self {
+        let heights: Vec<f32> = lines
+            .iter()
+            .map(|l| estimate_line_height(&raw[l.byte_start..l.byte_end], &l.ctx, est_col_width))
+            .collect();
+        let len = heights.len();
+        Self {
+            heights,
+            prefix: vec![0.0; len + 1],
+            dirty: true,
+        }
+    }
+
+    pub fn sync_lines(&mut self, lines: &[DocLine], raw: &str, est_col_width: f32) {
+        if self.heights.len() == lines.len() {
+            return;
+        }
+        self.heights = lines
+            .iter()
+            .map(|l| estimate_line_height(&raw[l.byte_start..l.byte_end], &l.ctx, est_col_width))
+            .collect();
+        self.dirty = true;
+    }
+
+    fn ensure_prefix(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.prefix.resize(self.heights.len() + 1, 0.0);
+        self.prefix[0] = 0.0;
+        let mut acc = 0.0f32;
+        for (i, &h) in self.heights.iter().enumerate() {
+            acc += h;
+            self.prefix[i + 1] = acc;
+        }
+        self.dirty = false;
+    }
+
+    pub fn set_height(&mut self, ix: usize, h: f32) -> bool {
+        if let Some(slot) = self.heights.get_mut(ix)
+            && (*slot - h).abs() > 0.25
+        {
+            *slot = h;
+            self.dirty = true;
+            return true;
+        }
+        false
+    }
+
+    pub fn total_height(&mut self) -> f32 {
+        self.ensure_prefix();
+        *self.prefix.last().unwrap_or(&0.0)
+    }
+
+    pub fn y_for_line(&mut self, ix: usize) -> f32 {
+        self.ensure_prefix();
+        self.prefix[ix.min(self.heights.len())]
+    }
+
+    pub fn line_for_y(&mut self, y: f32) -> usize {
+        self.ensure_prefix();
+        if self.heights.is_empty() || y <= 0.0 {
+            return 0;
+        }
+        let max_ix = self.heights.len() - 1;
+        let p = self.prefix.partition_point(|&val| val <= y);
+        p.saturating_sub(1).min(max_ix)
+    }
+}
+
+pub fn estimate_line_height(raw_line: &str, ctx: &LineBlockContext, col_width: f32) -> f32 {
+    let usable_w = (col_width - 24.0).max(160.0);
+    let chars = raw_line.chars().count().max(1) as f32;
+    match ctx {
+        LineBlockContext::Heading { level, .. } => {
+            let (cw, lh, pad) = match level {
+                1 => (14.5, 34.0, 16.0),
+                2 => (11.2, 27.0, 13.0),
+                3 => (9.2, 23.0, 10.0),
+                _ => (8.2, 21.0, 8.0),
+            };
+            let rows = ((chars * cw) / usable_w).ceil().max(1.0);
+            rows * lh + pad
+        }
+        LineBlockContext::ImageEmbed { .. } => 280.0,
+        LineBlockContext::SceneBreak => 24.0,
+        LineBlockContext::Blank => 24.75,
+        LineBlockContext::CodeFence { .. }
+        | LineBlockContext::Frontmatter { .. }
+        | LineBlockContext::Table { .. }
+        | LineBlockContext::MdxBlock { .. } => {
+            let rows = ((chars * 8.1) / usable_w).ceil().max(1.0);
+            rows * 21.0 + 4.0
+        }
+        _ => {
+            let rows = ((chars * 7.8) / usable_w).ceil().max(1.0);
+            rows * 24.75 + 4.0
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_projection_invariants(raw: &str, ctx: &LineBlockContext, cursor: Option<Range<usize>>) {
+        let proj = project_line(raw, ctx, cursor);
+        // Spans must contiguously cover 0..display_text.len()
+        let mut cur = 0usize;
+        for sp in &proj.spans {
+            assert_eq!(sp.range.start, cur, "gap/overlap in spans for {raw:?}");
+            assert!(sp.range.end > sp.range.start);
+            assert!(proj.display_text.is_char_boundary(sp.range.start));
+            assert!(proj.display_text.is_char_boundary(sp.range.end));
+            cur = sp.range.end;
+        }
+        assert_eq!(cur, proj.display_text.len(), "spans did not cover end for {raw:?}");
+
+        // Bijective char boundaries
+        for (rb, _) in raw.char_indices() {
+            let db = proj.raw_to_display(rb);
+            assert!(proj.display_text.is_char_boundary(db));
+        }
+        for (db, _) in proj.display_text.char_indices() {
+            let rb = proj.display_to_raw(raw, db);
+            assert!(raw.is_char_boundary(rb));
+        }
+    }
+
+    #[test]
+    fn classifies_all_markdown_blocks() {
+        let doc = "---\ntitle: Test\n---\n\n# Heading\n- [x] Task\n- Item\n> [!note] Tip\n> Body\n```rust\nfn a() {}\n```\n| a | b |\n| --- | --- |\n| 1 | 2 |\n![[pic.png|400]]\n---\n<Callout />";
+        let lines = classify_document_lines(doc, true);
+        assert!(matches!(lines[0].ctx, LineBlockContext::Frontmatter { is_delim: true, .. }));
+        assert!(matches!(lines[1].ctx, LineBlockContext::Frontmatter { is_delim: false, .. }));
+        assert!(matches!(lines[2].ctx, LineBlockContext::Frontmatter { is_delim: true, .. }));
+        assert!(matches!(lines[3].ctx, LineBlockContext::Blank));
+        assert!(matches!(lines[4].ctx, LineBlockContext::Heading { level: 1, prefix_bytes: 2 }));
+        assert!(matches!(lines[5].ctx, LineBlockContext::TaskItem { checked: true, .. }));
+        assert!(matches!(lines[6].ctx, LineBlockContext::ListItem { ordered: false, .. }));
+        assert!(matches!(lines[7].ctx, LineBlockContext::Callout { is_header: true, .. }));
+        assert!(matches!(lines[8].ctx, LineBlockContext::Callout { is_header: false, .. }));
+        assert!(matches!(lines[9].ctx, LineBlockContext::CodeFence { is_open: true, .. }));
+        assert!(matches!(lines[10].ctx, LineBlockContext::CodeFence { is_open: false, is_close: false, .. }));
+        assert!(matches!(lines[11].ctx, LineBlockContext::CodeFence { is_close: true, .. }));
+        assert!(matches!(lines[12].ctx, LineBlockContext::Table { is_header: true, .. }));
+        assert!(matches!(lines[13].ctx, LineBlockContext::Table { is_delim: true, .. }));
+        assert!(matches!(lines[14].ctx, LineBlockContext::Table { is_header: false, is_delim: false, .. }));
+        assert!(matches!(lines[15].ctx, LineBlockContext::ImageEmbed { .. }));
+        assert!(matches!(lines[16].ctx, LineBlockContext::SceneBreak));
+        assert!(matches!(lines[17].ctx, LineBlockContext::MdxBlock { .. }));
+    }
+
+    #[test]
+    fn projects_token_level_conceal_and_preserves_snake_case() {
+        let raw = "Hello **bold** and `code` with snake_case_var and [[note|Alias]] plus ==hi==";
+        let ctx = LineBlockContext::Paragraph;
+
+        // Cursor elsewhere -> syntax concealed
+        let concealed = project_line(raw, &ctx, None);
+        assert_eq!(
+            concealed.display_text,
+            "Hello bold and code with snake_case_var and Alias plus hi"
+        );
+        assert_eq!(concealed.links.len(), 1);
+        assert_eq!(
+            concealed.links[0].target,
+            LinkTarget::Wikilink("note".into())
+        );
+        assert!(concealed.spans.iter().any(|s| s.style.bold && &concealed.display_text[s.range.clone()] == "bold"));
+        assert!(concealed.spans.iter().any(|s| s.style.code && &concealed.display_text[s.range.clone()] == "code"));
+        assert!(concealed.spans.iter().any(|s| s.style.highlight && &concealed.display_text[s.range.clone()] == "hi"));
+        assert_projection_invariants(raw, &ctx, None);
+
+        // Cursor touching **bold** -> ONLY **bold** markers revealed on that token
+        let bold_mid = raw.find("bold").unwrap() + 1;
+        let revealed = project_line(raw, &ctx, Some(bold_mid..bold_mid));
+        assert_eq!(
+            revealed.display_text,
+            "Hello **bold** and code with snake_case_var and Alias plus hi"
+        );
+        assert_projection_invariants(raw, &ctx, Some(bold_mid..bold_mid));
+
+        // Display -> raw click mapping on concealed wikilink lands on visible alias chars
+        let alias_disp = concealed.display_text.find("Alias").unwrap() + 2;
+        let raw_hit = concealed.display_to_raw(raw, alias_disp);
+        assert_eq!(&raw[raw_hit..raw_hit + 3], "ias");
+
+        // Cyrillic + emoji safety
+        let uni = "# Заголовок **жирный** 🚀 `код`";
+        let uni_ctx = LineBlockContext::Heading { level: 1, prefix_bytes: 2 };
+        assert_projection_invariants(uni, &uni_ctx, None);
+        assert_projection_invariants(uni, &uni_ctx, Some(2..4));
+    }
+
+    #[test]
+    fn utf8_utf16_roundtrip_handles_multibyte_and_emoji() {
+        let s = "Hi Привет 🚀!";
+        for (byte_ix, _) in s.char_indices() {
+            let u16_off = utf8_to_utf16_offset(s, byte_ix);
+            assert_eq!(utf16_to_utf8_offset(s, u16_off), byte_ix);
+        }
+        assert_eq!(utf16_to_utf8_offset(s, utf8_to_utf16_offset(s, s.len())), s.len());
+    }
+
+    #[test]
+    fn doc_buffer_handles_smart_enter_indent_wrap_task_and_undo() {
+        let mut buf = LiveDocBuffer::new("- [ ] First".to_string(), false);
+        buf.set_cursor(buf.text.len(), false);
+        buf.smart_enter();
+        assert_eq!(buf.text, "- [ ] First\n- [ ] ");
+
+        // Enter on empty task clears prefix
+        buf.smart_enter();
+        assert_eq!(buf.text, "- [ ] First\n");
+
+        // Toggle task checkbox without disturbing cursor at end
+        buf.set_cursor(buf.text.len(), false);
+        assert!(buf.toggle_task_on_line(0));
+        assert!(buf.text.starts_with("- [x] First"));
+
+        // Auto-wrap selection with '*'
+        buf.set_selection(6, 11);
+        buf.insert_text("*");
+        assert_eq!(buf.text, "- [x] *First*\n");
+        assert_eq!(buf.selected_text(), "First");
+
+        // Undo restores step-by-step cleanly
+        assert!(buf.undo());
+        assert_eq!(buf.text, "- [x] First\n");
+        assert!(buf.redo());
+        assert_eq!(buf.text, "- [x] *First*\n");
+    }
+
+    #[test]
+    fn line_height_table_binary_search_and_updates() {
+        let raw = "a\nb\nc\nd";
+        let lines = classify_document_lines(raw, false);
+        let mut table = LineHeightTable::from_lines(&lines, raw, 700.0);
+        for i in 0..4 {
+            table.set_height(i, 30.0);
+        }
+        assert_eq!(table.total_height(), 120.0);
+        assert_eq!(table.y_for_line(2), 60.0);
+        assert_eq!(table.line_for_y(0.0), 0);
+        assert_eq!(table.line_for_y(31.0), 1);
+        assert_eq!(table.line_for_y(89.9), 2);
+        assert_eq!(table.line_for_y(119.0), 3);
+    }
+}

@@ -7246,15 +7246,21 @@ dependencies = [
  "codebook-tree-sitter-typst",
  "csv",
  "dirs 6.0.0",
+ "flate2",
  "gpui-kit",
  "ironcalc",
  "notify",
  "percent-encoding",
+ "resvg 0.46.0",
+ "roxmltree 0.21.2",
  "serde",
  "serde_json",
  "tempfile",
+ "toml 0.8.23",
  "tree-sitter",
+ "ttf-parser",
  "walkdir",
+ "zip",
 ]
 
 [[package]]

@@ -15,6 +15,7 @@ use gpui_kit::{
     Context, InteractiveElement as _, IntoElement, ParentElement, SharedString, Styled, div,
     prelude::FluentBuilder as _, px, relative,
 };
+use std::sync::Arc;
 
 pub fn render_markdown_tab(
     app: &VKarmaApp,
@@ -24,6 +25,7 @@ pub fn render_markdown_tab(
 ) -> impl IntoElement {
     let TabKind::Markdown {
         editor,
+        live_doc,
         view_mode,
         source_mode,
         preprocessed,
@@ -49,20 +51,36 @@ pub fn render_markdown_tab(
     let chapter_mode = *chapter_mode;
     let read_mins = if wc == 0 { 0 } else { (wc + 219) / 220 };
     let preprocessed_str = preprocessed.clone();
+    let zen_mode = app.zen_mode;
 
-    let raw_text = editor.read(cx).value();
-    let chapters = split_markdown_chapters(raw_text.as_ref());
-    let has_chapters = chapters.len() >= 2;
-    let (effective_preview, chapter_nav) = if chapter_mode && has_chapters && view_mode != MdViewMode::Edit
-    {
-        let idx = (*active_chapter).min(chapters.len().saturating_sub(1));
-        let ch = &chapters[idx];
-        let ch_pre: SharedString =
-            preprocess_markdown_with_options(&ch.content, &tab.path, &app.vault, 0, is_mdx)
-                .into();
-        (ch_pre, Some((idx, chapters.len(), ch.title.clone())))
+    let (effective_preview, chapter_nav) = if chapter_mode && view_mode != MdViewMode::Edit {
+        let raw_text: String = if source_mode {
+            editor.read(cx).value().to_string()
+        } else {
+            live_doc.read(cx).text().to_string()
+        };
+        let chapters = split_markdown_chapters(&raw_text);
+        if chapters.len() >= 2 {
+            let idx = (*active_chapter).min(chapters.len().saturating_sub(1));
+            let ch = &chapters[idx];
+            let ch_pre: SharedString =
+                preprocess_markdown_with_options(&ch.content, &tab.path, &app.vault, 0, is_mdx)
+                    .into();
+            (ch_pre, Some((idx, chapters.len(), ch.title.clone())))
+        } else {
+            (preprocessed_str, None)
+        }
     } else {
         (preprocessed_str, None)
+    };
+    let has_chapters = chapter_nav.is_some() || {
+        let raw_text: &str = if !source_mode {
+            live_doc.read(cx).text()
+        } else {
+            ""
+        };
+        !source_mode && split_markdown_chapters(raw_text).len() >= 2
+            || source_mode && split_markdown_chapters(editor.read(cx).value().as_ref()).len() >= 2
     };
 
     let header = h_flex()
@@ -218,13 +236,21 @@ pub fn render_markdown_tab(
 
     let app_entity = cx.entity();
     let extensions = app.markdown_extensions.clone();
-    let body = match view_mode {
+    let effective_mode = if zen_mode && view_mode == MdViewMode::Split {
+        MdViewMode::Edit
+    } else {
+        view_mode
+    };
+    let live_doc = live_doc.clone();
+    let body = match effective_mode {
         MdViewMode::Edit => {
             if source_mode {
-                render_md_editor_pane(app_entity, side, tab_id, editor, source_mode, cx)
+                render_md_editor_pane(app_entity, side, tab_id, editor, source_mode, zen_mode, cx)
                     .into_any_element()
             } else {
-                super::live_preview_view::render_md_live_preview_pane(app, side, tab, true, cx)
+                let vault = Arc::clone(&app.vault);
+                live_doc.update(cx, |ed, _| ed.sync_render_context(true, zen_mode, vault));
+                live_doc.into_any_element()
             }
         }
         MdViewMode::Reading => render_md_preview_pane(
@@ -234,6 +260,7 @@ pub fn render_markdown_tab(
             effective_preview,
             extensions,
             true,
+            zen_mode,
             chapter_nav,
             cx,
         )
@@ -246,11 +273,14 @@ pub fn render_markdown_tab(
                     tab_id,
                     editor,
                     source_mode,
+                    zen_mode,
                     cx,
                 )
                 .into_any_element()
             } else {
-                super::live_preview_view::render_md_live_preview_pane(app, side, tab, false, cx)
+                let vault = Arc::clone(&app.vault);
+                live_doc.update(cx, |ed, _| ed.sync_render_context(false, zen_mode, vault));
+                live_doc.into_any_element()
             };
             let preview_el = render_md_preview_pane(
                 app_entity,
@@ -259,6 +289,7 @@ pub fn render_markdown_tab(
                 effective_preview,
                 extensions,
                 false,
+                zen_mode,
                 chapter_nav,
                 cx,
             );
@@ -280,7 +311,7 @@ pub fn render_markdown_tab(
     v_flex()
         .size_full()
         .bg(hex_color(kd::BG_MAIN))
-        .child(header)
+        .when(!zen_mode, |this| this.child(header))
         .child(div().flex_1().min_h_0().w_full().child(body))
         .into_any_element()
 }
@@ -305,9 +336,8 @@ fn mode_pill_btn(
         .xsmall()
         .icon(icon)
         .label(label)
-        .on_click(cx.listener(move |this, _, window, cx| {
+        .on_click(cx.listener(move |this, _, _window, cx| {
             this.active_pane = side;
-            this.commit_active_live_block(side, tab_id, window, cx);
             if let Some(tab) = this.find_tab_mut(side, tab_id)
                 && let TabKind::Markdown { view_mode, .. } = &mut tab.kind
             {
@@ -323,6 +353,7 @@ fn render_md_editor_pane(
     tab_id: u64,
     editor: &gpui_kit::Entity<gpui_kit::component::input::EditorState>,
     source_mode: bool,
+    zen_mode: bool,
     cx: &mut Context<VKarmaApp>,
 ) -> impl IntoElement + use<> {
     let paste_app = app_entity;
@@ -344,10 +375,7 @@ fn render_md_editor_pane(
             })
         });
 
-    div()
-        .size_full()
-        .bg(hex_color(kd::BG_MAIN))
-        .child(ed)
+    super::zen_editor_frame(ed, zen_mode)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -358,9 +386,11 @@ fn render_md_preview_pane(
     preprocessed: SharedString,
     extensions: gpui_kit::component::text::MarkdownExtensions,
     centered_read: bool,
+    zen_mode: bool,
     chapter_nav: Option<(usize, usize, String)>,
     cx: &mut Context<VKarmaApp>,
 ) -> impl IntoElement {
+    let col_max_width = super::column_max_width(centered_read, zen_mode);
     let app_for_links = app_entity.clone();
     let app_for_tasks = app_entity;
 
@@ -396,12 +426,12 @@ fn render_md_preview_pane(
         .w_full()
         .bg(hex_color(kd::BG_MAIN))
         .overflow_y_scrollbar()
-        .px(px(if centered_read { 32. } else { 24. }))
-        .py(px(20.))
+        .px(px(if col_max_width.is_some() { 32. } else { 24. }))
+        .py(px(if zen_mode { 56. } else { 20. }))
         .child(
             div()
                 .w_full()
-                .when(centered_read, |d| d.max_w(px(820.)).mx_auto())
+                .when_some(col_max_width, |d, w| d.max_w(px(w)).mx_auto())
                 .child(text_view),
         );
 

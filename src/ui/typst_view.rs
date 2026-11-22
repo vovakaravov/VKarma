@@ -12,7 +12,7 @@ use gpui_kit::{
 };
 
 pub fn render_typst_tab(
-    _app: &VKarmaApp,
+    app: &VKarmaApp,
     side: PaneSide,
     tab: &super::DocumentTab,
     cx: &mut Context<VKarmaApp>,
@@ -218,20 +218,19 @@ pub fn render_typst_tab(
                 }),
         );
 
-    let editor_el = div()
-        .size_full()
-        .bg(hex_color(kd::BG_MAIN))
-        .child(
-            Editor::new(editor)
-                .size_full()
-                .appearance(false)
-                .bordered(false),
-        );
+    let zen_mode = app.zen_mode;
+    let editor_el = super::zen_editor_frame(
+        Editor::new(editor)
+            .size_full()
+            .appearance(false)
+            .bordered(false),
+        zen_mode && view_mode == TypstViewMode::Edit,
+    );
 
     let preview_el = render_typst_preview(side, tab_id, &pages, last_error, zoom, compiling);
 
     let body = match view_mode {
-        TypstViewMode::Edit => editor_el.into_any_element(),
+        TypstViewMode::Edit => editor_el,
         TypstViewMode::Preview => preview_el.into_any_element(),
         TypstViewMode::Split => {
             h_resizable(SharedString::from(format!("typ-split-{side:?}-{tab_id}")))
@@ -252,7 +251,7 @@ pub fn render_typst_tab(
     v_flex()
         .size_full()
         .bg(hex_color(kd::BG_MAIN))
-        .child(header)
+        .when(!zen_mode, |this| this.child(header))
         .child(div().flex_1().min_h_0().w_full().child(body))
         .into_any_element()
 }

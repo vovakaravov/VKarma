@@ -10,11 +10,66 @@ use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    Context, Focusable as _, InteractiveElement as _, IntoElement, MouseButton, ParentElement,
-    SharedString, StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _, px,
+    AppContext as _, ClickEvent, Context, Focusable as _, FontWeight, InteractiveElement as _,
+    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, SharedString,
+    StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+#[derive(Clone)]
+struct DraggedTreeEntry {
+    path: PathBuf,
+    name: String,
+    is_dir: bool,
+}
+
+struct DraggedTreePreview {
+    name: String,
+    is_dir: bool,
+}
+
+impl Render for DraggedTreePreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .h(px(26.))
+            .px_2p5()
+            .gap_1p5()
+            .items_center()
+            .rounded(px(5.))
+            .bg(hex_color(kd::BG_SIDEBAR))
+            .border_1()
+            .border_color(hex_color(kd::BLUE))
+            .opacity(0.92)
+            .child(
+                Icon::new(if self.is_dir {
+                    IconName::Folder
+                } else {
+                    IconName::FileText
+                })
+                .xsmall()
+                .text_color(if self.is_dir {
+                    hex_color(kd::YELLOW)
+                } else {
+                    hex_color(kd::BLUE)
+                }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(hex_color(kd::FG))
+                    .child(self.name.clone()),
+            )
+    }
+}
+
+fn can_drop_onto_dir(src: &Path, dest_dir: &Path) -> bool {
+    if src == dest_dir || dest_dir.starts_with(src) {
+        return false;
+    }
+    src.parent() != Some(dest_dir)
+}
 
 pub fn render_sidebar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> impl IntoElement {
     let sidebar_bg = hex_color(kd::BG_SIDEBAR);
@@ -207,10 +262,13 @@ pub fn render_sidebar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> impl Into
             let active_file = app.active_tab_ref().map(|t| t.path.clone());
             let mut rows = Vec::new();
             collect_tree_rows(app, &app.vault.tree, 0, active_file.as_ref(), &mut rows, cx);
+            let root_check = ws_root.clone();
+            let root_drop = ws_root.clone();
 
             v_flex()
                 .flex_1()
                 .min_h_0()
+                .track_focus(&app.sidebar_focus)
                 .child(quick_create)
                 .child(
                     div()
@@ -219,6 +277,20 @@ pub fn render_sidebar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> impl Into
                         .min_h_0()
                         .overflow_y_scrollbar()
                         .p_1()
+                        .rounded(px(4.))
+                        .drag_over::<DraggedTreeEntry>(move |style, drag, _, _| {
+                            if can_drop_onto_dir(&drag.path, &root_check) {
+                                style
+                                    .bg(hex_alpha(0x8ba4b014))
+                                    .border_1()
+                                    .border_color(hex_color(kd::BLUE))
+                            } else {
+                                style
+                            }
+                        })
+                        .on_drop(cx.listener(move |this, drag: &DraggedTreeEntry, window, cx| {
+                            this.move_fs_entry(drag.path.clone(), root_drop.clone(), window, cx);
+                        }))
                         .child(v_flex().gap_0p5().children(rows)),
                 )
                 .into_any_element()
@@ -349,12 +421,67 @@ fn collect_tree_rows(
         let node_name = node.name.clone();
         let is_expanded = app.expanded_dirs.contains(&node_path);
         let is_active = active_file.is_some_and(|p| p == &node_path);
+        let is_selected = app.selected_tree_path.as_ref() == Some(&node_path);
+        let rename_input = app
+            .inline_rename
+            .as_ref()
+            .filter(|r| r.target_path == node_path)
+            .map(|r| r.input.clone());
         let app_entity = cx.entity();
 
         if node.is_dir {
             let dir_for_menu = node_path.clone();
             let dir_for_click = node_path.clone();
+            let dir_for_drag = node_path.clone();
+            let dir_for_hover = node_path.clone();
+            let dir_for_drop = node_path.clone();
+            let name_for_drag = node_name.clone();
             let row_id: SharedString = format!("tree-dir-{}", node.rel_path).into();
+
+            if let Some(ren_input) = rename_input {
+                let row = h_flex()
+                    .id(row_id)
+                    .w_full()
+                    .h(px(26.))
+                    .pl(px(indent_px))
+                    .pr_2()
+                    .gap_1p5()
+                    .items_center()
+                    .rounded(px(4.))
+                    .bg(hex_color(kd::BG_PANEL))
+                    .child(
+                        Icon::new(if is_expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .xsmall()
+                        .text_color(hex_color(kd::FG_MUTED)),
+                    )
+                    .child(
+                        Icon::new(IconName::FolderOpen)
+                            .xsmall()
+                            .text_color(hex_color(kd::YELLOW)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                                if ev.keystroke.key == "escape" {
+                                    cx.stop_propagation();
+                                    this.cancel_inline_rename(window, cx);
+                                }
+                            }))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(Input::new(&ren_input).xsmall()),
+                    );
+                out.push(row.into_any_element());
+                if is_expanded {
+                    collect_tree_rows(app, &node.children, depth + 1, active_file, out, cx);
+                }
+                continue;
+            }
 
             let row = div()
                 .id(row_id)
@@ -367,12 +494,56 @@ fn collect_tree_rows(
                 .items_center()
                 .gap_1p5()
                 .cursor_pointer()
-                .hover(|s| s.bg(hex_color(kd::BG_PANEL)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if !this.expanded_dirs.remove(&dir_for_click) {
-                        this.expanded_dirs.insert(dir_for_click.clone());
+                .when(is_selected, |s| s.bg(hex_alpha(0x8ba4b024)))
+                .hover(move |s| {
+                    if is_selected {
+                        s.bg(hex_alpha(0x8ba4b035))
+                    } else {
+                        s.bg(hex_color(kd::BG_PANEL))
                     }
-                    cx.notify();
+                })
+                .on_drag(
+                    DraggedTreeEntry {
+                        path: dir_for_drag,
+                        name: name_for_drag,
+                        is_dir: true,
+                    },
+                    |drag, _, _, cx| {
+                        cx.new(|_| DraggedTreePreview {
+                            name: drag.name.clone(),
+                            is_dir: drag.is_dir,
+                        })
+                    },
+                )
+                .drag_over::<DraggedTreeEntry>(move |style, drag, _, _| {
+                    if can_drop_onto_dir(&drag.path, &dir_for_hover) {
+                        style
+                            .bg(hex_alpha(0x8ba4b038))
+                            .border_1()
+                            .border_color(hex_color(kd::BLUE))
+                    } else {
+                        style
+                    }
+                })
+                .on_drop(cx.listener(move |this, drag: &DraggedTreeEntry, window, cx| {
+                    cx.stop_propagation();
+                    this.move_fs_entry(drag.path.clone(), dir_for_drop.clone(), window, cx);
+                }))
+                .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                    this.selected_tree_path = Some(dir_for_click.clone());
+                    if ev.click_count() >= 2 {
+                        // Revert click-1 expand flip before starting inline rename.
+                        if !this.expanded_dirs.remove(&dir_for_click) {
+                            this.expanded_dirs.insert(dir_for_click.clone());
+                        }
+                        this.start_inline_rename(dir_for_click.clone(), window, cx);
+                    } else {
+                        if !this.expanded_dirs.remove(&dir_for_click) {
+                            this.expanded_dirs.insert(dir_for_click.clone());
+                        }
+                        this.sidebar_focus.focus(window, cx);
+                        cx.notify();
+                    }
                 }))
                 .context_menu(move |menu, _, _| {
                     let app_md = app_entity.clone();
@@ -446,6 +617,74 @@ fn collect_tree_rows(
                                 }),
                         )
                         .item(
+                            PopupMenuItem::new("New Canvas Here…")
+                                .icon(IconName::Columns2)
+                                .on_click({
+                                    let app_cnv = app_entity.clone();
+                                    let d_cnv = dir_for_menu.clone();
+                                    move |_, window, cx| {
+                                        modals::open_new_item_dialog(
+                                            app_cnv.clone(),
+                                            d_cnv.clone(),
+                                            NewItemTemplate::Canvas,
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new("New Kanban Here…")
+                                .icon(IconName::Check)
+                                .on_click({
+                                    let app_kbn = app_entity.clone();
+                                    let d_kbn = dir_for_menu.clone();
+                                    move |_, window, cx| {
+                                        modals::open_new_item_dialog(
+                                            app_kbn.clone(),
+                                            d_kbn.clone(),
+                                            NewItemTemplate::Kanban,
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new("New Mermaid Diagram…")
+                                .icon(IconName::Split)
+                                .on_click({
+                                    let app_mmd = app_entity.clone();
+                                    let d_mmd = dir_for_menu.clone();
+                                    move |_, window, cx| {
+                                        modals::open_new_item_dialog(
+                                            app_mmd.clone(),
+                                            d_mmd.clone(),
+                                            NewItemTemplate::Mermaid,
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new("New SVG Graphic…")
+                                .icon(IconName::Code)
+                                .on_click({
+                                    let app_svg = app_entity.clone();
+                                    let d_svg = dir_for_menu.clone();
+                                    move |_, window, cx| {
+                                        modals::open_new_item_dialog(
+                                            app_svg.clone(),
+                                            d_svg.clone(),
+                                            NewItemTemplate::Svg,
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                }),
+                        )
+                        .item(
                             PopupMenuItem::new("New Folder Here…")
                                 .icon(IconName::FolderPlus)
                                 .on_click(move |_, window, cx| {
@@ -460,15 +699,12 @@ fn collect_tree_rows(
                         )
                         .separator()
                         .item(
-                            PopupMenuItem::new("Rename…")
+                            PopupMenuItem::new("Rename")
                                 .icon(IconName::Pencil)
                                 .on_click(move |_, window, cx| {
-                                    modals::open_rename_dialog(
-                                        app_ren.clone(),
-                                        d5.clone(),
-                                        window,
-                                        cx,
-                                    );
+                                    app_ren.update(cx, |app, cx| {
+                                        app.start_inline_rename(d5.clone(), window, cx);
+                                    });
                                 }),
                         )
                         .item(
@@ -530,7 +766,46 @@ fn collect_tree_rows(
             let path_click = node_path.clone();
             let path_mid = node_path.clone();
             let path_menu = node_path.clone();
+            let path_drag = node_path.clone();
+            let name_drag = node_name.clone();
+            let parent_dir = node_path.parent().map(Path::to_path_buf);
             let row_id: SharedString = format!("tree-file-{}", node.rel_path).into();
+
+            if let Some(ren_input) = rename_input {
+                let row = h_flex()
+                    .id(row_id)
+                    .w_full()
+                    .h(px(25.))
+                    .pl(px(indent_px + 14.0))
+                    .pr_2()
+                    .gap_1p5()
+                    .items_center()
+                    .rounded(px(4.))
+                    .bg(hex_color(kd::BG_PANEL))
+                    .child(
+                        div()
+                            .w(px(6.))
+                            .h(px(6.))
+                            .rounded_full()
+                            .flex_shrink_0()
+                            .bg(badge_color),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                                if ev.keystroke.key == "escape" {
+                                    cx.stop_propagation();
+                                    this.cancel_inline_rename(window, cx);
+                                }
+                            }))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(Input::new(&ren_input).xsmall()),
+                    );
+                out.push(row.into_any_element());
+                continue;
+            }
 
             let row = div()
                 .id(row_id)
@@ -545,6 +820,7 @@ fn collect_tree_rows(
                 .gap_1p5()
                 .cursor_pointer()
                 .when(is_active, |s| s.bg(hex_alpha(0x8ba4b029)))
+                .when(!is_active && is_selected, |s| s.bg(hex_alpha(0x8ba4b01e)))
                 .hover(|s| {
                     if is_active {
                         s.bg(hex_alpha(0x8ba4b035))
@@ -552,9 +828,42 @@ fn collect_tree_rows(
                         s.bg(hex_color(kd::BG_PANEL))
                     }
                 })
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    let pane = this.active_pane;
-                    this.open_file(path_click.clone(), pane, window, cx);
+                .on_drag(
+                    DraggedTreeEntry {
+                        path: path_drag,
+                        name: name_drag,
+                        is_dir: false,
+                    },
+                    |drag, _, _, cx| {
+                        cx.new(|_| DraggedTreePreview {
+                            name: drag.name.clone(),
+                            is_dir: drag.is_dir,
+                        })
+                    },
+                )
+                .when_some(parent_dir, |el, pdir| {
+                    let check_dir = pdir.clone();
+                    let drop_dir = pdir;
+                    el.drag_over::<DraggedTreeEntry>(move |style, drag, _, _| {
+                        if can_drop_onto_dir(&drag.path, &check_dir) {
+                            style.bg(hex_alpha(0x8ba4b024))
+                        } else {
+                            style
+                        }
+                    })
+                    .on_drop(cx.listener(move |this, drag: &DraggedTreeEntry, window, cx| {
+                        cx.stop_propagation();
+                        this.move_fs_entry(drag.path.clone(), drop_dir.clone(), window, cx);
+                    }))
+                })
+                .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                    this.selected_tree_path = Some(path_click.clone());
+                    if ev.click_count() >= 2 {
+                        this.start_inline_rename(path_click.clone(), window, cx);
+                    } else {
+                        let pane = this.active_pane;
+                        this.open_file(path_click.clone(), pane, window, cx);
+                    }
                 }))
                 .on_mouse_down(
                     MouseButton::Middle,
@@ -585,15 +894,12 @@ fn collect_tree_rows(
                                 }),
                         )
                         .item(
-                            PopupMenuItem::new("Rename…")
+                            PopupMenuItem::new("Rename")
                                 .icon(IconName::Pencil)
                                 .on_click(move |_, window, cx| {
-                                    modals::open_rename_dialog(
-                                        app_ren.clone(),
-                                        p2.clone(),
-                                        window,
-                                        cx,
-                                    );
+                                    app_ren.update(cx, |app, cx| {
+                                        app.start_inline_rename(p2.clone(), window, cx);
+                                    });
                                 }),
                         )
                         .item(

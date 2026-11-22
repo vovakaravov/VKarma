@@ -1,6 +1,7 @@
 mod config;
+mod formats;
 mod fountain;
-mod live_preview;
+mod live_md;
 mod markdown;
 mod pdf_engine;
 mod spreadsheet;

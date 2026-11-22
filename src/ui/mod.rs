@@ -1,16 +1,38 @@
+pub mod archive_view;
+pub mod audio_view;
+pub mod canvas_view;
 pub mod code_view;
+pub mod epub_view;
+pub mod font_view;
 pub mod fountain_view;
-pub mod live_preview_view;
+pub mod kanban_view;
+pub mod live_editor;
 pub mod markdown_view;
+pub mod mermaid_view;
 pub mod modals;
+pub mod office_view;
 pub mod pane;
 pub mod pdf_view;
 pub mod right_panel;
 pub mod sidebar;
 pub mod spreadsheet_view;
+pub mod sqlite_view;
 pub mod status_bar;
+pub mod subtitle_view;
+pub mod svg_view;
 pub mod typst_view;
 pub mod workspace_bar;
+
+use archive_view::ArchiveView;
+use audio_view::AudioView;
+use canvas_view::{CanvasView, CanvasViewEvent};
+use epub_view::EpubView;
+use font_view::FontView;
+use kanban_view::{KanbanView, KanbanViewEvent};
+use mermaid_view::{MermaidView, MermaidViewEvent};
+use sqlite_view::SqliteView;
+use subtitle_view::{SubtitleView, SubtitleViewEvent};
+use svg_view::{SvgView, SvgViewEvent};
 
 use crate::config::{
     AppConfig, MdViewMode, WorkspaceConfig, WorkspacePreset, default_starter_workspaces,
@@ -19,12 +41,7 @@ use crate::config::{
 use crate::fountain::{
     FountainDocument, extract_fountain_headings, fountain_to_typst, parse_fountain,
 };
-use crate::live_preview::{
-    LiveBlock, LiveBlockKind, LiveEnterAction, block_index_for_line, byte_offset_to_line_col,
-    clamp_to_char_boundary, classify_single_line, click_pos_to_raw_byte, compute_smart_enter,
-    line_col_to_byte_offset, parse_live_blocks, splice_block_in_doc, toggle_task_in_line,
-};
-use live_preview_view::LiveScrollbarHandle;
+use crate::live_md::LinkTarget;
 use crate::markdown::{
     SceneBreakPlugin, StyledImagePlugin, preprocess_markdown_with_options, toggle_nth_task_checkbox,
     word_and_char_count,
@@ -39,36 +56,75 @@ use crate::vault::{
 };
 use crate::watcher::WorkspaceWatcher;
 use gpui_kit::assets::IconName;
-use gpui_kit::base::input::{BufferPoint, DiagnosticColors, InputEditorStyle};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{EditorState, InputEvent, InputState, TextareaState};
+use gpui_kit::component::input::{EditorState, InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::text::{FrontmatterPlugin, MarkdownExtensions, TaskToggleEvent};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
+    Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
-    App, AppContext as _, Bounds, ClipboardEntry, ClipboardItem, Context, Entity, FocusHandle,
-    Focusable, Hsla, Image, InteractiveElement as _, IntoElement, KeyBinding, ListAlignment,
-    ListState, MouseButton, MouseDownEvent, NavigationDirection, ParentElement, PathPromptOptions,
-    Pixels, Point, Render, SharedString, Styled, Subscription, UniformListScrollHandle, Window,
-    actions, div, prelude::FluentBuilder as _, px,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable, Hsla,
+    Image, InteractiveElement as _, IntoElement, KeyBinding, MouseButton, MouseDownEvent,
+    NavigationDirection, ParentElement, PathPromptOptions, Render, SharedString,
+    StatefulInteractiveElement as _, Styled, Subscription, UniformListScrollHandle, Window, actions,
+    div, prelude::FluentBuilder as _, px,
 };
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use live_editor::{LiveEditorEvent, LiveMarkdownEditor};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 static NEXT_TAB_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_tab_id() -> u64 {
     NEXT_TAB_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub const NORMAL_READ_WIDTH: f32 = 820.0;
+pub const ZEN_BOOK_WIDTH: f32 = 680.0;
+
+/// Returns the centered prose column max-width in pixels for the current view mode.
+pub fn column_max_width(centered: bool, zen_mode: bool) -> Option<f32> {
+    if zen_mode {
+        Some(ZEN_BOOK_WIDTH)
+    } else if centered {
+        Some(NORMAL_READ_WIDTH)
+    } else {
+        None
+    }
+}
+
+/// Frames an `Editor` widget either full-bleed or centered at book width in Zen Mode.
+pub fn zen_editor_frame(content: impl IntoElement, zen_mode: bool) -> AnyElement {
+    if zen_mode {
+        div()
+            .size_full()
+            .bg(hex_color(kd::BG_MAIN))
+            .flex()
+            .justify_center()
+            .px_6()
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(ZEN_BOOK_WIDTH))
+                    .h_full()
+                    .pt(px(36.))
+                    .child(content),
+            )
+            .into_any_element()
+    } else {
+        div()
+            .size_full()
+            .bg(hex_color(kd::BG_MAIN))
+            .child(content)
+            .into_any_element()
+    }
 }
 
 actions!(
@@ -80,6 +136,7 @@ actions!(
         VaultSearch,
         ToggleViewMode,
         ToggleSourceMode,
+        ToggleZenMode,
         SplitRight,
         CloseTab,
         NextTab,
@@ -89,6 +146,7 @@ actions!(
         OpenFileDialog,
         OpenFolderDialog,
         EscapeModal,
+        RenameSelectedTreeItem,
         NavigateBack,
         NavigateForward,
         SwitchWorkspace1,
@@ -114,6 +172,8 @@ pub fn register_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-shift-f", VaultSearch, None),
         KeyBinding::new("ctrl-e", ToggleViewMode, None),
         KeyBinding::new("ctrl-m", ToggleSourceMode, None),
+        KeyBinding::new("f11", ToggleZenMode, None),
+        KeyBinding::new("ctrl-alt-z", ToggleZenMode, None),
         KeyBinding::new("ctrl-\\", SplitRight, None),
         KeyBinding::new("ctrl-w", CloseTab, None),
         KeyBinding::new("ctrl-tab", NextTab, None),
@@ -123,6 +183,7 @@ pub fn register_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-o", OpenFileDialog, None),
         KeyBinding::new("ctrl-shift-o", OpenFolderDialog, None),
         KeyBinding::new("escape", EscapeModal, None),
+        KeyBinding::new("f2", RenameSelectedTreeItem, None),
         KeyBinding::new("alt-left", NavigateBack, None),
         KeyBinding::new("alt-right", NavigateForward, None),
         KeyBinding::new("ctrl-alt-1", SwitchWorkspace1, None),
@@ -159,6 +220,13 @@ pub enum RightPanelTab {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeViewMode {
+    Code,
+    Tree,
+    Table,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypstViewMode {
     Edit,
     Split,
@@ -175,6 +243,7 @@ pub enum FountainViewMode {
 pub enum TabKind {
     Markdown {
         editor: Entity<EditorState>,
+        live_doc: Entity<LiveMarkdownEditor>,
         view_mode: MdViewMode,
         source_mode: bool,
         preprocessed: SharedString,
@@ -185,16 +254,6 @@ pub enum TabKind {
         is_mdx: bool,
         chapter_mode: bool,
         active_chapter: usize,
-        live_blocks: Arc<Vec<LiveBlock>>,
-        live_active_block: Option<usize>,
-        live_editor: Entity<TextareaState>,
-        live_list_state: ListState,
-        live_scrollbar: LiveScrollbarHandle,
-        live_syncing: Arc<AtomicBool>,
-        live_row_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
-        live_last_wrap_rows: usize,
-        live_dirty_block: bool,
-        live_edit_gen: u64,
         _live_sub: Subscription,
         _sub: Subscription,
     },
@@ -234,7 +293,57 @@ pub enum TabKind {
         language: &'static str,
         badge: &'static str,
         soft_wrap: bool,
+        data_view: CodeViewMode,
+        collapsed_paths: HashSet<String>,
+        tree_filter: Option<Entity<InputState>>,
+        _tree_filter_sub: Option<Subscription>,
         _sub: Subscription,
+    },
+    Canvas {
+        view: Entity<CanvasView>,
+        _sub: Subscription,
+    },
+    Kanban {
+        view: Entity<KanbanView>,
+        _sub: Subscription,
+    },
+    Subtitle {
+        view: Entity<SubtitleView>,
+        _sub: Subscription,
+    },
+    Svg {
+        view: Entity<SvgView>,
+        _sub: Subscription,
+    },
+    Mermaid {
+        view: Entity<MermaidView>,
+        _sub: Subscription,
+    },
+    Office {
+        doc: crate::formats::office::OfficeDoc,
+        paper_light: bool,
+        font_scale: f32,
+        file_size_bytes: u64,
+    },
+    Epub {
+        view: Entity<EpubView>,
+        file_size_bytes: u64,
+    },
+    Sqlite {
+        view: Entity<SqliteView>,
+        file_size_bytes: u64,
+    },
+    Archive {
+        view: Entity<ArchiveView>,
+        file_size_bytes: u64,
+    },
+    Audio {
+        view: Entity<AudioView>,
+        file_size_bytes: u64,
+    },
+    Font {
+        view: Entity<FontView>,
+        file_size_bytes: u64,
     },
     Image {
         zoom: f32,
@@ -364,9 +473,19 @@ pub struct QuickSwitcherState {
     pub _sub: Subscription,
 }
 
+pub struct InlineRenameState {
+    pub target_path: PathBuf,
+    pub input: Entity<InputState>,
+    pub _sub: Subscription,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NewItemTemplate {
     Markdown,
+    Canvas,
+    Kanban,
+    Mermaid,
+    Svg,
     Typst,
     Spreadsheet,
     Fountain,
@@ -377,6 +496,10 @@ impl NewItemTemplate {
     pub fn title(&self) -> &'static str {
         match self {
             Self::Markdown => "New Markdown Note",
+            Self::Canvas => "New JSON Canvas",
+            Self::Kanban => "New Kanban Board",
+            Self::Mermaid => "New Mermaid Diagram",
+            Self::Svg => "New SVG Graphic",
             Self::Typst => "New Typst Document",
             Self::Spreadsheet => "New Spreadsheet (.xlsx)",
             Self::Fountain => "New Fountain Screenplay",
@@ -387,6 +510,10 @@ impl NewItemTemplate {
     pub fn placeholder(&self) -> &'static str {
         match self {
             Self::Markdown => "My Note.md",
+            Self::Canvas => "Storyboard.canvas",
+            Self::Kanban => "Tasks.kanban",
+            Self::Mermaid => "Flow.mmd",
+            Self::Svg => "Icon.svg",
             Self::Typst => "Document.typ",
             Self::Spreadsheet => "Sheet.xlsx",
             Self::Fountain => "Screenplay.fountain",
@@ -397,6 +524,10 @@ impl NewItemTemplate {
     pub fn extension(&self) -> Option<&'static str> {
         match self {
             Self::Markdown => Some("md"),
+            Self::Canvas => Some("canvas"),
+            Self::Kanban => Some("kanban"),
+            Self::Mermaid => Some("mmd"),
+            Self::Svg => Some("svg"),
             Self::Typst => Some("typ"),
             Self::Spreadsheet => Some("xlsx"),
             Self::Fountain => Some("fountain"),
@@ -409,6 +540,17 @@ pub fn file_kind_color(kind: FileKind) -> Hsla {
     match kind {
         FileKind::Markdown => hex_color(kd::BLUE),
         FileKind::Mdx => hex_color(kd::ORANGE),
+        FileKind::Canvas => hex_color(kd::VIOLET),
+        FileKind::Kanban => hex_color(kd::AQUA),
+        FileKind::Subtitle => hex_color(kd::ORANGE),
+        FileKind::Svg => hex_color(kd::PINK),
+        FileKind::Mermaid => hex_color(kd::AQUA),
+        FileKind::Office => hex_color(kd::GREEN),
+        FileKind::Epub => hex_color(kd::VIOLET),
+        FileKind::Sqlite => hex_color(kd::AQUA),
+        FileKind::Archive => hex_color(kd::YELLOW),
+        FileKind::Audio => hex_color(kd::ORANGE),
+        FileKind::Font => hex_color(kd::GREEN),
         FileKind::Fountain => hex_color(kd::VIOLET),
         FileKind::Typst => hex_color(kd::AQUA),
         FileKind::Spreadsheet => hex_color(kd::GREEN),
@@ -428,6 +570,20 @@ pub fn tab_badge_and_color(tab: &DocumentTab) -> (&'static str, Hsla) {
                 ("MD", hex_color(kd::BLUE))
             }
         }
+        TabKind::Canvas { .. } => ("CNV", hex_color(kd::VIOLET)),
+        TabKind::Kanban { .. } => ("KBN", hex_color(kd::AQUA)),
+        TabKind::Subtitle { .. } => ("SUB", hex_color(kd::ORANGE)),
+        TabKind::Svg { .. } => ("SVG", hex_color(kd::PINK)),
+        TabKind::Mermaid { .. } => ("MMD", hex_color(kd::AQUA)),
+        TabKind::Office { doc, .. } => (doc.format.label(), hex_color(kd::GREEN)),
+        TabKind::Epub { .. } => ("EPUB", hex_color(kd::VIOLET)),
+        TabKind::Sqlite { .. } => ("DB", hex_color(kd::AQUA)),
+        TabKind::Archive { .. } => (
+            crate::formats::archive::ArchiveFormat::from_path(&tab.path).label(),
+            hex_color(kd::YELLOW),
+        ),
+        TabKind::Audio { .. } => ("AUD", hex_color(kd::ORANGE)),
+        TabKind::Font { .. } => ("FNT", hex_color(kd::GREEN)),
         TabKind::Fountain { .. } => ("FTN", hex_color(kd::VIOLET)),
         TabKind::Typst { .. } => ("TYP", hex_color(kd::AQUA)),
         TabKind::Spreadsheet { doc, .. } => (doc.format.label(), hex_color(kd::GREEN)),
@@ -506,6 +662,9 @@ pub struct VKarmaApp {
     pub active_pane: PaneSide,
 
     pub sidebar_tab: SidebarTab,
+    pub sidebar_focus: FocusHandle,
+    pub selected_tree_path: Option<PathBuf>,
+    pub inline_rename: Option<InlineRenameState>,
     pub right_panel_tab: RightPanelTab,
     pub expanded_dirs: HashSet<PathBuf>,
 
@@ -517,6 +676,8 @@ pub struct VKarmaApp {
     pub nav_history: NavHistory,
     pub status_toast: Option<String>,
     pub workspace_gen: u64,
+    pub zen_mode: bool,
+    pub zen_entered_fullscreen: bool,
 }
 
 impl Focusable for VKarmaApp {
@@ -620,6 +781,9 @@ impl VKarmaApp {
             right_pane: None,
             active_pane: PaneSide::Left,
             sidebar_tab: SidebarTab::Files,
+            sidebar_focus: cx.focus_handle(),
+            selected_tree_path: None,
+            inline_rename: None,
             right_panel_tab: RightPanelTab::Outline,
             expanded_dirs: HashSet::new(),
             search_input,
@@ -629,6 +793,8 @@ impl VKarmaApp {
             nav_history: NavHistory::default(),
             status_toast: None,
             workspace_gen: 1,
+            zen_mode: false,
+            zen_entered_fullscreen: false,
         };
 
         window.set_window_title(&ws_title);
@@ -818,12 +984,9 @@ impl VKarmaApp {
         if target_idx >= self.workspaces.len() || target_idx == self.active_workspace {
             return;
         }
-        for side in [PaneSide::Left, PaneSide::Right] {
-            if let Some(tab_id) = self.pane(side).and_then(WorkspacePane::active).map(|t| t.id) {
-                self.commit_active_live_block(side, tab_id, window, cx);
-            }
-        }
         self.quick_switcher = None;
+        self.inline_rename = None;
+        self.selected_tree_path = None;
 
         let search_query = self.search_input.read(cx).value().to_string();
         let old_idx = self.active_workspace;
@@ -1124,12 +1287,18 @@ impl VKarmaApp {
                 {
                     if let TabKind::Markdown {
                         editor,
+                        live_doc,
+                        source_mode,
                         preprocessed,
                         is_mdx,
                         ..
                     } = &mut pane.kind
                     {
-                        let raw = editor.read(cx).value();
+                        let raw: SharedString = if *source_mode {
+                            editor.read(cx).value()
+                        } else {
+                            live_doc.read(cx).text().to_string().into()
+                        };
                         *preprocessed = preprocess_markdown_with_options(
                             raw.as_ref(),
                             &pane.path,
@@ -1138,6 +1307,9 @@ impl VKarmaApp {
                             *is_mdx,
                         )
                         .into();
+                    } else if let TabKind::Canvas { view, .. } = &pane.kind {
+                        let vault_clone = Arc::clone(&vault);
+                        view.update(cx, |v, _| v.update_vault(vault_clone));
                     }
                 }
                 cx.notify();
@@ -1157,6 +1329,8 @@ impl VKarmaApp {
         }
         self.workspace_gen = self.workspace_gen.wrapping_add(1);
         self.expanded_dirs.clear();
+        self.inline_rename = None;
+        self.selected_tree_path = None;
         self.search_hits.clear();
         self.watcher = WorkspaceWatcher::start(&canon).ok();
         self.persist_workspaces();
@@ -1366,15 +1540,15 @@ impl VKarmaApp {
         match &tab.kind {
             TabKind::Markdown {
                 editor,
+                live_doc,
+                view_mode,
                 source_mode,
-                live_active_block,
-                live_editor,
                 ..
             } => {
                 if *source_mode {
                     editor.focus_handle(cx).focus(window, cx);
-                } else if live_active_block.is_some() {
-                    live_editor.focus_handle(cx).focus(window, cx);
+                } else if *view_mode != MdViewMode::Reading {
+                    live_doc.focus_handle(cx).focus(window, cx);
                 } else {
                     self.focus_handle.focus(window, cx);
                 }
@@ -1384,10 +1558,40 @@ impl VKarmaApp {
             | TabKind::Code { editor, .. } => {
                 editor.focus_handle(cx).focus(window, cx);
             }
+            TabKind::Canvas { view, .. } => {
+                view.focus_handle(cx).focus(window, cx);
+            }
+            TabKind::Kanban { view, .. } => {
+                view.focus_handle(cx).focus(window, cx);
+            }
+            TabKind::Subtitle { view, .. } => {
+                view.focus_handle(cx).focus(window, cx);
+            }
+            TabKind::Svg { view, .. } => {
+                view.focus_handle(cx).focus(window, cx);
+            }
+            TabKind::Mermaid { view, .. } => {
+                view.focus_handle(cx).focus(window, cx);
+            }
+            TabKind::Epub { view, .. } => {
+                view.focus_handle(cx).focus(window, cx);
+            }
+            TabKind::Sqlite { view, .. } => {
+                view.focus_handle(cx).focus(window, cx);
+            }
+            TabKind::Archive { view, .. } => {
+                view.focus_handle(cx).focus(window, cx);
+            }
+            TabKind::Audio { view, .. } => {
+                view.focus_handle(cx).focus(window, cx);
+            }
+            TabKind::Font { view, .. } => {
+                view.focus_handle(cx).focus(window, cx);
+            }
             TabKind::Spreadsheet { grid_focus, .. } => {
                 grid_focus.focus(window, cx);
             }
-            TabKind::Image { .. } | TabKind::Pdf { .. } => {}
+            TabKind::Image { .. } | TabKind::Pdf { .. } | TabKind::Office { .. } => {}
         }
     }
 
@@ -1423,13 +1627,48 @@ impl VKarmaApp {
                 let source_mode = self.config.default_md_source_mode;
                 let view_mode = self.config.default_md_view;
 
-                let live_blocks = Arc::new(parse_live_blocks(&raw, is_mdx));
-                let live_list_state =
-                    ListState::new(live_blocks.len() + 1, ListAlignment::Top, px(1200.));
-                let live_scrollbar =
-                    LiveScrollbarHandle::new(live_list_state.clone(), Arc::clone(&live_blocks));
-                let live_syncing = Arc::new(AtomicBool::new(false));
-                let live_row_bounds = Rc::new(RefCell::new(HashMap::new()));
+                let live_doc = cx.new(|cx| {
+                    LiveMarkdownEditor::new(
+                        raw.clone(),
+                        path.to_path_buf(),
+                        Arc::clone(&self.vault),
+                        is_mdx,
+                        window,
+                        cx,
+                    )
+                });
+
+                let _live_sub =
+                    cx.subscribe_in(&live_doc, window, move |this, _ed, event, window, cx| {
+                        match event {
+                            LiveEditorEvent::Changed => {
+                                this.on_live_doc_changed(side, tab_id, window, cx);
+                            }
+                            LiveEditorEvent::OpenLink {
+                                target,
+                                in_right_split,
+                            } => {
+                                let dest = if *in_right_split {
+                                    PaneSide::Right
+                                } else {
+                                    side
+                                };
+                                let url: SharedString = match target {
+                                    LinkTarget::Wikilink(note) => format!(
+                                        "{}{}",
+                                        crate::markdown::VKARMA_NOTE_SCHEME,
+                                        crate::markdown::encode_uri_payload(note)
+                                    )
+                                    .into(),
+                                    LinkTarget::Url(u) => u.clone().into(),
+                                };
+                                this.handle_markdown_link(tab_id, dest, &url, window, cx);
+                            }
+                            LiveEditorEvent::PasteImage(item) => {
+                                this.handle_live_image_paste(side, tab_id, item, window, cx);
+                            }
+                        }
+                    });
 
                 let editor = cx.new(|cx| {
                     let mut state = EditorState::new(window, cx)
@@ -1446,41 +1685,6 @@ impl VKarmaApp {
                     state
                 });
 
-                let theme = cx.theme().clone();
-                let live_editor = cx.new(|cx| {
-                    let mut st = TextareaState::new(window, cx)
-                        .soft_wrap(true)
-                        .auto_grow(1, 200);
-                    st.set_editor_paddings(gpui_kit::Edges::all(px(0.)));
-                    st.set_editor_style(InputEditorStyle {
-                        foreground: hex_color(kd::FG),
-                        muted_foreground: hex_color(kd::FG_MUTED),
-                        background: gpui_kit::transparent_black(),
-                        border: gpui_kit::transparent_black(),
-                        selection: theme.selection,
-                        caret: hex_color(kd::BLUE),
-                        diagnostics: DiagnosticColors {
-                            error: hex_color(kd::RED),
-                            warning: hex_color(kd::YELLOW),
-                            info: hex_color(kd::BLUE),
-                            hint: hex_color(kd::AQUA),
-                        },
-                        highlight_styles: theme.highlight_theme.clone(),
-                        editor_invisible: None,
-                        editor_active_line: None,
-                        editor_gutter_background: None,
-                        fold_icon_renderer: None,
-                    });
-                    st
-                });
-
-                let _live_sub =
-                    cx.subscribe_in(&live_editor, window, move |this, _ed, event, window, cx| {
-                        if matches!(event, InputEvent::Change) {
-                            this.on_live_editor_changed(side, tab_id, window, cx);
-                        }
-                    });
-
                 let sub = cx.subscribe_in(&editor, window, move |this, _ed, event, window, cx| {
                     if matches!(event, InputEvent::Change) {
                         this.on_markdown_changed(side, tab_id, window, cx);
@@ -1489,6 +1693,7 @@ impl VKarmaApp {
 
                 TabKind::Markdown {
                     editor,
+                    live_doc,
                     view_mode,
                     source_mode,
                     preprocessed,
@@ -1499,16 +1704,6 @@ impl VKarmaApp {
                     is_mdx,
                     chapter_mode: false,
                     active_chapter: 0,
-                    live_blocks,
-                    live_active_block: None,
-                    live_editor,
-                    live_list_state,
-                    live_scrollbar,
-                    live_syncing,
-                    live_row_bounds,
-                    live_last_wrap_rows: 1,
-                    live_dirty_block: false,
-                    live_edit_gen: 0,
                     _live_sub,
                     _sub: sub,
                 }
@@ -1640,6 +1835,131 @@ impl VKarmaApp {
                     modified: meta.modified().ok(),
                 }
             }
+            FileKind::Canvas => {
+                let raw = fs::read_to_string(path)?;
+                let doc = crate::formats::canvas::CanvasDoc::parse(&raw)?;
+                let doc_path = path.to_path_buf();
+                let vault = Arc::clone(&self.vault);
+                let view =
+                    cx.new(|cx| CanvasView::new(doc, raw, doc_path, vault, window, cx));
+                let sub = cx.subscribe_in(&view, window, move |this, _, event, window, cx| {
+                    match event {
+                        CanvasViewEvent::Changed => this.on_code_changed(side, tab_id, window, cx),
+                        CanvasViewEvent::OpenFile(target_path) => {
+                            let pane = this.active_pane;
+                            this.open_file(target_path.clone(), pane, window, cx);
+                        }
+                    }
+                });
+                TabKind::Canvas { view, _sub: sub }
+            }
+            FileKind::Kanban => {
+                let raw = fs::read_to_string(path)?;
+                let view = cx.new(|cx| KanbanView::new(raw, window, cx));
+                let sub = cx.subscribe_in(&view, window, move |this, _, event, window, cx| {
+                    if matches!(event, KanbanViewEvent::Changed) {
+                        this.on_code_changed(side, tab_id, window, cx);
+                    }
+                });
+                TabKind::Kanban { view, _sub: sub }
+            }
+            FileKind::Subtitle => {
+                let raw = fs::read_to_string(path)?;
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let default_fmt = if ext == "vtt" {
+                    crate::formats::subtitle::SubtitleFormat::Vtt
+                } else {
+                    crate::formats::subtitle::SubtitleFormat::Srt
+                };
+                let view = cx.new(|cx| SubtitleView::new(raw, default_fmt, window, cx));
+                let sub = cx.subscribe_in(&view, window, move |this, _, event, window, cx| {
+                    if matches!(event, SubtitleViewEvent::Changed) {
+                        this.on_code_changed(side, tab_id, window, cx);
+                    }
+                });
+                TabKind::Subtitle { view, _sub: sub }
+            }
+            FileKind::Svg => {
+                let raw = fs::read_to_string(path)?;
+                let doc_path = path.to_path_buf();
+                let view = cx.new(|cx| SvgView::new(raw, doc_path, window, cx));
+                let sub = cx.subscribe_in(&view, window, move |this, _, event, window, cx| {
+                    if matches!(event, SvgViewEvent::Changed) {
+                        this.on_code_changed(side, tab_id, window, cx);
+                    }
+                });
+                TabKind::Svg { view, _sub: sub }
+            }
+            FileKind::Mermaid => {
+                let raw = fs::read_to_string(path)?;
+                let doc_path = path.to_path_buf();
+                let view = cx.new(|cx| MermaidView::new(raw, doc_path, window, cx));
+                let sub = cx.subscribe_in(&view, window, move |this, _, event, window, cx| {
+                    if matches!(event, MermaidViewEvent::Changed) {
+                        this.on_code_changed(side, tab_id, window, cx);
+                    }
+                });
+                TabKind::Mermaid { view, _sub: sub }
+            }
+            FileKind::Office => {
+                let meta = fs::metadata(path)?;
+                let doc = crate::formats::office::OfficeDoc::load(path)?;
+                TabKind::Office {
+                    doc,
+                    paper_light: false,
+                    font_scale: 1.0,
+                    file_size_bytes: meta.len(),
+                }
+            }
+            FileKind::Epub => {
+                let meta = fs::metadata(path)?;
+                let book = crate::formats::epub::EpubBook::load(path)?;
+                let view = cx.new(|cx| EpubView::new(book, cx));
+                TabKind::Epub {
+                    view,
+                    file_size_bytes: meta.len(),
+                }
+            }
+            FileKind::Sqlite => {
+                let meta = fs::metadata(path)?;
+                let db_path = path.to_path_buf();
+                let view = cx.new(|cx| SqliteView::new(db_path, window, cx));
+                TabKind::Sqlite {
+                    view,
+                    file_size_bytes: meta.len(),
+                }
+            }
+            FileKind::Archive => {
+                let meta = fs::metadata(path)?;
+                let arc_path = path.to_path_buf();
+                let view = cx.new(|cx| ArchiveView::new(arc_path, window, cx));
+                TabKind::Archive {
+                    view,
+                    file_size_bytes: meta.len(),
+                }
+            }
+            FileKind::Audio => {
+                let meta = fs::metadata(path)?;
+                let audio_path = path.to_path_buf();
+                let view = cx.new(|cx| AudioView::new(audio_path, window, cx));
+                TabKind::Audio {
+                    view,
+                    file_size_bytes: meta.len(),
+                }
+            }
+            FileKind::Font => {
+                let meta = fs::metadata(path)?;
+                let info = crate::formats::font::FontInfo::load(path)?;
+                let view = cx.new(|cx| FontView::new(info, window, cx));
+                TabKind::Font {
+                    view,
+                    file_size_bytes: meta.len(),
+                }
+            }
             FileKind::Code(lang) => {
                 let raw = fs::read_to_string(path)?;
                 let editor = cx.new(|cx| {
@@ -1654,11 +1974,28 @@ impl VKarmaApp {
                         this.on_code_changed(side, tab_id, window, cx);
                     }
                 });
+                let (tree_filter, tree_filter_sub) =
+                    if crate::formats::data_tree::is_structured_lang(lang) {
+                        let inp =
+                            cx.new(|cx| InputState::new(window, cx).placeholder("Filter keys or values…"));
+                        let fsub = cx.subscribe(&inp, |_, _, event, cx| {
+                            if matches!(event, InputEvent::Change) {
+                                cx.notify();
+                            }
+                        });
+                        (Some(inp), Some(fsub))
+                    } else {
+                        (None, None)
+                    };
                 TabKind::Code {
                     editor,
                     language: lang,
                     badge: file_kind.short_badge(),
                     soft_wrap: false,
+                    data_view: CodeViewMode::Code,
+                    collapsed_paths: HashSet::new(),
+                    tree_filter,
+                    _tree_filter_sub: tree_filter_sub,
                     _sub: sub,
                 }
             }
@@ -1681,6 +2018,10 @@ impl VKarmaApp {
                     language: "text",
                     badge: "TXT",
                     soft_wrap: true,
+                    data_view: CodeViewMode::Code,
+                    collapsed_paths: HashSet::new(),
+                    tree_filter: None,
+                    _tree_filter_sub: None,
                     _sub: sub,
                 }
             }
@@ -1776,1132 +2117,24 @@ impl VKarmaApp {
         cx.notify();
     }
 
-    pub fn commit_active_live_block(
+    fn on_live_doc_changed(
         &mut self,
         side: PaneSide,
         tab_id: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let info = {
-            let Some(tab) = self.find_tab(side, tab_id) else {
-                return;
-            };
-            let TabKind::Markdown {
-                editor,
-                is_mdx,
-                live_blocks,
-                live_active_block,
-                live_editor,
-                live_syncing,
-                live_dirty_block,
-                ..
-            } = &tab.kind
-            else {
-                return;
-            };
-            if !*live_dirty_block {
-                return;
-            }
-            let Some(ix) = *live_active_block else {
-                return;
-            };
-            let Some(block) = live_blocks.get(ix) else {
-                return;
-            };
-            (
-                editor.clone(),
-                live_editor.clone(),
-                Arc::clone(live_syncing),
-                Arc::clone(live_blocks),
-                *is_mdx,
-                ix,
-                block.clone(),
-            )
-        };
-        let (editor, live_editor, live_syncing, old_blocks, is_mdx, ix, block) = info;
-
-        let new_text = live_editor.read(cx).value().to_string();
-        let raw_doc = editor.read(cx).value();
-        let new_doc =
-            splice_block_in_doc(raw_doc.as_ref(), block.byte_start, block.byte_end, &new_text);
-
-        live_syncing.store(true, Ordering::SeqCst);
-        editor.update(cx, |state, cx| {
-            state.set_value(new_doc.clone(), window, cx);
-        });
-        live_syncing.store(false, Ordering::SeqCst);
-
-        let new_byte_end = block.byte_start + new_text.len();
-        let delta = new_byte_end as isize - block.byte_end as isize;
-        let new_kind = if block.kind.is_multiline() {
-            block.kind
-        } else {
-            classify_single_line(&new_text, is_mdx)
-        };
-
-        let mut updated_vec = (*old_blocks).clone();
-        if let Some(cur) = updated_vec.get_mut(ix) {
-            cur.kind = new_kind;
-            cur.byte_end = new_byte_end;
-            if block.kind.is_multiline() {
-                let line_count = new_text.bytes().filter(|&b| b == b'\n').count();
-                let old_lines = cur.end_line - cur.start_line;
-                cur.end_line = cur.start_line + line_count;
-                let line_delta = line_count as isize - old_lines as isize;
-                cur.raw = new_text;
-                for tail in updated_vec.iter_mut().skip(ix + 1) {
-                    tail.byte_start = tail.byte_start.saturating_add_signed(delta);
-                    tail.byte_end = tail.byte_end.saturating_add_signed(delta);
-                    tail.start_line = tail.start_line.saturating_add_signed(line_delta);
-                    tail.end_line = tail.end_line.saturating_add_signed(line_delta);
-                }
-            } else {
-                cur.raw = new_text;
-                for tail in updated_vec.iter_mut().skip(ix + 1) {
-                    tail.byte_start = tail.byte_start.saturating_add_signed(delta);
-                    tail.byte_end = tail.byte_end.saturating_add_signed(delta);
-                }
-            }
-        }
-        let new_blocks = Arc::new(updated_vec);
-        if let Some(tab) = self.find_tab_mut(side, tab_id)
-            && let TabKind::Markdown {
-                live_blocks,
-                live_dirty_block,
-                ..
-            } = &mut tab.kind
-        {
-            *live_blocks = new_blocks;
-            *live_dirty_block = false;
-        }
-        self.update_markdown_derived_state(side, tab_id, new_doc.into(), window, cx);
-    }
-
-    fn sync_live_blocks_from_master(
-        &mut self,
-        side: PaneSide,
-        tab_id: u64,
-        raw: &str,
-        clear_active: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(tab) = self.find_tab_mut(side, tab_id) else {
-            return;
-        };
-        if let TabKind::Markdown {
-            is_mdx,
-            live_blocks,
-            live_active_block,
-            live_list_state,
-            live_scrollbar,
-            live_editor,
-            live_dirty_block,
-            ..
-        } = &mut tab.kind
-        {
-            let old_active = *live_active_block;
-            if clear_active {
-                *live_active_block = None;
-            }
-            *live_dirty_block = false;
-            let new_blocks = Arc::new(parse_live_blocks(raw, *is_mdx));
-            let active_focus = (*live_active_block).and_then(|ix| {
-                if ix < new_blocks.len() {
-                    Some((ix, live_editor.focus_handle(cx)))
-                } else {
-                    None
-                }
-            });
-            if active_focus.is_none() {
-                *live_active_block = None;
-            }
-            splice_list_diff(
-                live_list_state,
-                live_scrollbar,
-                live_blocks,
-                &new_blocks,
-                old_active,
-                active_focus,
-            );
-            *live_blocks = new_blocks;
-        }
-    }
-
-    pub fn activate_live_block(
-        &mut self,
-        side: PaneSide,
-        tab_id: u64,
-        ix: usize,
-        byte_offset: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.activate_live_block_inner(side, tab_id, ix, byte_offset, true, window, cx);
-    }
-
-    pub fn activate_live_block_no_scroll(
-        &mut self,
-        side: PaneSide,
-        tab_id: u64,
-        ix: usize,
-        byte_offset: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.activate_live_block_inner(side, tab_id, ix, byte_offset, false, window, cx);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn activate_live_block_inner(
-        &mut self,
-        side: PaneSide,
-        tab_id: u64,
-        ix: usize,
-        byte_offset: usize,
-        reveal: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.active_pane = side;
-        let current_active = self.find_tab(side, tab_id).and_then(|t| match &t.kind {
+        let raw_opt = self.find_tab(side, tab_id).and_then(|t| match &t.kind {
             TabKind::Markdown {
-                live_active_block,
-                live_dirty_block,
+                live_doc,
+                source_mode,
                 ..
-            } => Some((*live_active_block, *live_dirty_block)),
+            } if !*source_mode => Some(SharedString::from(live_doc.read(cx).text().to_string())),
             _ => None,
         });
-        if let Some((Some(old_ix), true)) = current_active
-            && old_ix != ix
-        {
-            self.commit_active_live_block(side, tab_id, window, cx);
+        if let Some(raw) = raw_opt {
+            self.update_markdown_derived_state(side, tab_id, raw, window, cx);
         }
-
-        let extracted = {
-            let Some(tab) = self.find_tab(side, tab_id) else {
-                return;
-            };
-            let TabKind::Markdown {
-                live_blocks,
-                live_active_block,
-                live_editor,
-                live_list_state,
-                live_scrollbar,
-                live_syncing,
-                live_row_bounds,
-                ..
-            } = &tab.kind
-            else {
-                return;
-            };
-            if ix >= live_blocks.len() {
-                return;
-            }
-            let row_w = live_row_bounds
-                .borrow()
-                .get(&ix)
-                .map(|b| f32::from(b.size.width))
-                .unwrap_or(760.0);
-            (
-                *live_active_block,
-                live_blocks[ix].kind,
-                live_blocks[ix].raw.clone(),
-                live_editor.clone(),
-                live_list_state.clone(),
-                live_scrollbar.clone(),
-                Arc::clone(live_syncing),
-                row_w,
-            )
-        };
-        let (
-            old_active,
-            block_kind,
-            block_raw,
-            live_editor,
-            live_list_state,
-            live_scrollbar,
-            live_syncing,
-            row_w,
-        ) = extracted;
-
-        let font = {
-            let mut f = window.text_style().font();
-            if !matches!(
-                block_kind,
-                LiveBlockKind::CodeFence
-                    | LiveBlockKind::Frontmatter
-                    | LiveBlockKind::Table
-                    | LiveBlockKind::MdxBlock
-            ) {
-                f.family = cx.theme().font_family.clone();
-            }
-            f
-        };
-        let font_size = live_block_font_size(block_kind);
-
-        live_syncing.store(true, Ordering::SeqCst);
-        let pos = clamp_to_char_boundary(&block_raw, byte_offset);
-        live_editor.update(cx, |state, cx| {
-            state.set_value(block_raw, window, cx);
-            state.set_selected_range(pos..pos, cx);
-            state.prewrap(font, font_size, px((row_w - 10.0).max(120.0)), cx);
-            state.focus(window, cx);
-        });
-        live_syncing.store(false, Ordering::SeqCst);
-
-        let wrap_rows = live_editor.read(cx).display_map().display_row_count().max(1);
-        let fh = live_editor.focus_handle(cx);
-
-        let saved_scroll = live_list_state.logical_scroll_top();
-        if let Some(old_ix) = old_active
-            && old_ix != ix
-        {
-            live_list_state.splice_focusable(old_ix..old_ix + 1, [None]);
-        }
-        live_list_state.splice_focusable(ix..ix + 1, [Some(fh)]);
-        if saved_scroll.offset_in_item > px(0.)
-            && (old_active == Some(saved_scroll.item_ix) || ix == saved_scroll.item_ix)
-        {
-            live_list_state.scroll_to(saved_scroll);
-        }
-        if reveal {
-            live_scrollbar.reveal_item(ix);
-        }
-
-        if let Some(tab) = self.find_tab_mut(side, tab_id)
-            && let TabKind::Markdown {
-                live_active_block,
-                live_last_wrap_rows,
-                live_dirty_block,
-                ..
-            } = &mut tab.kind
-        {
-            *live_active_block = Some(ix);
-            *live_last_wrap_rows = wrap_rows;
-            *live_dirty_block = false;
-        }
-        cx.notify();
-    }
-
-    pub fn activate_live_block_from_click(
-        &mut self,
-        side: PaneSide,
-        tab_id: u64,
-        ix: usize,
-        click_pos: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let byte_offset = {
-            let Some(tab) = self.find_tab(side, tab_id) else {
-                return;
-            };
-            let TabKind::Markdown {
-                live_blocks,
-                live_row_bounds,
-                ..
-            } = &tab.kind
-            else {
-                return;
-            };
-            let Some(block) = live_blocks.get(ix) else {
-                return;
-            };
-            let (col_left, col_top, row_width) = live_row_bounds
-                .borrow()
-                .get(&ix)
-                .map(|b| {
-                    (
-                        f32::from(b.origin.x),
-                        f32::from(b.origin.y),
-                        f32::from(b.size.width),
-                    )
-                })
-                .unwrap_or((f32::from(click_pos.x), f32::from(click_pos.y), 760.0));
-            let (avg_char_px, line_height_px) = match block.kind {
-                LiveBlockKind::Heading(1) => (14.5, 27.0 * 1.25),
-                LiveBlockKind::Heading(2) => (11.2, 20.0 * 1.35),
-                LiveBlockKind::Heading(3) => (9.2, 17.0 * 1.35),
-                LiveBlockKind::Heading(_) => (8.2, 15.0 * 1.35),
-                LiveBlockKind::CodeFence
-                | LiveBlockKind::Frontmatter
-                | LiveBlockKind::Table
-                | LiveBlockKind::MdxBlock => (8.1, 13.5 * 1.5),
-                _ => (7.8, 15.0 * 1.65),
-            };
-            let rel_x = f32::from(click_pos.x) - col_left;
-            let rel_y = f32::from(click_pos.y) - col_top;
-            click_pos_to_raw_byte(block, rel_x, rel_y, row_width, avg_char_px, line_height_px)
-        };
-        self.activate_live_block_no_scroll(side, tab_id, ix, byte_offset, window, cx);
-    }
-
-    pub fn activate_or_append_bottom_line(
-        &mut self,
-        side: PaneSide,
-        tab_id: u64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.commit_active_live_block(side, tab_id, window, cx);
-        let state_info = {
-            let Some(tab) = self.find_tab(side, tab_id) else {
-                return;
-            };
-            let TabKind::Markdown {
-                editor,
-                live_blocks,
-                live_syncing,
-                ..
-            } = &tab.kind
-            else {
-                return;
-            };
-            (
-                editor.clone(),
-                Arc::clone(live_blocks),
-                Arc::clone(live_syncing),
-            )
-        };
-        let (editor, old_blocks, live_syncing) = state_info;
-        if let Some(last) = old_blocks.last()
-            && last.kind == LiveBlockKind::Blank
-        {
-            self.activate_live_block_no_scroll(side, tab_id, old_blocks.len() - 1, 0, window, cx);
-            return;
-        }
-
-        let mut new_doc = editor.read(cx).value().to_string();
-        new_doc.push('\n');
-        live_syncing.store(true, Ordering::SeqCst);
-        editor.update(cx, |state, cx| {
-            state.set_value(new_doc.clone(), window, cx);
-        });
-        live_syncing.store(false, Ordering::SeqCst);
-
-        self.sync_live_blocks_from_master(side, tab_id, &new_doc, false, cx);
-        self.update_markdown_derived_state(side, tab_id, new_doc.into(), window, cx);
-
-        let new_ix = self
-            .find_tab(side, tab_id)
-            .and_then(|t| match &t.kind {
-                TabKind::Markdown { live_blocks, .. } => Some(live_blocks.len().saturating_sub(1)),
-                _ => None,
-            })
-            .unwrap_or(0);
-        self.activate_live_block(side, tab_id, new_ix, 0, window, cx);
-    }
-
-    pub fn deactivate_live_block(
-        &mut self,
-        side: PaneSide,
-        tab_id: u64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.commit_active_live_block(side, tab_id, window, cx);
-        if let Some(tab) = self.find_tab_mut(side, tab_id)
-            && let TabKind::Markdown {
-                live_active_block,
-                live_list_state,
-                ..
-            } = &mut tab.kind
-            && let Some(old_ix) = live_active_block.take()
-        {
-            live_list_state.splice_focusable(old_ix..old_ix + 1, [None]);
-            self.focus_handle.focus(window, cx);
-            cx.notify();
-        }
-    }
-
-    fn on_live_editor_changed(
-        &mut self,
-        side: PaneSide,
-        tab_id: u64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let snapshot = {
-            let Some(tab) = self.find_tab(side, tab_id) else {
-                return;
-            };
-            let TabKind::Markdown {
-                editor,
-                is_mdx,
-                live_blocks,
-                live_active_block,
-                live_editor,
-                live_syncing,
-                ..
-            } = &tab.kind
-            else {
-                return;
-            };
-            if live_syncing.load(Ordering::SeqCst) {
-                return;
-            }
-            let Some(ix) = *live_active_block else {
-                return;
-            };
-            let Some(block) = live_blocks.get(ix) else {
-                return;
-            };
-            (
-                editor.clone(),
-                live_editor.clone(),
-                Arc::clone(live_syncing),
-                *is_mdx,
-                ix,
-                block.clone(),
-            )
-        };
-        let (editor, live_editor, live_syncing, is_mdx, ix, block) = snapshot;
-
-        let new_text = live_editor.read(cx).value().to_string();
-        if !block.kind.is_multiline() && new_text.contains('\n') {
-            // Multi-line paste into a single-line block: commit structurally and land at pasted cursor.
-            let pasted_cursor = live_editor.read(cx).cursor();
-            let raw_doc = editor.read(cx).value();
-            let new_doc = splice_block_in_doc(
-                raw_doc.as_ref(),
-                block.byte_start,
-                block.byte_end,
-                &new_text,
-            );
-            live_syncing.store(true, Ordering::SeqCst);
-            editor.update(cx, |state, cx| {
-                state.set_value(new_doc.clone(), window, cx);
-            });
-            live_syncing.store(false, Ordering::SeqCst);
-
-            let new_blocks = Arc::new(parse_live_blocks(&new_doc, is_mdx));
-            let abs_cursor = block.byte_start + pasted_cursor;
-            let (target_line, target_col) = byte_offset_to_line_col(&new_doc, abs_cursor);
-            let target_ix = block_index_for_line(&new_blocks, target_line);
-            let target_line_in_block = target_line.saturating_sub(new_blocks[target_ix].start_line);
-            let target_offset =
-                line_col_to_byte_offset(&new_blocks[target_ix].raw, target_line_in_block, target_col);
-
-            if let Some(tab) = self.find_tab_mut(side, tab_id)
-                && let TabKind::Markdown {
-                    live_blocks,
-                    live_active_block,
-                    live_list_state,
-                    live_scrollbar,
-                    live_dirty_block,
-                    ..
-                } = &mut tab.kind
-            {
-                let old_active = *live_active_block;
-                *live_active_block = None;
-                *live_dirty_block = false;
-                let fh = live_editor.focus_handle(cx);
-                splice_list_diff(
-                    live_list_state,
-                    live_scrollbar,
-                    live_blocks,
-                    &new_blocks,
-                    old_active,
-                    Some((target_ix, fh)),
-                );
-                *live_blocks = new_blocks;
-            }
-            self.update_markdown_derived_state(side, tab_id, new_doc.into(), window, cx);
-            self.activate_live_block(side, tab_id, target_ix, target_offset, window, cx);
-            return;
-        }
-
-        // Fast O(1) keystroke path: do not re-sync whole file on every character.
-        let new_kind = if block.kind.is_multiline() {
-            block.kind
-        } else {
-            classify_single_line(&new_text, is_mdx)
-        };
-        let kind_changed = new_kind != block.kind;
-        let wrap_rows = live_editor.read(cx).display_map().display_row_count().max(1);
-        let fh = live_editor.focus_handle(cx);
-
-        let gen_num = if let Some(tab) = self.find_tab_mut(side, tab_id) {
-            tab.dirty = true;
-            if let TabKind::Markdown {
-                live_blocks,
-                live_list_state,
-                live_last_wrap_rows,
-                live_dirty_block,
-                live_edit_gen,
-                ..
-            } = &mut tab.kind
-            {
-                *live_dirty_block = true;
-                *live_edit_gen = live_edit_gen.wrapping_add(1);
-                if kind_changed {
-                    Arc::make_mut(live_blocks)[ix].kind = new_kind;
-                }
-                if wrap_rows != *live_last_wrap_rows
-                    || kind_changed
-                    || new_kind == LiveBlockKind::ImageEmbed
-                {
-                    *live_last_wrap_rows = wrap_rows;
-                    live_list_state.splice_focusable(ix..ix + 1, [Some(fh)]);
-                }
-                *live_edit_gen
-            } else {
-                0
-            }
-        } else {
-            return;
-        };
-
-        cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(200))
-                .await;
-            let _ = this.update_in(cx, |app, window, cx| {
-                let should_commit = app.find_tab(side, tab_id).is_some_and(|t| {
-                    matches!(
-                        &t.kind,
-                        TabKind::Markdown {
-                            live_edit_gen,
-                            live_dirty_block,
-                            ..
-                        } if *live_edit_gen == gen_num && *live_dirty_block
-                    )
-                });
-                if should_commit {
-                    app.commit_active_live_block(side, tab_id, window, cx);
-                }
-            });
-        })
-        .detach();
-        cx.notify();
-    }
-
-    fn live_cursor_geometry(
-        &self,
-        side: PaneSide,
-        tab_id: u64,
-        cx: &App,
-    ) -> Option<(String, std::ops::Range<usize>, usize, usize, usize)> {
-        let tab = self.find_tab(side, tab_id)?;
-        let TabKind::Markdown { live_editor, .. } = &tab.kind else {
-            return None;
-        };
-        let state = live_editor.read(cx);
-        let val = state.value().to_string();
-        let sel = state.selected_range();
-        let (line, col) = byte_offset_to_line_col(&val, sel.start);
-        let display_row = state
-            .display_map()
-            .buffer_pos_to_display_pos(BufferPoint::new(line, col))
-            .row;
-        let total_rows = state.display_map().display_row_count().max(1);
-        Some((val, sel, display_row, total_rows, col))
-    }
-
-    pub fn handle_live_move_up(
-        &mut self,
-        side: PaneSide,
-        tab_id: u64,
-        ix: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((_val, _sel, display_row, _total_rows, cursor_col)) =
-            self.live_cursor_geometry(side, tab_id, cx)
-        else {
-            return;
-        };
-        if display_row == 0 && ix > 0 {
-            cx.stop_propagation();
-            self.commit_active_live_block(side, tab_id, window, cx);
-            let target_offset = self
-                .find_tab(side, tab_id)
-                .and_then(|t| match &t.kind {
-                    TabKind::Markdown { live_blocks, .. } => live_blocks.get(ix - 1).map(|prev| {
-                        let last_line = prev.raw.bytes().filter(|&b| b == b'\n').count();
-                        line_col_to_byte_offset(&prev.raw, last_line, cursor_col)
-                    }),
-                    _ => None,
-                })
-                .unwrap_or(0);
-            self.activate_live_block(side, tab_id, ix - 1, target_offset, window, cx);
-        }
-    }
-
-    pub fn handle_live_move_down(
-        &mut self,
-        side: PaneSide,
-        tab_id: u64,
-        ix: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((_val, _sel, display_row, total_rows, cursor_col)) =
-            self.live_cursor_geometry(side, tab_id, cx)
-        else {
-            return;
-        };
-        let total_blocks = self
-            .find_tab(side, tab_id)
-            .and_then(|t| match &t.kind {
-                TabKind::Markdown { live_blocks, .. } => Some(live_blocks.len()),
-                _ => None,
-            })
-            .unwrap_or(0);
-        if display_row + 1 >= total_rows && ix + 1 < total_blocks {
-            cx.stop_propagation();
-            self.commit_active_live_block(side, tab_id, window, cx);
-            let target_offset = self
-                .find_tab(side, tab_id)
-                .and_then(|t| match &t.kind {
-                    TabKind::Markdown { live_blocks, .. } => live_blocks
-                        .get(ix + 1)
-                        .map(|next| line_col_to_byte_offset(&next.raw, 0, cursor_col)),
-                    _ => None,
-                })
-                .unwrap_or(0);
-            self.activate_live_block(side, tab_id, ix + 1, target_offset, window, cx);
-        }
-    }
-
-    pub fn handle_live_move_left(
-        &mut self,
-        side: PaneSide,
-        tab_id: u64,
-        ix: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((_val, sel, _display_row, _total_rows, _col)) =
-            self.live_cursor_geometry(side, tab_id, cx)
-        else {
-            return;
-        };
-        if sel.start == 0 && sel.end == 0 && ix > 0 {
-            cx.stop_propagation();
-            self.commit_active_live_block(side, tab_id, window, cx);
-            let end_len = self
-                .find_tab(side, tab_id)
-                .and_then(|t| match &t.kind {
-                    TabKind::Markdown { live_blocks, .. } => {
-                        live_blocks.get(ix - 1).map(|prev| prev.raw.len())
-                    }
-                    _ => None,
-                })
-                .unwrap_or(0);
-            self.activate_live_block(side, tab_id, ix - 1, end_len, window, cx);
-        }
-    }
-
-    pub fn handle_live_move_right(
-        &mut self,
-        side: PaneSide,
-        tab_id: u64,
-        ix: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((cur_val, sel, _display_row, _total_rows, _col)) =
-            self.live_cursor_geometry(side, tab_id, cx)
-        else {
-            return;
-        };
-        let total_blocks = self
-            .find_tab(side, tab_id)
-            .and_then(|t| match &t.kind {
-                TabKind::Markdown { live_blocks, .. } => Some(live_blocks.len()),
-                _ => None,
-            })
-            .unwrap_or(0);
-        if sel.start == cur_val.len() && sel.end == cur_val.len() && ix + 1 < total_blocks {
-            cx.stop_propagation();
-            self.commit_active_live_block(side, tab_id, window, cx);
-            self.activate_live_block(side, tab_id, ix + 1, 0, window, cx);
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn handle_live_enter(
-        &mut self,
-        side: PaneSide,
-        tab_id: u64,
-        ix: usize,
-        secondary: bool,
-        shift: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.commit_active_live_block(side, tab_id, window, cx);
-        let snapshot = {
-            let Some(tab) = self.find_tab(side, tab_id) else {
-                return;
-            };
-            let TabKind::Markdown {
-                editor,
-                is_mdx,
-                live_blocks,
-                live_editor,
-                live_scrollbar,
-                live_syncing,
-                ..
-            } = &tab.kind
-            else {
-                return;
-            };
-            let Some(block) = live_blocks.get(ix).cloned() else {
-                return;
-            };
-            (
-                editor.clone(),
-                live_editor.clone(),
-                live_scrollbar.clone(),
-                Arc::clone(live_syncing),
-                live_blocks.len(),
-                *is_mdx,
-                block,
-            )
-        };
-        let (editor, live_editor, live_scrollbar, live_syncing, blocks_len, is_mdx, cur_block) =
-            snapshot;
-
-        if cur_block.kind.is_multiline() {
-            if secondary {
-                cx.stop_propagation();
-                if ix + 1 < blocks_len {
-                    self.activate_live_block(side, tab_id, ix + 1, 0, window, cx);
-                } else {
-                    self.activate_or_append_bottom_line(side, tab_id, window, cx);
-                }
-            }
-            return;
-        }
-
-        if shift || secondary {
-            return;
-        }
-
-        cx.stop_propagation();
-        let (cur_val, sel) = {
-            let st = live_editor.read(cx);
-            (st.value().to_string(), st.selected_range())
-        };
-        match compute_smart_enter(&cur_val, sel.start, sel.end) {
-            LiveEnterAction::ClearLine => {
-                live_editor.update(cx, |s, cx| {
-                    s.set_value(String::new(), window, cx);
-                    s.set_selected_range(0..0, cx);
-                });
-            }
-            LiveEnterAction::ExpandCodeFence {
-                text,
-                cursor_offset,
-            } => {
-                let raw_doc = editor.read(cx).value();
-                let new_doc = splice_block_in_doc(
-                    raw_doc.as_ref(),
-                    cur_block.byte_start,
-                    cur_block.byte_end,
-                    &text,
-                );
-                live_syncing.store(true, Ordering::SeqCst);
-                editor.update(cx, |s, cx| s.set_value(new_doc.clone(), window, cx));
-                live_editor.update(cx, |s, cx| {
-                    s.set_value(text, window, cx);
-                    let pos = clamp_to_char_boundary(s.value().as_ref(), cursor_offset);
-                    s.set_selected_range(pos..pos, cx);
-                    s.focus(window, cx);
-                });
-                live_syncing.store(false, Ordering::SeqCst);
-
-                self.update_markdown_derived_state(side, tab_id, new_doc.clone().into(), window, cx);
-                self.sync_live_blocks_from_master(side, tab_id, &new_doc, false, cx);
-                live_scrollbar.reveal_item(ix);
-            }
-            LiveEnterAction::SplitLine {
-                left,
-                right,
-                right_cursor,
-            } => {
-                let raw_doc = editor.read(cx).value();
-                let new_doc = splice_block_in_doc(
-                    raw_doc.as_ref(),
-                    cur_block.byte_start,
-                    cur_block.byte_end,
-                    &format!("{left}\n{right}"),
-                );
-                live_syncing.store(true, Ordering::SeqCst);
-                editor.update(cx, |s, cx| s.set_value(new_doc.clone(), window, cx));
-                live_syncing.store(false, Ordering::SeqCst);
-
-                self.update_markdown_derived_state(side, tab_id, new_doc.clone().into(), window, cx);
-                let new_blocks = Arc::new(parse_live_blocks(&new_doc, is_mdx));
-                let target_ix = (ix + 1).min(new_blocks.len().saturating_sub(1));
-                if let Some(tab) = self.find_tab_mut(side, tab_id)
-                    && let TabKind::Markdown {
-                        live_blocks,
-                        live_active_block,
-                        live_list_state,
-                        live_scrollbar,
-                        ..
-                    } = &mut tab.kind
-                {
-                    let old_active = *live_active_block;
-                    *live_active_block = None;
-                    let fh = live_editor.focus_handle(cx);
-                    splice_list_diff(
-                        live_list_state,
-                        live_scrollbar,
-                        live_blocks,
-                        &new_blocks,
-                        old_active,
-                        Some((target_ix, fh)),
-                    );
-                    *live_blocks = new_blocks;
-                }
-                self.activate_live_block(side, tab_id, target_ix, right_cursor, window, cx);
-            }
-        }
-    }
-
-    pub fn handle_live_backspace(
-        &mut self,
-        side: PaneSide,
-        tab_id: u64,
-        ix: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((_cur_val, sel, _, _, _)) = self.live_cursor_geometry(side, tab_id, cx) else {
-            return;
-        };
-        if sel.start != 0 || sel.end != 0 || ix == 0 {
-            return;
-        }
-        cx.stop_propagation();
-        self.commit_active_live_block(side, tab_id, window, cx);
-
-        let snapshot = {
-            let Some(tab) = self.find_tab(side, tab_id) else {
-                return;
-            };
-            let TabKind::Markdown {
-                editor,
-                live_blocks,
-                live_syncing,
-                ..
-            } = &tab.kind
-            else {
-                return;
-            };
-            let (Some(prev), Some(cur_block)) = (live_blocks.get(ix - 1), live_blocks.get(ix)) else {
-                return;
-            };
-            (
-                editor.clone(),
-                Arc::clone(live_syncing),
-                prev.clone(),
-                cur_block.clone(),
-            )
-        };
-        let (editor, live_syncing, prev, cur_block) = snapshot;
-
-        if prev.kind == LiveBlockKind::Blank {
-            let raw_doc = editor.read(cx).value();
-            let new_doc =
-                splice_block_in_doc(raw_doc.as_ref(), prev.byte_start, cur_block.byte_start, "");
-            live_syncing.store(true, Ordering::SeqCst);
-            editor.update(cx, |s, cx| s.set_value(new_doc.clone(), window, cx));
-            live_syncing.store(false, Ordering::SeqCst);
-
-            self.update_markdown_derived_state(side, tab_id, new_doc.clone().into(), window, cx);
-            self.sync_live_blocks_from_master(side, tab_id, &new_doc, false, cx);
-            self.activate_live_block(side, tab_id, ix - 1, 0, window, cx);
-        } else if !prev.kind.is_multiline() && !cur_block.kind.is_multiline() {
-            let merge_cursor = prev.raw.len();
-            let merged = format!("{}{}", prev.raw, cur_block.raw);
-            let raw_doc = editor.read(cx).value();
-            let new_doc = splice_block_in_doc(
-                raw_doc.as_ref(),
-                prev.byte_start,
-                cur_block.byte_end,
-                &merged,
-            );
-            live_syncing.store(true, Ordering::SeqCst);
-            editor.update(cx, |s, cx| s.set_value(new_doc.clone(), window, cx));
-            live_syncing.store(false, Ordering::SeqCst);
-
-            self.update_markdown_derived_state(side, tab_id, new_doc.clone().into(), window, cx);
-            self.sync_live_blocks_from_master(side, tab_id, &new_doc, false, cx);
-            self.activate_live_block(side, tab_id, ix - 1, merge_cursor, window, cx);
-        } else if cur_block.kind == LiveBlockKind::Blank {
-            let raw_doc = editor.read(cx).value();
-            let new_doc =
-                splice_block_in_doc(raw_doc.as_ref(), prev.byte_end, cur_block.byte_end, "");
-            live_syncing.store(true, Ordering::SeqCst);
-            editor.update(cx, |s, cx| s.set_value(new_doc.clone(), window, cx));
-            live_syncing.store(false, Ordering::SeqCst);
-
-            self.update_markdown_derived_state(side, tab_id, new_doc.clone().into(), window, cx);
-            self.sync_live_blocks_from_master(side, tab_id, &new_doc, false, cx);
-            self.activate_live_block(side, tab_id, ix - 1, prev.raw.len(), window, cx);
-        } else {
-            self.activate_live_block(side, tab_id, ix - 1, prev.raw.len(), window, cx);
-        }
-    }
-
-    pub fn handle_live_delete(
-        &mut self,
-        side: PaneSide,
-        tab_id: u64,
-        ix: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((cur_val, sel, _, _, _)) = self.live_cursor_geometry(side, tab_id, cx) else {
-            return;
-        };
-        if sel.start != cur_val.len() || sel.end != cur_val.len() {
-            return;
-        }
-        self.commit_active_live_block(side, tab_id, window, cx);
-        let snapshot = {
-            let Some(tab) = self.find_tab(side, tab_id) else {
-                return;
-            };
-            let TabKind::Markdown {
-                editor,
-                live_blocks,
-                live_syncing,
-                ..
-            } = &tab.kind
-            else {
-                return;
-            };
-            let (Some(cur_block), Some(next)) = (live_blocks.get(ix), live_blocks.get(ix + 1)) else {
-                return;
-            };
-            if cur_block.kind.is_multiline() || next.kind.is_multiline() {
-                return;
-            }
-            (
-                editor.clone(),
-                Arc::clone(live_syncing),
-                cur_block.clone(),
-                next.clone(),
-            )
-        };
-        let (editor, live_syncing, cur_block, next) = snapshot;
-
-        cx.stop_propagation();
-        let keep_cursor = cur_block.raw.len();
-        let merged = format!("{}{}", cur_block.raw, next.raw);
-        let raw_doc = editor.read(cx).value();
-        let new_doc =
-            splice_block_in_doc(raw_doc.as_ref(), cur_block.byte_start, next.byte_end, &merged);
-        live_syncing.store(true, Ordering::SeqCst);
-        editor.update(cx, |s, cx| s.set_value(new_doc.clone(), window, cx));
-        live_syncing.store(false, Ordering::SeqCst);
-
-        self.update_markdown_derived_state(side, tab_id, new_doc.clone().into(), window, cx);
-        self.sync_live_blocks_from_master(side, tab_id, &new_doc, false, cx);
-        self.activate_live_block(side, tab_id, ix, keep_cursor, window, cx);
-    }
-
-    pub fn handle_live_escape(
-        &mut self,
-        side: PaneSide,
-        tab_id: u64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        cx.stop_propagation();
-        self.deactivate_live_block(side, tab_id, window, cx);
-    }
-
-    pub fn handle_live_paste_action(
-        &mut self,
-        side: PaneSide,
-        tab_id: u64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(item) = cx.read_from_clipboard() else {
-            return;
-        };
-        let has_image = item
-            .entries()
-            .iter()
-            .any(|e| matches!(e, ClipboardEntry::Image(_)));
-        if has_image {
-            cx.stop_propagation();
-            self.handle_live_image_paste(side, tab_id, &item, window, cx);
-        }
-    }
-
-    pub fn handle_live_task_toggle(
-        &mut self,
-        side: PaneSide,
-        tab_id: u64,
-        ix: usize,
-        checked: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.commit_active_live_block(side, tab_id, window, cx);
-        let info = {
-            let Some(tab) = self.find_tab(side, tab_id) else {
-                return;
-            };
-            let TabKind::Markdown {
-                editor,
-                live_blocks,
-                live_syncing,
-                ..
-            } = &tab.kind
-            else {
-                return;
-            };
-            let Some(block) = live_blocks.get(ix) else {
-                return;
-            };
-            let Some(updated_line) = toggle_task_in_line(&block.raw, checked) else {
-                return;
-            };
-            (
-                editor.clone(),
-                Arc::clone(live_syncing),
-                Arc::clone(live_blocks),
-                block.byte_start,
-                block.byte_end,
-                updated_line,
-            )
-        };
-        let (editor, live_syncing, old_blocks, byte_start, byte_end, updated_line) = info;
-
-        let raw_doc = editor.read(cx).value();
-        let new_doc = splice_block_in_doc(raw_doc.as_ref(), byte_start, byte_end, &updated_line);
-
-        live_syncing.store(true, Ordering::SeqCst);
-        editor.update(cx, |s, cx| s.set_value(new_doc.clone(), window, cx));
-        live_syncing.store(false, Ordering::SeqCst);
-
-        let mut updated_vec = (*old_blocks).clone();
-        if let Some(cur) = updated_vec.get_mut(ix) {
-            cur.raw = updated_line;
-        }
-        let new_blocks = Arc::new(updated_vec);
-        if let Some(tab) = self.find_tab_mut(side, tab_id)
-            && let TabKind::Markdown {
-                live_blocks,
-                live_list_state,
-                ..
-            } = &mut tab.kind
-        {
-            *live_blocks = new_blocks;
-            live_list_state.splice_focusable(ix..ix + 1, [None]);
-        }
-        self.update_markdown_derived_state(side, tab_id, new_doc.into(), window, cx);
     }
 
     fn on_markdown_changed(
@@ -2911,26 +2144,18 @@ impl VKarmaApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let state_info = {
-            let Some(tab) = self.find_tab(side, tab_id) else {
-                return;
-            };
-            let TabKind::Markdown {
+        let ed_opt = self.find_tab(side, tab_id).and_then(|t| match &t.kind {
+            TabKind::Markdown {
                 editor,
-                live_syncing,
+                source_mode,
                 ..
-            } = &tab.kind
-            else {
-                return;
-            };
-            if live_syncing.load(Ordering::SeqCst) {
-                return;
-            }
-            editor.clone()
-        };
-        let raw = state_info.read(cx).value();
-        self.sync_live_blocks_from_master(side, tab_id, raw.as_ref(), true, cx);
-        self.update_markdown_derived_state(side, tab_id, raw, window, cx);
+            } if *source_mode => Some(editor.clone()),
+            _ => None,
+        });
+        if let Some(ed) = ed_opt {
+            let raw = ed.read(cx).value();
+            self.update_markdown_derived_state(side, tab_id, raw, window, cx);
+        }
     }
 
     fn on_fountain_changed(
@@ -3303,7 +2528,7 @@ impl VKarmaApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.commit_active_live_block(side, tab_id, window, cx);
+        let _ = window;
         let Some(idx) = self
             .pane(side)
             .and_then(|p| p.tabs.iter().position(|t| t.id == tab_id))
@@ -3317,15 +2542,55 @@ impl VKarmaApp {
             };
             let path = tab.path.clone();
             match &mut tab.kind {
-                TabKind::Markdown { editor, .. }
-                | TabKind::Fountain { editor, .. }
+                TabKind::Markdown {
+                    editor,
+                    live_doc,
+                    source_mode,
+                    ..
+                } => {
+                    if *source_mode {
+                        let content = editor.read(cx).value();
+                        atomic_write_string(&path, content.as_ref())
+                    } else {
+                        let content = live_doc.read(cx).text();
+                        atomic_write_string(&path, content)
+                    }
+                }
+                TabKind::Fountain { editor, .. }
                 | TabKind::Typst { editor, .. }
                 | TabKind::Code { editor, .. } => {
                     let content = editor.read(cx).value();
                     atomic_write_string(&path, content.as_ref())
                 }
+                TabKind::Canvas { view, .. } => {
+                    let content = view.read(cx).to_json(cx);
+                    atomic_write_string(&path, &content)
+                }
+                TabKind::Kanban { view, .. } => {
+                    let content = view.read(cx).to_markdown(cx);
+                    atomic_write_string(&path, &content)
+                }
+                TabKind::Subtitle { view, .. } => {
+                    let content = view.read(cx).to_text(cx);
+                    atomic_write_string(&path, &content)
+                }
+                TabKind::Svg { view, .. } => {
+                    let content = view.read(cx).value(cx);
+                    atomic_write_string(&path, &content)
+                }
+                TabKind::Mermaid { view, .. } => {
+                    let content = view.read(cx).value(cx);
+                    atomic_write_string(&path, &content)
+                }
                 TabKind::Spreadsheet { doc, .. } => doc.save(&path),
-                TabKind::Image { .. } | TabKind::Pdf { .. } => Ok(()),
+                TabKind::Image { .. }
+                | TabKind::Pdf { .. }
+                | TabKind::Office { .. }
+                | TabKind::Epub { .. }
+                | TabKind::Sqlite { .. }
+                | TabKind::Archive { .. }
+                | TabKind::Audio { .. }
+                | TabKind::Font { .. } => Ok(()),
             }
         };
 
@@ -3417,11 +2682,8 @@ impl VKarmaApp {
         }
     }
 
-    pub fn toggle_md_view_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn toggle_md_view_mode(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let side = self.active_pane;
-        if let Some(tab_id) = self.pane(side).and_then(WorkspacePane::active).map(|t| t.id) {
-            self.commit_active_live_block(side, tab_id, window, cx);
-        }
         if let Some(tab) = self.pane_mut(side).and_then(WorkspacePane::active_mut) {
             match &mut tab.kind {
                 TabKind::Markdown { view_mode, .. } => {
@@ -3455,55 +2717,32 @@ impl VKarmaApp {
 
     pub fn toggle_md_source_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let side = self.active_pane;
-        if let Some(tab_id) = self.pane(side).and_then(WorkspacePane::active).map(|t| t.id) {
-            self.commit_active_live_block(side, tab_id, window, cx);
-        }
         let info = {
             let Some(tab) = self.pane_mut(side).and_then(WorkspacePane::active_mut) else {
                 return;
             };
-            let tab_id = tab.id;
             let TabKind::Markdown {
                 editor,
+                live_doc,
                 source_mode,
-                live_blocks,
-                live_active_block,
-                live_list_state,
-                live_editor,
                 ..
             } = &mut tab.kind
             else {
                 return;
             };
             *source_mode = !*source_mode;
-            let sm = *source_mode;
-            let active_before = *live_active_block;
-            if sm {
-                *live_active_block = None;
-                if let Some(old_ix) = active_before {
-                    live_list_state.splice_focusable(old_ix..old_ix + 1, [None]);
-                }
-            }
-            (
-                tab_id,
-                sm,
-                editor.clone(),
-                Arc::clone(live_blocks),
-                active_before,
-                live_editor.clone(),
-            )
+            (*source_mode, editor.clone(), live_doc.clone())
         };
-        let (tab_id, sm, editor, old_blocks, active_before, live_editor) = info;
+        let (sm, editor, live_doc) = info;
 
         if sm {
-            let target_line = active_before
-                .and_then(|ix| old_blocks.get(ix))
-                .map(|b| {
-                    let live_pos = live_editor.read(cx).cursor_position().line as usize;
-                    b.start_line + live_pos
-                })
-                .unwrap_or(0);
+            let (raw, line, col) = {
+                let ld = live_doc.read(cx);
+                let (l, c) = ld.cursor_line_col();
+                (ld.text().to_string(), l, c)
+            };
             editor.update(cx, |s, cx| {
+                s.set_value(raw, window, cx);
                 s.set_line_number(true, window, cx);
                 s.set_editor_paddings(gpui_kit::Edges {
                     top: px(10.),
@@ -3512,43 +2751,24 @@ impl VKarmaApp {
                     left: px(12.),
                 });
                 s.set_cursor_position(
-                    gpui_kit::component::input::Position::new(target_line as u32, 0),
+                    gpui_kit::component::input::Position::new(line as u32, col as u32),
                     window,
                     cx,
                 );
+                s.focus(window, cx);
             });
-            cx.notify();
         } else {
             let (raw, cursor_line, cursor_col) = {
                 let ed = editor.read(cx);
                 let pos = ed.cursor_position();
                 (ed.value().to_string(), pos.line as usize, pos.character as usize)
             };
-            editor.update(cx, |s, cx| {
-                s.set_line_number(false, window, cx);
-                s.set_editor_paddings(gpui_kit::Edges {
-                    top: px(16.),
-                    right: px(28.),
-                    bottom: px(24.),
-                    left: px(28.),
-                });
+            live_doc.update(cx, |ld, cx| {
+                ld.set_text(raw, cursor_line, cursor_col, cx);
             });
-            self.sync_live_blocks_from_master(side, tab_id, &raw, true, cx);
-            let target = self.find_tab(side, tab_id).and_then(|t| match &t.kind {
-                TabKind::Markdown { live_blocks, .. } => {
-                    let ix = block_index_for_line(live_blocks, cursor_line);
-                    let line_in_block = cursor_line.saturating_sub(live_blocks[ix].start_line);
-                    let off = line_col_to_byte_offset(&live_blocks[ix].raw, line_in_block, cursor_col);
-                    Some((ix, off))
-                }
-                _ => None,
-            });
-            if let Some((ix, off)) = target {
-                self.activate_live_block(side, tab_id, ix, off, window, cx);
-            } else {
-                cx.notify();
-            }
+            live_doc.focus_handle(cx).focus(window, cx);
         }
+        cx.notify();
     }
 
     pub fn handle_markdown_link(
@@ -3620,11 +2840,17 @@ impl VKarmaApp {
         };
         if let TabKind::Markdown {
             editor,
+            live_doc,
+            source_mode,
             preprocessed,
             ..
         } = &tab.kind
         {
-            let raw = editor.read(cx).value();
+            let raw: SharedString = if *source_mode {
+                editor.read(cx).value()
+            } else {
+                live_doc.read(cx).text().to_string().into()
+            };
             if let Some(updated) = toggle_nth_task_checkbox(
                 raw.as_ref(),
                 preprocessed.as_ref(),
@@ -3632,8 +2858,17 @@ impl VKarmaApp {
                 event.checked(),
             ) {
                 let ed = editor.clone();
-                ed.update(cx, |s, cx| s.set_value(updated, window, cx));
-                self.on_markdown_changed(side, tab_id, window, cx);
+                let ld = live_doc.clone();
+                let is_source = *source_mode;
+                if is_source {
+                    ed.update(cx, |s, cx| s.set_value(updated.clone(), window, cx));
+                } else {
+                    ld.update(cx, |s, cx| {
+                        let (l, c) = s.cursor_line_col();
+                        s.set_text(updated.clone(), l, c, cx);
+                    });
+                }
+                self.update_markdown_derived_state(side, tab_id, updated.into(), window, cx);
             }
         }
     }
@@ -3724,11 +2959,11 @@ impl VKarmaApp {
             return true;
         };
         if let Some(tab) = self.find_tab(side, tab_id)
-            && let TabKind::Markdown { live_editor, .. } = &tab.kind
+            && let TabKind::Markdown { live_doc, .. } = &tab.kind
         {
             let embed = format!("![[{filename}]]");
-            live_editor.clone().update(cx, |state, cx| {
-                state.insert(embed, window, cx);
+            live_doc.clone().update(cx, |ed, cx| {
+                ed.insert_text_at_caret(&embed, cx);
             });
         }
         true
@@ -3858,22 +3093,21 @@ impl VKarmaApp {
         let Some(tab) = self.pane(side).and_then(WorkspacePane::active) else {
             return;
         };
-        let tab_id = tab.id;
         let line_0based = line_1based.saturating_sub(1);
         let pos = gpui_kit::component::input::Position::new(line_0based as u32, 0);
         match &tab.kind {
             TabKind::Markdown {
+                editor,
+                live_doc,
                 view_mode,
                 source_mode,
-                live_blocks,
                 ..
             } => {
                 if !*source_mode && *view_mode != MdViewMode::Reading {
-                    let ix = block_index_for_line(live_blocks, line_0based);
-                    self.activate_live_block(side, tab_id, ix, 0, window, cx);
-                } else if let Some(TabKind::Markdown { editor, .. }) =
-                    self.pane(side).and_then(WorkspacePane::active).map(|t| &t.kind)
-                {
+                    live_doc.clone().update(cx, |ed, cx| {
+                        ed.jump_to_line(line_0based, window, cx);
+                    });
+                } else {
                     editor.clone().update(cx, |state, cx| {
                         state.set_cursor_position(pos, window, cx);
                     });
@@ -3884,6 +3118,11 @@ impl VKarmaApp {
             | TabKind::Code { editor, .. } => {
                 editor.clone().update(cx, |state, cx| {
                     state.set_cursor_position(pos, window, cx);
+                });
+            }
+            TabKind::Epub { view, .. } => {
+                view.clone().update(cx, |v, cx| {
+                    v.go_to_chapter(line_0based, cx);
                 });
             }
             _ => {}
@@ -3979,6 +3218,223 @@ impl VKarmaApp {
         }
         cx.notify();
     }
+
+    pub fn enter_zen_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.zen_mode {
+            return;
+        }
+        self.zen_mode = true;
+        if !window.is_fullscreen() {
+            window.toggle_fullscreen();
+            self.zen_entered_fullscreen = true;
+        } else {
+            self.zen_entered_fullscreen = false;
+        }
+        cx.notify();
+    }
+
+    pub fn exit_zen_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.zen_mode {
+            return;
+        }
+        self.zen_mode = false;
+        if self.zen_entered_fullscreen && window.is_fullscreen() {
+            window.toggle_fullscreen();
+        }
+        self.zen_entered_fullscreen = false;
+        cx.notify();
+    }
+
+    pub fn toggle_zen_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.zen_mode {
+            self.exit_zen_mode(window, cx);
+        } else {
+            self.enter_zen_mode(window, cx);
+        }
+    }
+
+    fn apply_path_relocation(&mut self, old_path: &Path, new_path: &Path, cx: &mut Context<Self>) {
+        for tab in self
+            .left_pane
+            .tabs
+            .iter_mut()
+            .chain(self.right_pane.iter_mut().flat_map(|p| p.tabs.iter_mut()))
+        {
+            if let Some(updated) = relocate_path(&tab.path, old_path, new_path) {
+                tab.path = updated.clone();
+                tab.title = updated
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Untitled")
+                    .to_string();
+                tab.rel_path = updated
+                    .strip_prefix(&self.workspace_root)
+                    .unwrap_or(&updated)
+                    .to_string_lossy()
+                    .to_string();
+                if let TabKind::Markdown { live_doc, .. } = &tab.kind {
+                    live_doc.update(cx, |ed, _| ed.set_doc_path(updated));
+                } else if let TabKind::Canvas { view, .. } = &tab.kind {
+                    let vault = Arc::clone(&self.vault);
+                    view.update(cx, |v, _| v.relocate_doc(updated, vault));
+                } else if let TabKind::Svg { view, .. } = &tab.kind {
+                    view.update(cx, |v, _| v.relocate_doc(updated));
+                } else if let TabKind::Mermaid { view, .. } = &tab.kind {
+                    view.update(cx, |v, _| v.relocate_doc(updated));
+                } else if let TabKind::Sqlite { view, .. } = &tab.kind {
+                    view.update(cx, |v, _| v.relocate_db(updated));
+                } else if let TabKind::Archive { view, .. } = &tab.kind {
+                    view.update(cx, |v, _| v.relocate_archive(updated));
+                } else if let TabKind::Audio { view, .. } = &tab.kind {
+                    view.update(cx, |v, _| v.relocate_audio(updated));
+                }
+            }
+        }
+
+        let prev_expanded: Vec<PathBuf> = self.expanded_dirs.drain().collect();
+        for dir in prev_expanded {
+            if let Some(updated) = relocate_path(&dir, old_path, new_path) {
+                self.expanded_dirs.insert(updated);
+            } else {
+                self.expanded_dirs.insert(dir);
+            }
+        }
+
+        if let Some(sel) = &self.selected_tree_path
+            && let Some(updated) = relocate_path(sel, old_path, new_path)
+        {
+            self.selected_tree_path = Some(updated);
+        }
+
+        for entry in &mut self.nav_history.entries {
+            if let Some(updated) = relocate_path(&entry.path, old_path, new_path) {
+                entry.path = updated;
+            }
+        }
+
+        self.persist_workspaces();
+        self.refresh_vault_index(cx);
+    }
+
+    pub fn start_inline_rename(
+        &mut self,
+        target: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !target.exists() {
+            return;
+        }
+        self.config.sidebar_visible = true;
+        self.sidebar_tab = SidebarTab::Files;
+        self.selected_tree_path = Some(target.clone());
+
+        let mut cur = target.parent();
+        while let Some(dir) = cur {
+            if !dir.starts_with(&self.workspace_root) || dir == self.workspace_root.as_path() {
+                break;
+            }
+            self.expanded_dirs.insert(dir.to_path_buf());
+            cur = dir.parent();
+        }
+
+        let cur_name = target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let sel_end = if !target.is_dir()
+            && !cur_name.starts_with('.')
+            && let Some(dot) = cur_name.rfind('.')
+            && dot > 0
+        {
+            dot
+        } else {
+            cur_name.len()
+        };
+
+        let input = cx.new(|cx| {
+            let mut st = InputState::new(window, cx).default_value(cur_name);
+            st.set_selected_range(0..sel_end, cx);
+            st
+        });
+        let _sub = cx.subscribe_in(&input, window, |this, _state, event, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                this.commit_inline_rename(window, cx);
+            }
+        });
+        input.focus_handle(cx).focus(window, cx);
+        self.inline_rename = Some(InlineRenameState {
+            target_path: target,
+            input,
+            _sub,
+        });
+        cx.notify();
+    }
+
+    pub fn commit_inline_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(st) = self.inline_rename.take() else {
+            return;
+        };
+        let new_name = st.input.read(cx).value().trim().to_string();
+        let old_name = st
+            .target_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if new_name.is_empty() || new_name == old_name {
+            cx.notify();
+            return;
+        }
+        match crate::vault::rename_entry(&st.target_path, &new_name) {
+            Ok(new_path) => {
+                self.selected_tree_path = Some(new_path.clone());
+                self.apply_path_relocation(&st.target_path, &new_path, cx);
+                self.set_status(format!("Renamed to {new_name}"), cx);
+            }
+            Err(err) => {
+                self.toast_err(format!("{err}"), window, cx);
+            }
+        }
+    }
+
+    pub fn cancel_inline_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.inline_rename.take().is_some() {
+            self.sidebar_focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    pub fn move_fs_entry(
+        &mut self,
+        src: PathBuf,
+        dest_dir: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.inline_rename = None;
+        let src_canon = fs::canonicalize(&src).unwrap_or_else(|_| src.clone());
+        match crate::vault::move_entry(&src, &dest_dir) {
+            Ok(new_path) => {
+                if new_path != src_canon {
+                    if dest_dir != self.workspace_root {
+                        self.expanded_dirs.insert(dest_dir);
+                    }
+                    let name = new_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("item")
+                        .to_string();
+                    self.selected_tree_path = Some(new_path.clone());
+                    self.apply_path_relocation(&src, &new_path, cx);
+                    self.set_status(format!("Moved {name}"), cx);
+                }
+            }
+            Err(err) => {
+                self.toast_err(format!("{err}"), window, cx);
+            }
+        }
+    }
 }
 
 impl Render for VKarmaApp {
@@ -3987,9 +3443,111 @@ impl Render for VKarmaApp {
         let toolbar_bg = hex_color(kd::BG_SIDEBAR);
         let border = hex_color(kd::BORDER_SUBTLE);
         let fg = hex_color(kd::FG);
-        let fg_muted = hex_color(kd::FG_MUTED);
 
-        let top_bar = h_flex()
+        let main_body = if self.zen_mode {
+            let zen_side = if self.pane(self.active_pane).is_some() {
+                self.active_pane
+            } else {
+                PaneSide::Left
+            };
+            let zen_words: Option<usize> = self
+                .pane(zen_side)
+                .and_then(|p| p.active())
+                .and_then(|t| match &t.kind {
+                    TabKind::Markdown { word_count, .. } => Some(*word_count),
+                    _ => None,
+                });
+
+            let zen_exit_overlay = div()
+                .id("zen-exit-zone")
+                .group("zen-exit-zone")
+                .absolute()
+                .bottom_0()
+                .right_0()
+                .w(px(220.))
+                .h(px(76.))
+                .p_4()
+                .flex()
+                .items_end()
+                .justify_end()
+                .child(
+                    div()
+                        .id("zen-exit-reveal")
+                        .opacity(0.)
+                        .group_hover("zen-exit-zone", |s| s.opacity(1.))
+                        .child(
+                            div()
+                                .id("zen-exit-btn")
+                                .px_3()
+                                .py_1p5()
+                                .rounded(px(8.))
+                                .bg(hex_color(kd::BG_SIDEBAR))
+                                .border_1()
+                                .border_color(hex_color(kd::BORDER_SUBTLE))
+                                .shadow_md()
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .hover(|s| {
+                                    s.bg(hex_color(kd::BG_PANEL))
+                                        .border_color(hex_color(kd::BLUE))
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.exit_zen_mode(window, cx);
+                                }))
+                                .when_some(zen_words, |d, wc| {
+                                    d.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(hex_color(kd::FG_MUTED))
+                                            .child(format!("{wc}w")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(hex_color(kd::BORDER_SUBTLE))
+                                            .child("·"),
+                                    )
+                                })
+                                .child(
+                                    Icon::new(IconName::Minimize2)
+                                        .xsmall()
+                                        .text_color(hex_color(kd::FG)),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(hex_color(kd::FG))
+                                        .child("Exit Zen"),
+                                )
+                                .child(
+                                    div()
+                                        .px_1()
+                                        .py_0p5()
+                                        .rounded(px(4.))
+                                        .bg(hex_color(kd::BG_DEEP))
+                                        .text_size(px(10.))
+                                        .text_color(hex_color(kd::FG_MUTED))
+                                        .child("F11"),
+                                ),
+                        ),
+                );
+
+            v_flex()
+                .relative()
+                .size_full()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .child(pane::render_pane(self, zen_side, window, cx)),
+                )
+                .child(zen_exit_overlay)
+                .into_any_element()
+        } else {
+            let top_bar = h_flex()
             .h(px(40.))
             .w_full()
             .px_2()
@@ -4228,9 +3786,17 @@ impl Render for VKarmaApp {
             );
         }
 
-        let _ = fg_muted;
+            v_flex()
+                .size_full()
+                .child(workspace_bar::render_workspace_bar(self, cx))
+                .child(top_bar)
+                .child(div().flex_1().min_h_0().w_full().child(workspace_split))
+                .child(status_bar::render_status_bar(self, cx))
+                .into_any_element()
+        };
 
         v_flex()
+            .relative()
             .size_full()
             .bg(app_bg)
             .text_color(fg)
@@ -4258,6 +3824,7 @@ impl Render for VKarmaApp {
                 this.open_quick_switcher(window, cx);
             }))
             .on_action(cx.listener(|this, _: &VaultSearch, window, cx| {
+                this.exit_zen_mode(window, cx);
                 this.config.sidebar_visible = true;
                 this.sidebar_tab = SidebarTab::Search;
                 this.persist_workspaces();
@@ -4269,6 +3836,9 @@ impl Render for VKarmaApp {
             }))
             .on_action(cx.listener(|this, _: &ToggleSourceMode, window, cx| {
                 this.toggle_md_source_mode(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleZenMode, window, cx| {
+                this.toggle_zen_mode(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
                 this.split_active_to_right(window, cx);
@@ -4319,10 +3889,41 @@ impl Render for VKarmaApp {
             .on_action(cx.listener(|this, _: &OpenFolderDialog, window, cx| {
                 this.prompt_open_folder(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &EscapeModal, _, cx| {
-                if this.quick_switcher.is_some() {
+            .on_action(cx.listener(|this, _: &EscapeModal, window, cx| {
+                if this.inline_rename.is_some() {
+                    this.cancel_inline_rename(window, cx);
+                } else if this.quick_switcher.is_some() {
                     this.quick_switcher = None;
                     cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &RenameSelectedTreeItem, window, cx| {
+                if let Some((side, tab_id, row, col)) = this.pane(this.active_pane).and_then(|p| {
+                    p.active().and_then(|t| match &t.kind {
+                        TabKind::Spreadsheet {
+                            grid_focus,
+                            active_row,
+                            active_col,
+                            ..
+                        } if grid_focus.is_focused(window) => {
+                            Some((this.active_pane, t.id, *active_row, *active_col))
+                        }
+                        _ => None,
+                    })
+                }) {
+                    this.select_spreadsheet_cell(side, tab_id, row, col, true, window, cx);
+                    return;
+                }
+                if this.zen_mode {
+                    return;
+                }
+                let target = this
+                    .selected_tree_path
+                    .clone()
+                    .or_else(|| this.active_tab_ref().map(|t| t.path.clone()))
+                    .filter(|p| p.starts_with(&this.workspace_root));
+                if let Some(target_path) = target {
+                    this.start_inline_rename(target_path, window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &SwitchWorkspace1, window, cx| {
@@ -4373,10 +3974,7 @@ impl Render for VKarmaApp {
                 let dir = this.workspace_root.clone();
                 modals::open_new_workspace_dialog(entity, dir, window, cx);
             }))
-            .child(workspace_bar::render_workspace_bar(self, cx))
-            .child(top_bar)
-            .child(div().flex_1().min_h_0().w_full().child(workspace_split))
-            .child(status_bar::render_status_bar(self, cx))
+            .child(main_body)
             .when_some(self.quick_switcher.as_ref(), |this, qs| {
                 this.child(modals::render_quick_switcher_overlay(self, qs, cx))
             })
@@ -4384,74 +3982,12 @@ impl Render for VKarmaApp {
     }
 }
 
-fn live_block_font_size(kind: LiveBlockKind) -> Pixels {
-    match kind {
-        LiveBlockKind::Heading(1) => px(27.),
-        LiveBlockKind::Heading(2) => px(20.),
-        LiveBlockKind::Heading(3) => px(17.),
-        LiveBlockKind::CodeFence
-        | LiveBlockKind::Frontmatter
-        | LiveBlockKind::Table
-        | LiveBlockKind::MdxBlock => px(13.5),
-        _ => px(15.),
+pub fn relocate_path(path: &Path, old_base: &Path, new_base: &Path) -> Option<PathBuf> {
+    if path == old_base {
+        return Some(new_base.to_path_buf());
     }
-}
-
-fn splice_list_diff(
-    list_state: &ListState,
-    live_scrollbar: &LiveScrollbarHandle,
-    old_blocks: &[LiveBlock],
-    new_blocks: &Arc<Vec<LiveBlock>>,
-    old_active: Option<usize>,
-    new_active: Option<(usize, FocusHandle)>,
-) {
-    let mut prefix = 0usize;
-    let min_blocks = old_blocks.len().min(new_blocks.len());
-    while prefix < min_blocks {
-        if old_active == Some(prefix)
-            || new_active.as_ref().is_some_and(|(ix, _)| *ix == prefix)
-            || old_blocks[prefix].kind != new_blocks[prefix].kind
-            || old_blocks[prefix].raw != new_blocks[prefix].raw
-            || old_blocks[prefix].byte_start != new_blocks[prefix].byte_start
-        {
-            break;
-        }
-        prefix += 1;
-    }
-
-    let mut suffix = 0usize;
-    let max_suffix = (old_blocks.len() - prefix).min(new_blocks.len() - prefix);
-    while suffix < max_suffix {
-        let oi = old_blocks.len() - 1 - suffix;
-        let ni = new_blocks.len() - 1 - suffix;
-        if old_active == Some(oi)
-            || new_active.as_ref().is_some_and(|(ix, _)| *ix == ni)
-            || old_blocks[oi].kind != new_blocks[ni].kind
-            || old_blocks[oi].raw != new_blocks[ni].raw
-        {
-            break;
-        }
-        suffix += 1;
-    }
-
-    let old_end = old_blocks.len() - suffix;
-    let new_end = new_blocks.len() - suffix;
-    if old_end == prefix && new_end == prefix {
-        return;
-    }
-    list_state.splice_focusable(
-        prefix..old_end,
-        (prefix..new_end).map(|ni| {
-            new_active.as_ref().and_then(|(active_ix, fh)| {
-                if *active_ix == ni {
-                    Some(fh.clone())
-                } else {
-                    None
-                }
-            })
-        }),
-    );
-    live_scrollbar.splice_blocks(prefix..old_end, Arc::clone(new_blocks), prefix..new_end);
+    let rel = path.strip_prefix(old_base).ok()?;
+    Some(new_base.join(rel))
 }
 
 pub(crate) fn reorder_with_active<T>(
@@ -4564,5 +4100,28 @@ mod tests {
         assert!(!reorder_with_active(&mut items, &mut active, 99, 0));
         assert_eq!(items, vec!["D", "C", "B", "A"]);
         assert_eq!(active, 2);
+    }
+
+    #[test]
+    fn zen_column_max_width_rules() {
+        assert_eq!(column_max_width(true, false), Some(NORMAL_READ_WIDTH));
+        assert_eq!(column_max_width(false, false), None);
+        assert_eq!(column_max_width(true, true), Some(ZEN_BOOK_WIDTH));
+        assert_eq!(column_max_width(false, true), Some(ZEN_BOOK_WIDTH));
+    }
+
+    #[test]
+    fn relocate_path_rewrites_files_and_nested_descendants() {
+        let old_dir = PathBuf::from("/vault/Notes");
+        let new_dir = PathBuf::from("/vault/Archive/Notes");
+        assert_eq!(relocate_path(&old_dir, &old_dir, &new_dir), Some(new_dir.clone()));
+        assert_eq!(
+            relocate_path(&PathBuf::from("/vault/Notes/Sub/A.md"), &old_dir, &new_dir),
+            Some(PathBuf::from("/vault/Archive/Notes/Sub/A.md"))
+        );
+        assert_eq!(
+            relocate_path(&PathBuf::from("/vault/Notes2/B.md"), &old_dir, &new_dir),
+            None
+        );
     }
 }

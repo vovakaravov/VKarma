@@ -1,6 +1,7 @@
-use super::{TabKind, VKarmaApp};
+use super::{CodeViewMode, TabKind, VKarmaApp};
 use crate::spreadsheet::cell_ref;
 use crate::theme::{hex_color, kd};
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::{Sizable as _, h_flex};
 use gpui_kit::{Context, IntoElement, ParentElement, Styled, div, prelude::FluentBuilder as _, px};
@@ -86,10 +87,104 @@ pub fn render_status_bar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> impl I
                 )
             }
             TabKind::Code {
-                language, soft_wrap, ..
+                language,
+                soft_wrap,
+                data_view,
+                ..
             } => {
-                let wrap = if *soft_wrap { "Wrap" } else { "NoWrap" };
-                format!("{} · {language} · {wrap}", tab.rel_path)
+                let mode = match data_view {
+                    CodeViewMode::Code => {
+                        if *soft_wrap {
+                            "Wrap"
+                        } else {
+                            "NoWrap"
+                        }
+                    }
+                    CodeViewMode::Tree => "Tree",
+                    CodeViewMode::Table => "Table",
+                };
+                format!("{} · {language} · {mode}", tab.rel_path)
+            }
+            TabKind::Canvas { view, .. } => {
+                format!("{} · Canvas · {}", tab.rel_path, view.read(cx).summary())
+            }
+            TabKind::Kanban { view, .. } => {
+                format!("{} · Kanban · {}", tab.rel_path, view.read(cx).summary())
+            }
+            TabKind::Subtitle { view, .. } => {
+                format!("{} · {}", tab.rel_path, view.read(cx).summary())
+            }
+            TabKind::Svg { view, .. } => {
+                format!("{} · SVG · {}", tab.rel_path, view.read(cx).summary())
+            }
+            TabKind::Mermaid { view, .. } => {
+                format!("{} · Mermaid · {}", tab.rel_path, view.read(cx).summary())
+            }
+            TabKind::Office {
+                doc, file_size_bytes, ..
+            } => {
+                format!(
+                    "{} · {} · {} words · {:.1} KB",
+                    tab.rel_path,
+                    doc.format.label(),
+                    doc.word_count,
+                    *file_size_bytes as f64 / 1024.0
+                )
+            }
+            TabKind::Epub {
+                view,
+                file_size_bytes,
+            } => {
+                format!(
+                    "{} · EPUB · {} · {:.0} KB",
+                    tab.rel_path,
+                    view.read(cx).summary(),
+                    *file_size_bytes as f64 / 1024.0
+                )
+            }
+            TabKind::Sqlite {
+                view,
+                file_size_bytes,
+            } => {
+                format!(
+                    "{} · SQLite · {} · {:.1} KB",
+                    tab.rel_path,
+                    view.read(cx).summary(),
+                    *file_size_bytes as f64 / 1024.0
+                )
+            }
+            TabKind::Archive {
+                view,
+                file_size_bytes,
+            } => {
+                format!(
+                    "{} · {} · {:.1} KB",
+                    tab.rel_path,
+                    view.read(cx).summary(),
+                    *file_size_bytes as f64 / 1024.0
+                )
+            }
+            TabKind::Audio {
+                view,
+                file_size_bytes,
+            } => {
+                format!(
+                    "{} · {} · {:.1} KB",
+                    tab.rel_path,
+                    view.read(cx).summary(),
+                    *file_size_bytes as f64 / 1024.0
+                )
+            }
+            TabKind::Font {
+                view,
+                file_size_bytes,
+            } => {
+                format!(
+                    "{} · {} · {:.1} KB",
+                    tab.rel_path,
+                    view.read(cx).summary(),
+                    *file_size_bytes as f64 / 1024.0
+                )
             }
             TabKind::Image {
                 zoom,
@@ -209,6 +304,17 @@ pub fn render_status_bar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> impl I
                                 this.save_all_tabs(window, cx);
                             }
                             cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("status-zen-btn")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Feather)
+                        .label("Zen")
+                        .tooltip("Zen Mode — Hide UI, Fullscreen & Book Width (F11)")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_zen_mode(window, cx);
                         })),
                 ),
         )

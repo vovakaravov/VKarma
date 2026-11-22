@@ -8,25 +8,61 @@ use walkdir::WalkDir;
 pub enum FileKind {
     Markdown,
     Mdx,
+    Canvas,
+    Kanban,
+    Subtitle,
     Fountain,
     Typst,
     Spreadsheet,
     Image,
+    Svg,
+    Mermaid,
+    Office,
+    Epub,
     Pdf,
+    Sqlite,
+    Archive,
+    Audio,
+    Font,
     Code(&'static str),
     PlainText,
 }
 
 impl FileKind {
+    pub fn is_binary(&self) -> bool {
+        matches!(
+            self,
+            Self::Image
+                | Self::Pdf
+                | Self::Office
+                | Self::Epub
+                | Self::Sqlite
+                | Self::Archive
+                | Self::Audio
+                | Self::Font
+        )
+    }
+
     pub fn short_badge(&self) -> &'static str {
         match self {
             Self::Markdown => "MD",
             Self::Mdx => "MDX",
+            Self::Canvas => "CNV",
+            Self::Kanban => "KBN",
+            Self::Subtitle => "SUB",
             Self::Fountain => "FTN",
             Self::Typst => "TYP",
             Self::Spreadsheet => "XLS",
             Self::Image => "IMG",
+            Self::Svg => "SVG",
+            Self::Mermaid => "MMD",
+            Self::Office => "DOC",
+            Self::Epub => "EPUB",
             Self::Pdf => "PDF",
+            Self::Sqlite => "DB",
+            Self::Archive => "ZIP",
+            Self::Audio => "AUD",
+            Self::Font => "FNT",
             Self::Code(lang) => match *lang {
                 "rust" => "RS",
                 "toml" => "TOML",
@@ -71,6 +107,12 @@ pub fn detect_file_kind(path: &Path) -> FileKind {
     if file_name == "cmakelists.txt" {
         return FileKind::Code("cmake");
     }
+    if file_name.ends_with(".kanban.md") {
+        return FileKind::Kanban;
+    }
+    if file_name.ends_with(".tar.gz") {
+        return FileKind::Archive;
+    }
 
     let ext = path
         .extension()
@@ -81,11 +123,22 @@ pub fn detect_file_kind(path: &Path) -> FileKind {
     match ext.as_str() {
         "md" | "markdown" => FileKind::Markdown,
         "mdx" => FileKind::Mdx,
+        "canvas" => FileKind::Canvas,
+        "kanban" => FileKind::Kanban,
+        "srt" | "vtt" => FileKind::Subtitle,
         "fountain" => FileKind::Fountain,
         "typ" => FileKind::Typst,
         "xlsx" | "csv" | "tsv" => FileKind::Spreadsheet,
-        "png" | "jpg" | "jpeg" | "webp" | "gif" | "svg" | "bmp" => FileKind::Image,
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" => FileKind::Image,
+        "svg" => FileKind::Svg,
+        "mmd" | "mermaid" => FileKind::Mermaid,
+        "docx" | "odt" => FileKind::Office,
+        "epub" => FileKind::Epub,
         "pdf" => FileKind::Pdf,
+        "sqlite" | "sqlite3" | "db" => FileKind::Sqlite,
+        "zip" | "tar" | "tgz" => FileKind::Archive,
+        "mp3" | "wav" | "ogg" | "flac" | "m4a" | "opus" => FileKind::Audio,
+        "ttf" | "otf" => FileKind::Font,
         "rs" => FileKind::Code("rust"),
         "toml" => FileKind::Code("toml"),
         "yaml" | "yml" => FileKind::Code("yaml"),
@@ -728,8 +781,7 @@ pub fn search_content(
         let title_score = score_title_match(&rel_path, name, stem, &q, &q_tokens);
 
         let kind = detect_file_kind(path);
-        let is_image = matches!(kind, FileKind::Image);
-        let is_pdf = matches!(kind, FileKind::Pdf);
+        let is_binary = kind.is_binary();
         let is_xlsx = path
             .extension()
             .and_then(|e| e.to_str())
@@ -739,8 +791,7 @@ pub fn search_content(
             .map(|m| m.len() <= 2 * 1024 * 1024)
             .unwrap_or(false);
 
-        let content_opt = if !is_image
-            && !is_pdf
+        let content_opt = if !is_binary
             && !is_xlsx
             && within_size
             && (title_score.is_some() || content_hits.len() < max_hits)
@@ -756,10 +807,22 @@ pub fn search_content(
                 .as_deref()
                 .and_then(|c| first_preview_line(c, is_md))
                 .unwrap_or_else(|| {
-                    if is_image {
+                    if matches!(kind, FileKind::Image) {
                         "Image".to_string()
-                    } else if is_pdf {
+                    } else if matches!(kind, FileKind::Pdf) {
                         "PDF document".to_string()
+                    } else if matches!(kind, FileKind::Office) {
+                        "Office document".to_string()
+                    } else if matches!(kind, FileKind::Epub) {
+                        "EPUB eBook".to_string()
+                    } else if matches!(kind, FileKind::Sqlite) {
+                        "SQLite database".to_string()
+                    } else if matches!(kind, FileKind::Archive) {
+                        "Archive".to_string()
+                    } else if matches!(kind, FileKind::Audio) {
+                        "Audio file".to_string()
+                    } else if matches!(kind, FileKind::Font) {
+                        "Font file".to_string()
                     } else if is_xlsx {
                         "Spreadsheet".to_string()
                     } else {
@@ -922,6 +985,35 @@ pub fn rename_entry(old_path: &Path, new_name: &str) -> Result<PathBuf> {
         )
     })?;
     Ok(new_path)
+}
+
+pub fn move_entry(src_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
+    let src_canon = fs::canonicalize(src_path).unwrap_or_else(|_| src_path.to_path_buf());
+    let dest_canon = fs::canonicalize(dest_dir).unwrap_or_else(|_| dest_dir.to_path_buf());
+    if !dest_canon.is_dir() {
+        anyhow::bail!("Destination is not a folder: {}", dest_dir.display());
+    }
+    if src_canon == dest_canon || (src_canon.is_dir() && dest_canon.starts_with(&src_canon)) {
+        anyhow::bail!("Cannot move a folder into itself or a subfolder");
+    }
+    if src_canon.parent() == Some(dest_canon.as_path()) {
+        return Ok(src_canon);
+    }
+    let Some(file_name) = src_canon.file_name() else {
+        anyhow::bail!("Invalid source path: {}", src_path.display());
+    };
+    let dest_path = dest_canon.join(file_name);
+    if dest_path.exists() {
+        anyhow::bail!("Target already exists: {}", dest_path.display());
+    }
+    fs::rename(&src_canon, &dest_path).with_context(|| {
+        format!(
+            "move {} to {}",
+            src_canon.display(),
+            dest_path.display()
+        )
+    })?;
+    Ok(dest_path)
 }
 
 pub fn duplicate_file(path: &Path) -> Result<PathBuf> {
@@ -1113,5 +1205,43 @@ mod tests {
         assert_eq!(capped.len(), 3);
         assert!(capped[0].is_title_match);
         assert_eq!(capped[0].rel_path, "zzz_omega.md");
+    }
+
+    #[test]
+    fn move_entry_handles_valid_and_invalid_moves() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let sub_a = root.join("Alpha");
+        let sub_b = root.join("Beta");
+        let nested = sub_a.join("Nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&sub_b).unwrap();
+        fs::write(root.join("Note.md"), "# Note").unwrap();
+        fs::write(sub_b.join("Collision.md"), "existing").unwrap();
+        fs::write(root.join("Collision.md"), "incoming").unwrap();
+
+        // Move file into subfolder
+        let moved_file = move_entry(&root.join("Note.md"), &sub_a).unwrap();
+        assert_eq!(moved_file, sub_a.join("Note.md"));
+        assert!(moved_file.is_file());
+
+        // No-op when dropping into same parent
+        let same = move_entry(&moved_file, &sub_a).unwrap();
+        assert_eq!(same, fs::canonicalize(&moved_file).unwrap());
+
+        // Move file back to root
+        let back = move_entry(&moved_file, root).unwrap();
+        assert_eq!(back, fs::canonicalize(root).unwrap().join("Note.md"));
+
+        // Move folder into sibling folder
+        let moved_dir = move_entry(&nested, &sub_b).unwrap();
+        assert!(moved_dir.is_dir());
+
+        // Reject moving folder into itself or descendant
+        assert!(move_entry(&sub_b, &sub_b).is_err());
+        assert!(move_entry(&sub_b, &moved_dir).is_err());
+
+        // Reject colliding destination name
+        assert!(move_entry(&root.join("Collision.md"), &sub_b).is_err());
     }
 }
