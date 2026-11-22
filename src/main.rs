@@ -2,6 +2,7 @@ mod config;
 mod fountain;
 mod live_preview;
 mod markdown;
+mod pdf_engine;
 mod spreadsheet;
 mod theme;
 mod typst_engine;

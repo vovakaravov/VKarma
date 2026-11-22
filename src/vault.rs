@@ -12,6 +12,7 @@ pub enum FileKind {
     Typst,
     Spreadsheet,
     Image,
+    Pdf,
     Code(&'static str),
     PlainText,
 }
@@ -25,6 +26,7 @@ impl FileKind {
             Self::Typst => "TYP",
             Self::Spreadsheet => "XLS",
             Self::Image => "IMG",
+            Self::Pdf => "PDF",
             Self::Code(lang) => match *lang {
                 "rust" => "RS",
                 "toml" => "TOML",
@@ -83,6 +85,7 @@ pub fn detect_file_kind(path: &Path) -> FileKind {
         "typ" => FileKind::Typst,
         "xlsx" | "csv" | "tsv" => FileKind::Spreadsheet,
         "png" | "jpg" | "jpeg" | "webp" | "gif" | "svg" | "bmp" => FileKind::Image,
+        "pdf" => FileKind::Pdf,
         "rs" => FileKind::Code("rust"),
         "toml" => FileKind::Code("toml"),
         "yaml" | "yml" => FileKind::Code("yaml"),
@@ -726,6 +729,7 @@ pub fn search_content(
 
         let kind = detect_file_kind(path);
         let is_image = matches!(kind, FileKind::Image);
+        let is_pdf = matches!(kind, FileKind::Pdf);
         let is_xlsx = path
             .extension()
             .and_then(|e| e.to_str())
@@ -736,6 +740,7 @@ pub fn search_content(
             .unwrap_or(false);
 
         let content_opt = if !is_image
+            && !is_pdf
             && !is_xlsx
             && within_size
             && (title_score.is_some() || content_hits.len() < max_hits)
@@ -753,6 +758,8 @@ pub fn search_content(
                 .unwrap_or_else(|| {
                     if is_image {
                         "Image".to_string()
+                    } else if is_pdf {
+                        "PDF document".to_string()
                     } else if is_xlsx {
                         "Spreadsheet".to_string()
                     } else {
@@ -1062,8 +1069,9 @@ mod tests {
         // Multi-word filename match with underscore
         fs::write(root.join("Raid_Prep.md"), "Flasks and food\n").unwrap();
 
-        // Image filename match (no text body)
+        // Image & PDF filename match (no text body)
         fs::write(root.join("alpha_banner.png"), [0x89, 0x50, 0x4E, 0x47]).unwrap();
+        fs::write(root.join("alpha_resume.pdf"), b"%PDF-1.7\n").unwrap();
 
         // Content-only match
         fs::write(
@@ -1085,6 +1093,7 @@ mod tests {
         assert_eq!(hits[1].rel_path, "AlphaNotes.md");
 
         assert!(hits.iter().any(|h| h.is_title_match && h.rel_path == "alpha_banner.png" && h.line_text == "Image"));
+        assert!(hits.iter().any(|h| h.is_title_match && h.rel_path == "alpha_resume.pdf" && h.line_text == "PDF document"));
         assert!(hits.iter().any(|h| !h.is_title_match && h.rel_path == "Zed.md" && h.line_num == 1));
 
         // Multi-word title match on underscore filename

@@ -4,6 +4,7 @@ pub mod live_preview_view;
 pub mod markdown_view;
 pub mod modals;
 pub mod pane;
+pub mod pdf_view;
 pub mod right_panel;
 pub mod sidebar;
 pub mod spreadsheet_view;
@@ -28,6 +29,7 @@ use crate::markdown::{
     SceneBreakPlugin, StyledImagePlugin, preprocess_markdown_with_options, toggle_nth_task_checkbox,
     word_and_char_count,
 };
+use crate::pdf_engine::{DEFAULT_PDF_DPI, DEFAULT_PDF_PAGE_LIMIT, render_pdf_pages};
 use crate::spreadsheet::SpreadsheetDoc;
 use crate::theme::{hex_color, kd};
 use crate::typst_engine::{compile_typst_png, empty_typst_debounce, export_typst_pdf};
@@ -239,6 +241,18 @@ pub enum TabKind {
         fit_to_view: bool,
         file_size_bytes: u64,
     },
+    Pdf {
+        zoom: f32,
+        pages: Vec<Arc<Image>>,
+        total_pages: usize,
+        rendered_limit: Option<usize>,
+        render_ms: Option<u128>,
+        last_error: Option<String>,
+        rendering: bool,
+        render_gen: u64,
+        file_size_bytes: u64,
+        modified: Option<std::time::SystemTime>,
+    },
 }
 
 pub struct DocumentTab {
@@ -399,6 +413,7 @@ pub fn file_kind_color(kind: FileKind) -> Hsla {
         FileKind::Typst => hex_color(kd::AQUA),
         FileKind::Spreadsheet => hex_color(kd::GREEN),
         FileKind::Image => hex_color(kd::PINK),
+        FileKind::Pdf => hex_color(kd::RED),
         FileKind::Code(_) => hex_color(kd::YELLOW),
         FileKind::PlainText => hex_color(kd::FG_MUTED),
     }
@@ -418,6 +433,7 @@ pub fn tab_badge_and_color(tab: &DocumentTab) -> (&'static str, Hsla) {
         TabKind::Spreadsheet { doc, .. } => (doc.format.label(), hex_color(kd::GREEN)),
         TabKind::Code { badge, .. } => (*badge, hex_color(kd::YELLOW)),
         TabKind::Image { .. } => ("IMG", hex_color(kd::PINK)),
+        TabKind::Pdf { .. } => ("PDF", hex_color(kd::RED)),
     }
 }
 
@@ -639,6 +655,7 @@ impl VKarmaApp {
                 if changed {
                     let _ = this.update(cx, |app, cx| {
                         app.refresh_vault_index(cx);
+                        app.reload_modified_pdf_tabs(cx);
                     });
                 }
             }
@@ -1370,7 +1387,7 @@ impl VKarmaApp {
             TabKind::Spreadsheet { grid_focus, .. } => {
                 grid_focus.focus(window, cx);
             }
-            TabKind::Image { .. } => {}
+            TabKind::Image { .. } | TabKind::Pdf { .. } => {}
         }
     }
 
@@ -1597,6 +1614,30 @@ impl VKarmaApp {
                     zoom: 1.0,
                     fit_to_view: true,
                     file_size_bytes: meta.len(),
+                }
+            }
+            FileKind::Pdf => {
+                let meta = fs::metadata(path)?;
+                self.schedule_pdf_render(
+                    side,
+                    tab_id,
+                    1,
+                    path.to_path_buf(),
+                    DEFAULT_PDF_DPI,
+                    Some(DEFAULT_PDF_PAGE_LIMIT),
+                    cx,
+                );
+                TabKind::Pdf {
+                    zoom: 1.0,
+                    pages: Vec::new(),
+                    total_pages: 0,
+                    rendered_limit: Some(DEFAULT_PDF_PAGE_LIMIT),
+                    render_ms: None,
+                    last_error: None,
+                    rendering: true,
+                    render_gen: 1,
+                    file_size_bytes: meta.len(),
+                    modified: meta.modified().ok(),
                 }
             }
             FileKind::Code(lang) => {
@@ -3060,6 +3101,149 @@ impl VKarmaApp {
         .detach();
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_pdf_render(
+        &self,
+        side: PaneSide,
+        tab_id: u64,
+        gen_num: u64,
+        path: PathBuf,
+        dpi: u32,
+        max_pages: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let ws_gen = self.workspace_gen;
+        cx.spawn(async move |this, cx| {
+            let rendered = cx
+                .background_executor()
+                .spawn(async move {
+                    let meta = fs::metadata(&path).ok();
+                    let out = render_pdf_pages(&path, dpi, max_pages);
+                    (
+                        out,
+                        meta.as_ref().map(|m| m.len()),
+                        meta.and_then(|m| m.modified().ok()),
+                    )
+                })
+                .await;
+
+            let _ = this.update(cx, |app, cx| {
+                if app.workspace_gen != ws_gen {
+                    return;
+                }
+                let Some(tab) = app.find_tab_mut(side, tab_id) else {
+                    return;
+                };
+                if let TabKind::Pdf {
+                    pages,
+                    total_pages,
+                    render_ms,
+                    last_error,
+                    rendering,
+                    render_gen,
+                    file_size_bytes,
+                    modified,
+                    ..
+                } = &mut tab.kind
+                {
+                    if *render_gen != gen_num {
+                        return;
+                    }
+                    let (out, new_sz, new_mod) = rendered;
+                    *rendering = false;
+                    *render_ms = Some(out.duration_ms);
+                    *last_error = out.error;
+                    if out.total_pages > 0 || last_error.is_none() {
+                        *total_pages = out.total_pages;
+                    }
+                    if !out.pages.is_empty() || last_error.is_none() {
+                        *pages = out.pages;
+                    }
+                    if let Some(sz) = new_sz {
+                        *file_size_bytes = sz;
+                    }
+                    if new_mod.is_some() {
+                        *modified = new_mod;
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub fn reload_pdf_tab(&mut self, side: PaneSide, tab_id: u64, cx: &mut Context<Self>) {
+        let params = self.find_tab_mut(side, tab_id).and_then(|tab| {
+            if let TabKind::Pdf {
+                rendered_limit,
+                rendering,
+                render_gen,
+                ..
+            } = &mut tab.kind
+            {
+                *render_gen = render_gen.wrapping_add(1);
+                *rendering = true;
+                Some((*render_gen, tab.path.clone(), *rendered_limit))
+            } else {
+                None
+            }
+        });
+        if let Some((gen_num, path, limit)) = params {
+            self.schedule_pdf_render(side, tab_id, gen_num, path, DEFAULT_PDF_DPI, limit, cx);
+            cx.notify();
+        }
+    }
+
+    pub fn load_all_pdf_pages(&mut self, side: PaneSide, tab_id: u64, cx: &mut Context<Self>) {
+        let params = self.find_tab_mut(side, tab_id).and_then(|tab| {
+            if let TabKind::Pdf {
+                rendered_limit,
+                rendering,
+                render_gen,
+                ..
+            } = &mut tab.kind
+            {
+                *rendered_limit = None;
+                *render_gen = render_gen.wrapping_add(1);
+                *rendering = true;
+                Some((*render_gen, tab.path.clone()))
+            } else {
+                None
+            }
+        });
+        if let Some((gen_num, path)) = params {
+            self.schedule_pdf_render(side, tab_id, gen_num, path, DEFAULT_PDF_DPI, None, cx);
+            cx.notify();
+        }
+    }
+
+    pub fn reload_modified_pdf_tabs(&mut self, cx: &mut Context<Self>) {
+        let mut to_reload = Vec::new();
+        for (side, pane_opt) in [
+            (PaneSide::Left, Some(&self.left_pane)),
+            (PaneSide::Right, self.right_pane.as_ref()),
+        ] {
+            let Some(pane) = pane_opt else {
+                continue;
+            };
+            for tab in &pane.tabs {
+                if let TabKind::Pdf {
+                    modified, rendering, ..
+                } = &tab.kind
+                    && !*rendering
+                    && let Ok(meta) = fs::metadata(&tab.path)
+                    && let Ok(disk_mod) = meta.modified()
+                    && modified.as_ref() != Some(&disk_mod)
+                {
+                    to_reload.push((side, tab.id));
+                }
+            }
+        }
+        for (side, tab_id) in to_reload {
+            self.reload_pdf_tab(side, tab_id, cx);
+        }
+    }
+
     fn on_code_changed(
         &mut self,
         side: PaneSide,
@@ -3141,7 +3325,7 @@ impl VKarmaApp {
                     atomic_write_string(&path, content.as_ref())
                 }
                 TabKind::Spreadsheet { doc, .. } => doc.save(&path),
-                TabKind::Image { .. } => Ok(()),
+                TabKind::Image { .. } | TabKind::Pdf { .. } => Ok(()),
             }
         };
 

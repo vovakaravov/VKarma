@@ -1,6 +1,6 @@
 use super::{
     NewItemTemplate, PaneSide, TabKind, VKarmaApp, code_view, fountain_view, markdown_view, modals,
-    spreadsheet_view, tab_badge_and_color, typst_view,
+    pdf_view, spreadsheet_view, tab_badge_and_color, typst_view,
 };
 use crate::theme::{hex_alpha, hex_color, kd};
 use gpui_kit::assets::IconName;
@@ -172,6 +172,7 @@ pub fn render_pane(
             }
             TabKind::Code { .. } => code_view::render_code_tab(side, tab, cx).into_any_element(),
             TabKind::Image { .. } => code_view::render_image_tab(tab, cx).into_any_element(),
+            TabKind::Pdf { .. } => pdf_view::render_pdf_tab(side, tab, cx).into_any_element(),
         },
         None => render_empty_pane(app, side, cx).into_any_element(),
     };

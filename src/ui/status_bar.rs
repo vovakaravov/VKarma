@@ -107,6 +107,31 @@ pub fn render_status_bar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> impl I
                     *file_size_bytes as f64 / 1024.0
                 )
             }
+            TabKind::Pdf {
+                pages,
+                total_pages,
+                rendering,
+                last_error,
+                file_size_bytes,
+                zoom,
+                ..
+            } => {
+                let kb = *file_size_bytes as f64 / 1024.0;
+                let status = if *rendering {
+                    "Rendering…".to_string()
+                } else if last_error.is_some() {
+                    "Render Error".to_string()
+                } else if *total_pages > pages.len() {
+                    format!("{}/{}p", pages.len(), total_pages)
+                } else {
+                    format!("{total_pages}p")
+                };
+                format!(
+                    "{} · PDF · {status} · {kb:.1} KB · {}%",
+                    tab.rel_path,
+                    (zoom * 100.0).round() as i32
+                )
+            }
         },
         None => format!(
             "Vault: {} files ({} notes)",

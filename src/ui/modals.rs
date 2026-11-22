@@ -6,13 +6,13 @@ use crate::vault::{create_new_file, create_new_folder, delete_entry, rename_entr
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, Entity, Focusable as _, InteractiveElement as _, IntoElement,
     ParentElement, PathPromptOptions, SharedString, StatefulInteractiveElement as _, Styled,
-    Window, div, prelude::FluentBuilder as _, px,
+    Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -201,6 +201,19 @@ pub fn render_quick_switcher_overlay(
         )
 }
 
+fn subscribe_submit_on_enter(
+    input: &Entity<InputState>,
+    submit: Rc<dyn Fn(&mut Window, &mut App)>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Subscription {
+    window.subscribe(input, cx, move |_, event: &InputEvent, window, cx| {
+        if matches!(event, InputEvent::PressEnter { .. }) {
+            submit(window, cx);
+        }
+    })
+}
+
 pub fn open_new_item_dialog(
     app_entity: Entity<VKarmaApp>,
     parent_dir: PathBuf,
@@ -210,15 +223,92 @@ pub fn open_new_item_dialog(
 ) {
     let name_input = cx.new(|cx| InputState::new(window, cx).placeholder(template.placeholder()));
     let initial_focus = Cell::new(true);
+    let submitted = Rc::new(Cell::new(false));
+
+    let submit: Rc<dyn Fn(&mut Window, &mut App)> = {
+        let input_ok = name_input.clone();
+        let app_ok = app_entity.clone();
+        let dir_ok = parent_dir.clone();
+        let done = submitted.clone();
+        Rc::new(move |window, cx| {
+            if done.get() {
+                return;
+            }
+            let raw_name = input_ok.read(cx).value().trim().to_string();
+            if raw_name.is_empty() {
+                return;
+            }
+            let final_name = match template.extension() {
+                Some(ext) if !raw_name.contains('.') => format!("{raw_name}.{ext}"),
+                _ => raw_name,
+            };
+            let dest = dir_ok.join(&final_name);
+
+            let res = match template {
+                NewItemTemplate::Folder => create_new_folder(&dest),
+                NewItemTemplate::Markdown => {
+                    let title = dest
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Note");
+                    create_new_file(&dest, &format!("# {title}\n\n"))
+                }
+                NewItemTemplate::Typst => {
+                    let title = dest
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Document");
+                    create_new_file(
+                        &dest,
+                        &format!(
+                            "#set page(paper: \"a4\", margin: 2cm)\n#set text(size: 11pt)\n\n= {title}\n\nWrite Typst content here.\n"
+                        ),
+                    )
+                }
+                NewItemTemplate::Spreadsheet => {
+                    SpreadsheetDoc::new_empty(&dest).and_then(|mut doc| doc.save(&dest))
+                }
+                NewItemTemplate::Fountain => {
+                    let title = dest
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Untitled Screenplay");
+                    let starter = format!(
+                        "Title: {title}\nCredit: Written by\nAuthor: \nDraft date: \n\n===\n\nFADE IN:\n\nINT. LOCATION - DAY\n\nOpening beat.\n\nCHARACTER\nFirst line of dialogue.\n\nFADE OUT.\n"
+                    );
+                    create_new_file(&dest, &starter)
+                }
+            };
+
+            match res {
+                Ok(()) => {
+                    done.set(true);
+                    window.close_dialog(cx);
+                    app_ok.update(cx, |app, cx| {
+                        app.refresh_vault_index(cx);
+                        if template != NewItemTemplate::Folder {
+                            let pane = app.active_pane;
+                            app.open_file(dest, pane, window, cx);
+                        }
+                    });
+                }
+                Err(err) => {
+                    app_ok.update(cx, |app, cx| {
+                        app.toast_err(format!("{err}"), window, cx);
+                    });
+                }
+            }
+        })
+    };
+    let enter_sub = subscribe_submit_on_enter(&name_input, submit.clone(), window, cx);
 
     window.open_dialog(cx, move |dialog, window, cx| {
+        let _ = &enter_sub;
         if initial_focus.replace(false) {
             name_input.focus_handle(cx).focus(window, cx);
         }
 
-        let input_ok = name_input.clone();
-        let app_ok = app_entity.clone();
-        let dir_ok = parent_dir.clone();
+        let submit_btn = submit.clone();
 
         dialog
             .title(template.title())
@@ -246,72 +336,7 @@ pub fn open_new_item_dialog(
                             .primary()
                             .label("Create")
                             .on_click(move |_, window, cx| {
-                                let raw_name = input_ok.read(cx).value().trim().to_string();
-                                if raw_name.is_empty() {
-                                    return;
-                                }
-                                let final_name = match template.extension() {
-                                    Some(ext) if !raw_name.contains('.') => {
-                                        format!("{raw_name}.{ext}")
-                                    }
-                                    _ => raw_name,
-                                };
-                                let dest = dir_ok.join(&final_name);
-
-                                let res = match template {
-                                    NewItemTemplate::Folder => create_new_folder(&dest),
-                                    NewItemTemplate::Markdown => {
-                                        let title = dest
-                                            .file_stem()
-                                            .and_then(|s| s.to_str())
-                                            .unwrap_or("Note");
-                                        create_new_file(&dest, &format!("# {title}\n\n"))
-                                    }
-                                    NewItemTemplate::Typst => {
-                                        let title = dest
-                                            .file_stem()
-                                            .and_then(|s| s.to_str())
-                                            .unwrap_or("Document");
-                                        create_new_file(
-                                            &dest,
-                                            &format!(
-                                                "#set page(paper: \"a4\", margin: 2cm)\n#set text(size: 11pt)\n\n= {title}\n\nWrite Typst content here.\n"
-                                            ),
-                                        )
-                                    }
-                                    NewItemTemplate::Spreadsheet => {
-                                        SpreadsheetDoc::new_empty(&dest)
-                                            .and_then(|mut doc| doc.save(&dest))
-                                    }
-                                    NewItemTemplate::Fountain => {
-                                        let title = dest
-                                            .file_stem()
-                                            .and_then(|s| s.to_str())
-                                            .unwrap_or("Untitled Screenplay");
-                                        let starter = format!(
-                                            "Title: {title}\nCredit: Written by\nAuthor: \nDraft date: \n\n===\n\nFADE IN:\n\nINT. LOCATION - DAY\n\nOpening beat.\n\nCHARACTER\nFirst line of dialogue.\n\nFADE OUT.\n"
-                                        );
-                                        create_new_file(&dest, &starter)
-                                    }
-                                };
-
-                                match res {
-                                    Ok(()) => {
-                                        window.close_dialog(cx);
-                                        app_ok.update(cx, |app, cx| {
-                                            app.refresh_vault_index(cx);
-                                            if template != NewItemTemplate::Folder {
-                                                let pane = app.active_pane;
-                                                app.open_file(dest, pane, window, cx);
-                                            }
-                                        });
-                                    }
-                                    Err(err) => {
-                                        app_ok.update(cx, |app, cx| {
-                                            app.toast_err(format!("{err}"), window, cx);
-                                        });
-                                    }
-                                }
+                                submit_btn(window, cx);
                             }),
                     ),
             )
@@ -331,14 +356,61 @@ pub fn open_rename_dialog(
         .to_string();
     let name_input = cx.new(|cx| InputState::new(window, cx).default_value(cur_name.clone()));
     let initial_focus = Cell::new(true);
+    let submitted = Rc::new(Cell::new(false));
 
-    window.open_dialog(cx, move |dialog, window, cx| {
-        if initial_focus.replace(false) {
-            name_input.focus_handle(cx).focus(window, cx);
-        }
+    let submit: Rc<dyn Fn(&mut Window, &mut App)> = {
         let input_ok = name_input.clone();
         let app_ok = app_entity.clone();
         let old_path = target.clone();
+        let done = submitted.clone();
+        Rc::new(move |window, cx| {
+            if done.get() {
+                return;
+            }
+            let new_name = input_ok.read(cx).value().trim().to_string();
+            if new_name.is_empty() {
+                return;
+            }
+            match rename_entry(&old_path, &new_name) {
+                Ok(new_path) => {
+                    done.set(true);
+                    window.close_dialog(cx);
+                    app_ok.update(cx, |app, cx| {
+                        for tab in app
+                            .left_pane
+                            .tabs
+                            .iter_mut()
+                            .chain(app.right_pane.iter_mut().flat_map(|p| p.tabs.iter_mut()))
+                        {
+                            if tab.path == old_path {
+                                tab.path = new_path.clone();
+                                tab.title = new_name.clone();
+                                tab.rel_path = new_path
+                                    .strip_prefix(&app.workspace_root)
+                                    .unwrap_or(&new_path)
+                                    .to_string_lossy()
+                                    .to_string();
+                            }
+                        }
+                        app.refresh_vault_index(cx);
+                    });
+                }
+                Err(err) => {
+                    app_ok.update(cx, |app, cx| {
+                        app.toast_err(format!("{err}"), window, cx);
+                    });
+                }
+            }
+        })
+    };
+    let enter_sub = subscribe_submit_on_enter(&name_input, submit.clone(), window, cx);
+
+    window.open_dialog(cx, move |dialog, window, cx| {
+        let _ = &enter_sub;
+        if initial_focus.replace(false) {
+            name_input.focus_handle(cx).focus(window, cx);
+        }
+        let submit_btn = submit.clone();
 
         dialog
             .title(format!("Rename '{cur_name}'"))
@@ -356,40 +428,7 @@ pub fn open_rename_dialog(
                             .primary()
                             .label("Rename")
                             .on_click(move |_, window, cx| {
-                                let new_name = input_ok.read(cx).value().trim().to_string();
-                                match rename_entry(&old_path, &new_name) {
-                                    Ok(new_path) => {
-                                        window.close_dialog(cx);
-                                        app_ok.update(cx, |app, cx| {
-                                            for tab in app
-                                                .left_pane
-                                                .tabs
-                                                .iter_mut()
-                                                .chain(
-                                                    app.right_pane
-                                                        .iter_mut()
-                                                        .flat_map(|p| p.tabs.iter_mut()),
-                                                )
-                                            {
-                                                if tab.path == old_path {
-                                                    tab.path = new_path.clone();
-                                                    tab.title = new_name.clone();
-                                                    tab.rel_path = new_path
-                                                        .strip_prefix(&app.workspace_root)
-                                                        .unwrap_or(&new_path)
-                                                        .to_string_lossy()
-                                                        .to_string();
-                                                }
-                                            }
-                                            app.refresh_vault_index(cx);
-                                        });
-                                    }
-                                    Err(err) => {
-                                        app_ok.update(cx, |app, cx| {
-                                            app.toast_err(format!("{err}"), window, cx);
-                                        });
-                                    }
-                                }
+                                submit_btn(window, cx);
                             }),
                     ),
             )
@@ -486,14 +525,52 @@ pub fn open_rename_sheet_dialog(
 ) {
     let name_input = cx.new(|cx| InputState::new(window, cx).default_value(old_name.clone()));
     let initial_focus = Cell::new(true);
+    let submitted = Rc::new(Cell::new(false));
 
-    window.open_dialog(cx, move |dialog, window, cx| {
-        if initial_focus.replace(false) {
-            name_input.focus_handle(cx).focus(window, cx);
-        }
+    let submit: Rc<dyn Fn(&mut Window, &mut App)> = {
         let input_ok = name_input.clone();
         let app_ok = app_entity.clone();
         let old = old_name.clone();
+        let done = submitted.clone();
+        Rc::new(move |window, cx| {
+            if done.get() {
+                return;
+            }
+            let new_name = input_ok.read(cx).value().trim().to_string();
+            let res = app_ok.update(cx, |app, _| {
+                if let Some(tab) = app.find_tab_mut(side, tab_id)
+                    && let TabKind::Spreadsheet { doc, .. } = &mut tab.kind
+                {
+                    let r = doc.rename_sheet(&old, &new_name);
+                    if r.is_ok() {
+                        tab.dirty = true;
+                    }
+                    return r;
+                }
+                Ok(())
+            });
+            match res {
+                Ok(()) => {
+                    done.set(true);
+                    window.close_dialog(cx);
+                    app_ok.update(cx, |_, cx| cx.notify());
+                }
+                Err(err) => {
+                    app_ok.update(cx, |app, cx| {
+                        app.toast_err(format!("{err}"), window, cx);
+                    });
+                }
+            }
+        })
+    };
+    let enter_sub = subscribe_submit_on_enter(&name_input, submit.clone(), window, cx);
+
+    window.open_dialog(cx, move |dialog, window, cx| {
+        let _ = &enter_sub;
+        if initial_focus.replace(false) {
+            name_input.focus_handle(cx).focus(window, cx);
+        }
+        let submit_btn = submit.clone();
 
         dialog
             .title(format!("Rename Sheet '{old_name}'"))
@@ -511,30 +588,7 @@ pub fn open_rename_sheet_dialog(
                             .primary()
                             .label("Rename")
                             .on_click(move |_, window, cx| {
-                                let new_name = input_ok.read(cx).value().trim().to_string();
-                                let res = app_ok.update(cx, |app, _| {
-                                    if let Some(tab) = app.find_tab_mut(side, tab_id)
-                                        && let TabKind::Spreadsheet { doc, .. } = &mut tab.kind
-                                    {
-                                        let r = doc.rename_sheet(&old, &new_name);
-                                        if r.is_ok() {
-                                            tab.dirty = true;
-                                        }
-                                        return r;
-                                    }
-                                    Ok(())
-                                });
-                                match res {
-                                    Ok(()) => {
-                                        window.close_dialog(cx);
-                                        app_ok.update(cx, |_, cx| cx.notify());
-                                    }
-                                    Err(err) => {
-                                        app_ok.update(cx, |app, cx| {
-                                            app.toast_err(format!("{err}"), window, cx);
-                                        });
-                                    }
-                                }
+                                submit_btn(window, cx);
                             }),
                     ),
             )
@@ -552,8 +606,49 @@ pub fn open_new_workspace_dialog(
     let selected_root = Rc::new(RefCell::new(default_root));
     let selected_preset = Rc::new(Cell::new(WorkspacePreset::Notes));
     let initial_focus = Cell::new(true);
+    let submitted = Rc::new(Cell::new(false));
+
+    let submit: Rc<dyn Fn(&mut Window, &mut App)> = {
+        let input_ok = name_input.clone();
+        let root_ok = selected_root.clone();
+        let preset_ok = selected_preset.clone();
+        let app_ok = app_entity.clone();
+        let done = submitted.clone();
+        Rc::new(move |window, cx| {
+            if done.get() {
+                return;
+            }
+            let typed = input_ok.read(cx).value().trim().to_string();
+            let root = root_ok.borrow().clone();
+            if !root.is_dir() {
+                app_ok.update(cx, |app, cx| {
+                    app.toast_err(
+                        format!("Folder not found: {}", root.display()),
+                        window,
+                        cx,
+                    );
+                });
+                return;
+            }
+            let name = if typed.is_empty() {
+                root.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Workspace")
+                    .to_string()
+            } else {
+                typed
+            };
+            done.set(true);
+            window.close_dialog(cx);
+            app_ok.update(cx, |app, cx| {
+                app.add_workspace(name, root, preset_ok.get(), window, cx);
+            });
+        })
+    };
+    let enter_sub = subscribe_submit_on_enter(&name_input, submit.clone(), window, cx);
 
     window.open_dialog(cx, move |dialog, window, cx| {
+        let _ = &enter_sub;
         if initial_focus.replace(false) {
             name_input.focus_handle(cx).focus(window, cx);
         }
@@ -563,10 +658,7 @@ pub fn open_new_workspace_dialog(
 
         let root_pick = selected_root.clone();
         let app_pick = app_entity.clone();
-        let input_ok = name_input.clone();
-        let root_ok = selected_root.clone();
-        let preset_ok = selected_preset.clone();
-        let app_ok = app_entity.clone();
+        let submit_btn = submit.clone();
 
         let preset_pills = WorkspacePreset::all().iter().copied().map(|preset| {
             let is_sel = preset == current_preset;
@@ -697,30 +789,7 @@ pub fn open_new_workspace_dialog(
                             .primary()
                             .label("Create Workspace")
                             .on_click(move |_, window, cx| {
-                                let typed = input_ok.read(cx).value().trim().to_string();
-                                let root = root_ok.borrow().clone();
-                                if !root.is_dir() {
-                                    app_ok.update(cx, |app, cx| {
-                                        app.toast_err(
-                                            format!("Folder not found: {}", root.display()),
-                                            window,
-                                            cx,
-                                        );
-                                    });
-                                    return;
-                                }
-                                let name = if typed.is_empty() {
-                                    root.file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or("Workspace")
-                                        .to_string()
-                                } else {
-                                    typed
-                                };
-                                window.close_dialog(cx);
-                                app_ok.update(cx, |app, cx| {
-                                    app.add_workspace(name, root, preset_ok.get(), window, cx);
-                                });
+                                submit_btn(window, cx);
                             }),
                     ),
             )
@@ -736,13 +805,35 @@ pub fn open_rename_workspace_dialog(
 ) {
     let name_input = cx.new(|cx| InputState::new(window, cx).default_value(current_name.clone()));
     let initial_focus = Cell::new(true);
+    let submitted = Rc::new(Cell::new(false));
+
+    let submit: Rc<dyn Fn(&mut Window, &mut App)> = {
+        let input_ok = name_input.clone();
+        let app_ok = app_entity.clone();
+        let done = submitted.clone();
+        Rc::new(move |window, cx| {
+            if done.get() {
+                return;
+            }
+            let new_name = input_ok.read(cx).value().trim().to_string();
+            if new_name.is_empty() {
+                return;
+            }
+            done.set(true);
+            window.close_dialog(cx);
+            app_ok.update(cx, |app, cx| {
+                app.rename_workspace(ws_idx, new_name, window, cx);
+            });
+        })
+    };
+    let enter_sub = subscribe_submit_on_enter(&name_input, submit.clone(), window, cx);
 
     window.open_dialog(cx, move |dialog, window, cx| {
+        let _ = &enter_sub;
         if initial_focus.replace(false) {
             name_input.focus_handle(cx).focus(window, cx);
         }
-        let input_ok = name_input.clone();
-        let app_ok = app_entity.clone();
+        let submit_btn = submit.clone();
 
         dialog
             .title(format!("Rename Workspace '{current_name}'"))
@@ -760,14 +851,7 @@ pub fn open_rename_workspace_dialog(
                             .primary()
                             .label("Rename")
                             .on_click(move |_, window, cx| {
-                                let new_name = input_ok.read(cx).value().trim().to_string();
-                                if new_name.is_empty() {
-                                    return;
-                                }
-                                window.close_dialog(cx);
-                                app_ok.update(cx, |app, cx| {
-                                    app.rename_workspace(ws_idx, new_name, window, cx);
-                                });
+                                submit_btn(window, cx);
                             }),
                     ),
             )
