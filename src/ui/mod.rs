@@ -66,19 +66,80 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable, Hsla,
-    Image, InteractiveElement as _, IntoElement, KeyBinding, MouseButton, MouseDownEvent,
-    NavigationDirection, ParentElement, PathPromptOptions, Render, SharedString,
-    StatefulInteractiveElement as _, Styled, Subscription, UniformListScrollHandle, Window, actions,
-    div, prelude::FluentBuilder as _, px,
+    Image, ImageCache, ImageCacheError, InteractiveElement as _, IntoElement, KeyBinding,
+    MouseButton, MouseDownEvent, NavigationDirection, ParentElement, PathPromptOptions, Render,
+    RenderImage, Resource, RetainAllImageCache, SharedString, StatefulInteractiveElement as _,
+    Styled, Subscription, UniformListScrollHandle, Window, actions, div,
+    prelude::FluentBuilder as _, px,
 };
 use live_editor::{LiveEditorEvent, LiveMarkdownEditor};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+#[cfg(target_env = "gnu")]
+pub fn trim_allocator() {
+    unsafe extern "C" {
+        fn malloc_trim(pad: usize) -> std::ffi::c_int;
+    }
+    // SAFETY: glibc's `malloc_trim(0)` is thread-safe and releases unused free
+    // heap/arena pages back to the OS without affecting live allocations.
+    unsafe {
+        let _ = malloc_trim(0);
+    }
+}
+
+#[cfg(not(target_env = "gnu"))]
+pub fn trim_allocator() {}
+
+pub struct LruImageCache {
+    inner: Entity<RetainAllImageCache>,
+    order: VecDeque<Resource>,
+    max_entries: usize,
+}
+
+impl LruImageCache {
+    pub fn new(max_entries: usize, cx: &mut App) -> Entity<Self> {
+        let inner = RetainAllImageCache::new(cx);
+        cx.new(|_| Self {
+            inner,
+            order: VecDeque::with_capacity(max_entries + 1),
+            max_entries: max_entries.max(1),
+        })
+    }
+}
+
+impl ImageCache for LruImageCache {
+    fn load(
+        &mut self,
+        resource: &Resource,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+        if let Some(pos) = self.order.iter().position(|r| r == resource) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(resource.clone());
+
+        let result = self
+            .inner
+            .update(cx, |cache, cx| cache.load(resource, window, cx));
+
+        while self.order.len() > self.max_entries {
+            if let Some(oldest) = self.order.pop_front() {
+                self.inner.update(cx, |cache, cx| {
+                    cache.remove(&oldest, window, cx);
+                });
+            }
+        }
+
+        result
+    }
+}
 
 static NEXT_TAB_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -242,7 +303,7 @@ pub enum FountainViewMode {
 
 pub enum TabKind {
     Markdown {
-        editor: Entity<EditorState>,
+        editor: Option<Entity<EditorState>>,
         live_doc: Entity<LiveMarkdownEditor>,
         view_mode: MdViewMode,
         source_mode: bool,
@@ -255,7 +316,7 @@ pub enum TabKind {
         chapter_mode: bool,
         active_chapter: usize,
         _live_sub: Subscription,
-        _sub: Subscription,
+        _sub: Option<Subscription>,
     },
     Fountain {
         editor: Entity<EditorState>,
@@ -678,6 +739,7 @@ pub struct VKarmaApp {
     pub workspace_gen: u64,
     pub zen_mode: bool,
     pub zen_entered_fullscreen: bool,
+    pub image_cache: Entity<LruImageCache>,
 }
 
 impl Focusable for VKarmaApp {
@@ -768,6 +830,8 @@ impl VKarmaApp {
             .plugin(SceneBreakPlugin)
             .parser_revision(1);
 
+        let image_cache = LruImageCache::new(48, cx);
+
         let mut app = Self {
             focus_handle: cx.focus_handle(),
             config,
@@ -795,6 +859,7 @@ impl VKarmaApp {
             workspace_gen: 1,
             zen_mode: false,
             zen_entered_fullscreen: false,
+            image_cache,
         };
 
         window.set_window_title(&ws_title);
@@ -1066,6 +1131,7 @@ impl VKarmaApp {
         if let Some(active_tab) = self.pane(self.active_pane).map(|p| p.active_tab) {
             self.focus_tab_widget(self.active_pane, active_tab, window, cx);
         }
+        trim_allocator();
         self.set_status(format!("Workspace: {target_name}"), cx);
         cx.notify();
     }
@@ -1269,7 +1335,11 @@ impl VKarmaApp {
         cx.spawn(async move |this, cx| {
             let new_vault = cx
                 .background_executor()
-                .spawn(async move { Arc::new(VaultIndex::build(&root, show_hidden)) })
+                .spawn(async move {
+                    let built = Arc::new(VaultIndex::build(&root, show_hidden));
+                    trim_allocator();
+                    built
+                })
                 .await;
 
             let _ = this.update(cx, |app, cx| {
@@ -1294,8 +1364,10 @@ impl VKarmaApp {
                         ..
                     } = &mut pane.kind
                     {
-                        let raw: SharedString = if *source_mode {
-                            editor.read(cx).value()
+                        let raw: SharedString = if *source_mode
+                            && let Some(ed) = editor.as_ref()
+                        {
+                            ed.read(cx).value()
                         } else {
                             live_doc.read(cx).text().to_string().into()
                         };
@@ -1312,6 +1384,7 @@ impl VKarmaApp {
                         view.update(cx, |v, _| v.update_vault(vault_clone));
                     }
                 }
+                trim_allocator();
                 cx.notify();
             });
         })
@@ -1545,8 +1618,10 @@ impl VKarmaApp {
                 source_mode,
                 ..
             } => {
-                if *source_mode {
-                    editor.focus_handle(cx).focus(window, cx);
+                if *source_mode
+                    && let Some(ed) = editor
+                {
+                    ed.focus_handle(cx).focus(window, cx);
                 } else if *view_mode != MdViewMode::Reading {
                     live_doc.focus_handle(cx).focus(window, cx);
                 } else {
@@ -1595,6 +1670,36 @@ impl VKarmaApp {
         }
     }
 
+    fn create_md_source_editor(
+        side: PaneSide,
+        tab_id: u64,
+        raw: String,
+        line_numbers: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<EditorState>, Subscription) {
+        let editor = cx.new(|cx| {
+            let mut state = EditorState::new(window, cx)
+                .language("markdown")
+                .soft_wrap(true)
+                .line_number(line_numbers)
+                .default_value(raw);
+            state.set_editor_paddings(gpui_kit::Edges {
+                top: px(10.),
+                right: px(16.),
+                bottom: px(24.),
+                left: px(12.),
+            });
+            state
+        });
+        let sub = cx.subscribe_in(&editor, window, move |this, _ed, event, window, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.on_markdown_changed(side, tab_id, window, cx);
+            }
+        });
+        (editor, sub)
+    }
+
     fn build_document_tab(
         &self,
         path: &Path,
@@ -1627,9 +1732,17 @@ impl VKarmaApp {
                 let source_mode = self.config.default_md_source_mode;
                 let view_mode = self.config.default_md_view;
 
+                let (editor, sub) = if source_mode {
+                    let (ed, s) =
+                        Self::create_md_source_editor(side, tab_id, raw.clone(), true, window, cx);
+                    (Some(ed), Some(s))
+                } else {
+                    (None, None)
+                };
+
                 let live_doc = cx.new(|cx| {
                     LiveMarkdownEditor::new(
-                        raw.clone(),
+                        raw,
                         path.to_path_buf(),
                         Arc::clone(&self.vault),
                         is_mdx,
@@ -1669,27 +1782,6 @@ impl VKarmaApp {
                             }
                         }
                     });
-
-                let editor = cx.new(|cx| {
-                    let mut state = EditorState::new(window, cx)
-                        .language("markdown")
-                        .soft_wrap(true)
-                        .line_number(source_mode)
-                        .default_value(raw);
-                    state.set_editor_paddings(gpui_kit::Edges {
-                        top: px(16.),
-                        right: px(28.),
-                        bottom: px(24.),
-                        left: px(28.),
-                    });
-                    state
-                });
-
-                let sub = cx.subscribe_in(&editor, window, move |this, _ed, event, window, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        this.on_markdown_changed(side, tab_id, window, cx);
-                    }
-                });
 
                 TabKind::Markdown {
                     editor,
@@ -2149,7 +2241,7 @@ impl VKarmaApp {
                 editor,
                 source_mode,
                 ..
-            } if *source_mode => Some(editor.clone()),
+            } if *source_mode => editor.clone(),
             _ => None,
         });
         if let Some(ed) = ed_opt {
@@ -2548,8 +2640,10 @@ impl VKarmaApp {
                     source_mode,
                     ..
                 } => {
-                    if *source_mode {
-                        let content = editor.read(cx).value();
+                    if *source_mode
+                        && let Some(ed) = editor.as_ref()
+                    {
+                        let content = ed.read(cx).value();
                         atomic_write_string(&path, content.as_ref())
                     } else {
                         let content = live_doc.read(cx).text();
@@ -2660,6 +2754,7 @@ impl VKarmaApp {
             pane.active_tab = pane.tabs.len() - 1;
         }
         self.persist_workspaces();
+        trim_allocator();
         cx.notify();
     }
 
@@ -2721,6 +2816,7 @@ impl VKarmaApp {
             let Some(tab) = self.pane_mut(side).and_then(WorkspacePane::active_mut) else {
                 return;
             };
+            let tab_id = tab.id;
             let TabKind::Markdown {
                 editor,
                 live_doc,
@@ -2731,9 +2827,9 @@ impl VKarmaApp {
                 return;
             };
             *source_mode = !*source_mode;
-            (*source_mode, editor.clone(), live_doc.clone())
+            (*source_mode, tab_id, editor.clone(), live_doc.clone())
         };
-        let (sm, editor, live_doc) = info;
+        let (sm, tab_id, existing_ed, live_doc) = info;
 
         if sm {
             let (raw, line, col) = {
@@ -2741,32 +2837,53 @@ impl VKarmaApp {
                 let (l, c) = ld.cursor_line_col();
                 (ld.text().to_string(), l, c)
             };
-            editor.update(cx, |s, cx| {
-                s.set_value(raw, window, cx);
-                s.set_line_number(true, window, cx);
-                s.set_editor_paddings(gpui_kit::Edges {
-                    top: px(10.),
-                    right: px(16.),
-                    bottom: px(24.),
-                    left: px(12.),
+            let pos = gpui_kit::component::input::Position::new(line as u32, col as u32);
+            if let Some(editor) = existing_ed {
+                editor.update(cx, |s, cx| {
+                    s.set_value(raw, window, cx);
+                    s.set_line_number(true, window, cx);
+                    s.set_editor_paddings(gpui_kit::Edges {
+                        top: px(10.),
+                        right: px(16.),
+                        bottom: px(24.),
+                        left: px(12.),
+                    });
+                    s.set_cursor_position(pos, window, cx);
+                    s.focus(window, cx);
                 });
-                s.set_cursor_position(
-                    gpui_kit::component::input::Position::new(line as u32, col as u32),
-                    window,
-                    cx,
-                );
-                s.focus(window, cx);
-            });
+            } else {
+                let (editor, sub) =
+                    Self::create_md_source_editor(side, tab_id, raw, true, window, cx);
+                editor.update(cx, |s, cx| {
+                    s.set_cursor_position(pos, window, cx);
+                    s.focus(window, cx);
+                });
+                if let Some(tab) = self.find_tab_mut(side, tab_id)
+                    && let TabKind::Markdown { editor: slot, _sub, .. } = &mut tab.kind
+                {
+                    *slot = Some(editor);
+                    *_sub = Some(sub);
+                }
+            }
         } else {
-            let (raw, cursor_line, cursor_col) = {
-                let ed = editor.read(cx);
-                let pos = ed.cursor_position();
-                (ed.value().to_string(), pos.line as usize, pos.character as usize)
-            };
-            live_doc.update(cx, |ld, cx| {
-                ld.set_text(raw, cursor_line, cursor_col, cx);
-            });
+            if let Some(editor) = existing_ed {
+                let (raw, cursor_line, cursor_col) = {
+                    let ed = editor.read(cx);
+                    let pos = ed.cursor_position();
+                    (ed.value().to_string(), pos.line as usize, pos.character as usize)
+                };
+                live_doc.update(cx, |ld, cx| {
+                    ld.set_text(raw, cursor_line, cursor_col, cx);
+                });
+            }
+            if let Some(tab) = self.find_tab_mut(side, tab_id)
+                && let TabKind::Markdown { editor: slot, _sub, .. } = &mut tab.kind
+            {
+                *slot = None;
+                *_sub = None;
+            }
             live_doc.focus_handle(cx).focus(window, cx);
+            trim_allocator();
         }
         cx.notify();
     }
@@ -2846,8 +2963,10 @@ impl VKarmaApp {
             ..
         } = &tab.kind
         {
-            let raw: SharedString = if *source_mode {
-                editor.read(cx).value()
+            let raw: SharedString = if *source_mode
+                && let Some(ed) = editor.as_ref()
+            {
+                ed.read(cx).value()
             } else {
                 live_doc.read(cx).text().to_string().into()
             };
@@ -2860,8 +2979,10 @@ impl VKarmaApp {
                 let ed = editor.clone();
                 let ld = live_doc.clone();
                 let is_source = *source_mode;
-                if is_source {
-                    ed.update(cx, |s, cx| s.set_value(updated.clone(), window, cx));
+                if is_source
+                    && let Some(ed_ent) = ed
+                {
+                    ed_ent.update(cx, |s, cx| s.set_value(updated.clone(), window, cx));
                 } else {
                     ld.update(cx, |s, cx| {
                         let (l, c) = s.cursor_line_col();
@@ -2930,7 +3051,10 @@ impl VKarmaApp {
             return true;
         };
         if let Some(tab) = self.find_tab(side, tab_id)
-            && let TabKind::Markdown { editor, .. } = &tab.kind
+            && let TabKind::Markdown {
+                editor: Some(editor),
+                ..
+            } = &tab.kind
         {
             let embed = format!("![[{filename}]]");
             editor.clone().update(cx, |state, cx| {
@@ -3107,9 +3231,13 @@ impl VKarmaApp {
                     live_doc.clone().update(cx, |ed, cx| {
                         ed.jump_to_line(line_0based, window, cx);
                     });
-                } else {
-                    editor.clone().update(cx, |state, cx| {
+                } else if let Some(ed) = editor {
+                    ed.clone().update(cx, |state, cx| {
                         state.set_cursor_position(pos, window, cx);
+                    });
+                } else {
+                    live_doc.clone().update(cx, |ed, cx| {
+                        ed.jump_to_line(line_0based, window, cx);
                     });
                 }
             }
@@ -3808,6 +3936,7 @@ impl Render for VKarmaApp {
         };
 
         v_flex()
+            .image_cache(self.image_cache.clone())
             .relative()
             .size_full()
             .bg(app_bg)

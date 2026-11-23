@@ -54,8 +54,10 @@ pub fn render_markdown_tab(
     let zen_mode = app.zen_mode;
 
     let (effective_preview, chapter_nav) = if chapter_mode && view_mode != MdViewMode::Edit {
-        let raw_text: String = if source_mode {
-            editor.read(cx).value().to_string()
+        let raw_text: String = if source_mode
+            && let Some(ed) = editor.as_ref()
+        {
+            ed.read(cx).value().to_string()
         } else {
             live_doc.read(cx).text().to_string()
         };
@@ -74,13 +76,13 @@ pub fn render_markdown_tab(
         (preprocessed_str, None)
     };
     let has_chapters = chapter_nav.is_some() || {
-        let raw_text: &str = if !source_mode {
-            live_doc.read(cx).text()
+        if source_mode
+            && let Some(ed) = editor.as_ref()
+        {
+            split_markdown_chapters(ed.read(cx).value().as_ref()).len() >= 2
         } else {
-            ""
-        };
-        !source_mode && split_markdown_chapters(raw_text).len() >= 2
-            || source_mode && split_markdown_chapters(editor.read(cx).value().as_ref()).len() >= 2
+            split_markdown_chapters(live_doc.read(cx).text()).len() >= 2
+        }
     };
 
     let header = h_flex()
@@ -244,8 +246,10 @@ pub fn render_markdown_tab(
     let live_doc = live_doc.clone();
     let body = match effective_mode {
         MdViewMode::Edit => {
-            if source_mode {
-                render_md_editor_pane(app_entity, side, tab_id, editor, source_mode, zen_mode, cx)
+            if source_mode
+                && let Some(ed) = editor.as_ref()
+            {
+                render_md_editor_pane(app_entity, side, tab_id, ed, source_mode, zen_mode, cx)
                     .into_any_element()
             } else {
                 let vault = Arc::clone(&app.vault);
@@ -266,12 +270,14 @@ pub fn render_markdown_tab(
         )
         .into_any_element(),
         MdViewMode::Split => {
-            let edit_el = if source_mode {
+            let edit_el = if source_mode
+                && let Some(ed) = editor.as_ref()
+            {
                 render_md_editor_pane(
                     app_entity.clone(),
                     side,
                     tab_id,
-                    editor,
+                    ed,
                     source_mode,
                     zen_mode,
                     cx,

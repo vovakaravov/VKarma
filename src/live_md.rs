@@ -1829,6 +1829,9 @@ pub enum EditKind {
     Ime,
 }
 
+const MAX_UNDO_SNAPSHOTS: usize = 250;
+const MAX_UNDO_BYTES: usize = 6 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 struct UndoSnapshot {
     text: String,
@@ -1846,6 +1849,7 @@ pub struct LiveDocBuffer {
     pub head: usize,
     pub marked_range: Option<Range<usize>>,
     undo_stack: Vec<UndoSnapshot>,
+    undo_bytes: usize,
     redo_stack: Vec<UndoSnapshot>,
     last_edit: Option<(EditKind, Instant)>,
 }
@@ -1862,6 +1866,7 @@ impl LiveDocBuffer {
             head: 0,
             marked_range: None,
             undo_stack: Vec::new(),
+            undo_bytes: 0,
             redo_stack: Vec::new(),
             last_edit: None,
         }
@@ -1942,6 +1947,18 @@ impl LiveDocBuffer {
         dl.byte_start + rel
     }
 
+    fn push_undo_snapshot(&mut self, snap: UndoSnapshot) {
+        let snap_bytes = snap.text.len();
+        while self.undo_stack.len() >= MAX_UNDO_SNAPSHOTS
+            || (self.undo_stack.len() >= 2 && self.undo_bytes + snap_bytes > MAX_UNDO_BYTES)
+        {
+            let evicted = self.undo_stack.remove(0);
+            self.undo_bytes = self.undo_bytes.saturating_sub(evicted.text.len());
+        }
+        self.undo_bytes += snap_bytes;
+        self.undo_stack.push(snap);
+    }
+
     fn record_undo(&mut self, kind: EditKind) {
         let now = Instant::now();
         let coalesce = match (kind, self.last_edit) {
@@ -1953,10 +1970,7 @@ impl LiveDocBuffer {
             _ => false,
         };
         if !coalesce || self.undo_stack.is_empty() {
-            if self.undo_stack.len() >= 250 {
-                self.undo_stack.remove(0);
-            }
-            self.undo_stack.push(UndoSnapshot {
+            self.push_undo_snapshot(UndoSnapshot {
                 text: self.text.clone(),
                 anchor: self.anchor,
                 head: self.head,
@@ -1976,6 +1990,7 @@ impl LiveDocBuffer {
         self.version = self.version.wrapping_add(1);
         self.marked_range = None;
         self.undo_stack.clear();
+        self.undo_bytes = 0;
         self.redo_stack.clear();
         self.last_edit = None;
         let b = self.byte_from_line_col(line_0based, col_chars);
@@ -2950,6 +2965,7 @@ impl LiveDocBuffer {
         let Some(prev) = self.undo_stack.pop() else {
             return false;
         };
+        self.undo_bytes = self.undo_bytes.saturating_sub(prev.text.len());
         self.redo_stack.push(UndoSnapshot {
             text: self.text.clone(),
             anchor: self.anchor,
@@ -2969,7 +2985,7 @@ impl LiveDocBuffer {
         let Some(next) = self.redo_stack.pop() else {
             return false;
         };
-        self.undo_stack.push(UndoSnapshot {
+        self.push_undo_snapshot(UndoSnapshot {
             text: self.text.clone(),
             anchor: self.anchor,
             head: self.head,
@@ -3520,5 +3536,21 @@ mod tests {
         buf.select_all();
         buf.backspace(false);
         assert_eq!(buf.text, "");
+    }
+
+    #[test]
+    fn undo_stack_enforces_byte_budget_on_large_docs() {
+        let big = "a".repeat(1024 * 1024); // 1 MiB
+        let mut buf = LiveDocBuffer::new(big, false);
+        for i in 0..10u8 {
+            let ch = (b'0' + i) as char;
+            let len = buf.text.len();
+            buf.replace_range(len..len, &ch.to_string(), EditKind::Atomic);
+        }
+        assert!(buf.undo_bytes <= MAX_UNDO_BYTES);
+        assert!(buf.undo_stack.len() >= 2);
+        assert!(buf.undo_stack.len() <= 6);
+        assert!(buf.undo());
+        assert!(buf.redo());
     }
 }
