@@ -1,8 +1,10 @@
 use super::{NewItemTemplate, PaneSide, QuickSwitcherState, TabKind, VKarmaApp, file_kind_color};
 use crate::config::WorkspacePreset;
-use crate::spreadsheet::SpreadsheetDoc;
 use crate::theme::{accent_alpha, hex_alpha, hex_color, kd};
-use crate::vault::{create_new_file, create_new_folder, delete_entry};
+use crate::vault::{
+    create_adaptive_file, create_new_folder, delete_entry, detect_file_kind,
+    normalize_new_file_name,
+};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
@@ -15,7 +17,7 @@ use gpui_kit::{
     Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 pub fn render_quick_switcher_overlay(
@@ -238,73 +240,18 @@ pub fn open_new_item_dialog(
             if raw_name.is_empty() {
                 return;
             }
-            let final_name = match template.extension() {
-                Some(ext) if !raw_name.contains('.') => format!("{raw_name}.{ext}"),
-                _ => raw_name,
+            let final_name = match template {
+                NewItemTemplate::File => normalize_new_file_name(&raw_name),
+                NewItemTemplate::Folder => raw_name,
             };
+            if final_name.is_empty() {
+                return;
+            }
             let dest = dir_ok.join(&final_name);
 
             let res = match template {
                 NewItemTemplate::Folder => create_new_folder(&dest),
-                NewItemTemplate::Markdown => {
-                    let title = dest
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("Note");
-                    create_new_file(&dest, &format!("# {title}\n\n"))
-                }
-                NewItemTemplate::Canvas => {
-                    let mut doc = crate::formats::canvas::CanvasDoc::default();
-                    let title = dest
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("Canvas");
-                    doc.add_text_node(0.0, 0.0, format!("# {title}\n\nDouble-click to edit card."));
-                    create_new_file(&dest, &doc.to_json_pretty())
-                }
-                NewItemTemplate::Kanban => {
-                    let title = dest
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("Board");
-                    let starter = format!(
-                        "# {title}\n\n## Todo\n- [ ] First task\n\n## Doing\n\n## Done\n"
-                    );
-                    create_new_file(&dest, &starter)
-                }
-                NewItemTemplate::Mermaid => {
-                    let starter = "flowchart TD\n    A[Start] --> B{Ready?}\n    B -->|Yes| C([Launch])\n    B -->|No| D[(Revise)]\n";
-                    create_new_file(&dest, starter)
-                }
-                NewItemTemplate::Svg => {
-                    let starter = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"240\" height=\"160\" viewBox=\"0 0 240 160\">\n  <rect x=\"20\" y=\"20\" width=\"200\" height=\"120\" rx=\"14\" fill=\"#222020\" stroke=\"#8ba4b0\" stroke-width=\"3\"/>\n  <text x=\"120\" y=\"86\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"18\" fill=\"#c5c9c5\">VKarma SVG</text>\n</svg>\n";
-                    create_new_file(&dest, starter)
-                }
-                NewItemTemplate::Typst => {
-                    let title = dest
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("Document");
-                    create_new_file(
-                        &dest,
-                        &format!(
-                            "#set page(paper: \"a4\", margin: 2cm)\n#set text(size: 11pt)\n\n= {title}\n\nWrite Typst content here.\n"
-                        ),
-                    )
-                }
-                NewItemTemplate::Spreadsheet => {
-                    SpreadsheetDoc::new_empty(&dest).and_then(|mut doc| doc.save(&dest))
-                }
-                NewItemTemplate::Fountain => {
-                    let title = dest
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("Untitled Screenplay");
-                    let starter = format!(
-                        "Title: {title}\nCredit: Written by\nAuthor: \nDraft date: \n\n===\n\nFADE IN:\n\nINT. LOCATION - DAY\n\nOpening beat.\n\nCHARACTER\nFirst line of dialogue.\n\nFADE OUT.\n"
-                    );
-                    create_new_file(&dest, &starter)
-                }
+                NewItemTemplate::File => create_adaptive_file(&dest),
             };
 
             match res {
@@ -327,15 +274,65 @@ pub fn open_new_item_dialog(
             }
         })
     };
-    let enter_sub = subscribe_submit_on_enter(&name_input, submit.clone(), window, cx);
+    let submit_sub = submit.clone();
+    let input_sub = window.subscribe(&name_input, cx, move |_, event: &InputEvent, window, _cx| {
+        match event {
+            InputEvent::PressEnter { .. } => submit_sub(window, _cx),
+            InputEvent::Change => window.refresh(),
+            _ => {}
+        }
+    });
 
     window.open_dialog(cx, move |dialog, window, cx| {
-        let _ = &enter_sub;
+        let _ = &input_sub;
         if initial_focus.replace(false) {
             name_input.focus_handle(cx).focus(window, cx);
         }
 
         let submit_btn = submit.clone();
+        let live_hint = if template == NewItemTemplate::File {
+            let raw_val = name_input.read(cx).value();
+            let raw_trimmed = raw_val.trim();
+            if raw_trimmed.is_empty() {
+                Some(
+                    div()
+                        .text_xs()
+                        .text_color(hex_color(kd::FG_MUTED))
+                        .child("Include any extension (.cs, .cpp, .fountain, .typ, .xlsx, .canvas…) — defaults to .md")
+                        .into_any_element(),
+                )
+            } else {
+                let preview_name = normalize_new_file_name(raw_trimmed);
+                let kind = detect_file_kind(Path::new(&preview_name));
+                let badge_color = file_kind_color(kind);
+                Some(
+                    h_flex()
+                        .gap_1p5()
+                        .items_center()
+                        .child(
+                            div()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded(px(4.))
+                                .bg(hex_color(kd::BG_PANEL))
+                                .text_size(px(10.))
+                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                .text_color(badge_color)
+                                .child(kind.short_badge()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(hex_color(kd::FG_SUBTLE))
+                                .truncate()
+                                .child(format!("Will create: {preview_name}")),
+                        )
+                        .into_any_element(),
+                )
+            }
+        } else {
+            None
+        };
 
         dialog
             .title(template.title())
@@ -349,7 +346,8 @@ pub fn open_new_item_dialog(
                             .text_color(hex_color(kd::FG_MUTED))
                             .child(format!("Create inside: {}", parent_dir.display())),
                     )
-                    .child(Input::new(&name_input)),
+                    .child(Input::new(&name_input))
+                    .children(live_hint),
             )
             .footer(
                 DialogFooter::new()

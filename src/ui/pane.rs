@@ -298,11 +298,11 @@ fn render_empty_pane(
                             h_flex()
                                 .gap_2()
                                 .child(
-                                    Button::new(SharedString::from(format!("empty-new-md-{side:?}")))
+                                    Button::new(SharedString::from(format!("empty-new-file-{side:?}")))
                                         .small()
                                         .flex_1()
-                                        .icon(IconName::FileText)
-                                        .label("New Note")
+                                        .icon(IconName::FilePlus)
+                                        .label("New File…")
                                         .on_click({
                                             let dir = ws_root.clone();
                                             let ent = entity.clone();
@@ -311,7 +311,7 @@ fn render_empty_pane(
                                                 modals::open_new_item_dialog(
                                                     ent.clone(),
                                                     dir.clone(),
-                                                    NewItemTemplate::Markdown,
+                                                    NewItemTemplate::File,
                                                     window,
                                                     cx,
                                                 );
@@ -319,11 +319,11 @@ fn render_empty_pane(
                                         }),
                                 )
                                 .child(
-                                    Button::new(SharedString::from(format!("empty-new-typ-{side:?}")))
+                                    Button::new(SharedString::from(format!("empty-new-folder-{side:?}")))
                                         .small()
                                         .flex_1()
-                                        .icon(IconName::BookOpen)
-                                        .label("New Typst")
+                                        .icon(IconName::FolderPlus)
+                                        .label("New Folder…")
                                         .on_click({
                                             let dir = ws_root.clone();
                                             let ent = entity.clone();
@@ -332,49 +332,7 @@ fn render_empty_pane(
                                                 modals::open_new_item_dialog(
                                                     ent.clone(),
                                                     dir.clone(),
-                                                    NewItemTemplate::Typst,
-                                                    window,
-                                                    cx,
-                                                );
-                                            })
-                                        }),
-                                )
-                                .child(
-                                    Button::new(SharedString::from(format!("empty-new-xls-{side:?}")))
-                                        .small()
-                                        .flex_1()
-                                        .icon(IconName::FileSpreadsheet)
-                                        .label("New Sheet")
-                                        .on_click({
-                                            let dir = ws_root.clone();
-                                            let ent = entity.clone();
-                                            cx.listener(move |this, _, window, cx| {
-                                                this.active_pane = side;
-                                                modals::open_new_item_dialog(
-                                                    ent.clone(),
-                                                    dir.clone(),
-                                                    NewItemTemplate::Spreadsheet,
-                                                    window,
-                                                    cx,
-                                                );
-                                            })
-                                        }),
-                                )
-                                .child(
-                                    Button::new(SharedString::from(format!("empty-new-ftn-{side:?}")))
-                                        .small()
-                                        .flex_1()
-                                        .icon(IconName::FileText)
-                                        .label("New Script")
-                                        .on_click({
-                                            let dir = ws_root.clone();
-                                            let ent = entity.clone();
-                                            cx.listener(move |this, _, window, cx| {
-                                                this.active_pane = side;
-                                                modals::open_new_item_dialog(
-                                                    ent.clone(),
-                                                    dir.clone(),
-                                                    NewItemTemplate::Fountain,
+                                                    NewItemTemplate::Folder,
                                                     window,
                                                     cx,
                                                 );

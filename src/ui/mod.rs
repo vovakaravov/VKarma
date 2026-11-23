@@ -279,12 +279,6 @@ pub enum PaneSide {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SidebarTab {
-    Files,
-    Search,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RightPanelTab {
     Outline,
     Backlinks,
@@ -552,57 +546,22 @@ pub struct InlineRenameState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NewItemTemplate {
-    Markdown,
-    Canvas,
-    Kanban,
-    Mermaid,
-    Svg,
-    Typst,
-    Spreadsheet,
-    Fountain,
+    File,
     Folder,
 }
 
 impl NewItemTemplate {
     pub fn title(&self) -> &'static str {
         match self {
-            Self::Markdown => "New Markdown Note",
-            Self::Canvas => "New JSON Canvas",
-            Self::Kanban => "New Kanban Board",
-            Self::Mermaid => "New Mermaid Diagram",
-            Self::Svg => "New SVG Graphic",
-            Self::Typst => "New Typst Document",
-            Self::Spreadsheet => "New Spreadsheet (.xlsx)",
-            Self::Fountain => "New Fountain Screenplay",
+            Self::File => "New File",
             Self::Folder => "New Folder",
         }
     }
 
     pub fn placeholder(&self) -> &'static str {
         match self {
-            Self::Markdown => "My Note.md",
-            Self::Canvas => "Storyboard.canvas",
-            Self::Kanban => "Tasks.kanban",
-            Self::Mermaid => "Flow.mmd",
-            Self::Svg => "Icon.svg",
-            Self::Typst => "Document.typ",
-            Self::Spreadsheet => "Sheet.xlsx",
-            Self::Fountain => "Screenplay.fountain",
+            Self::File => "Name.md, Script.fountain, Player.cs, Sheet.xlsx…",
             Self::Folder => "Folder Name",
-        }
-    }
-
-    pub fn extension(&self) -> Option<&'static str> {
-        match self {
-            Self::Markdown => Some("md"),
-            Self::Canvas => Some("canvas"),
-            Self::Kanban => Some("kanban"),
-            Self::Mermaid => Some("mmd"),
-            Self::Svg => Some("svg"),
-            Self::Typst => Some("typ"),
-            Self::Spreadsheet => Some("xlsx"),
-            Self::Fountain => Some("fountain"),
-            Self::Folder => None,
         }
     }
 }
@@ -670,7 +629,6 @@ pub struct ParkedWorkspaceState {
     pub left_pane: WorkspacePane,
     pub right_pane: Option<WorkspacePane>,
     pub active_pane: PaneSide,
-    pub sidebar_tab: SidebarTab,
     pub right_panel_tab: RightPanelTab,
     pub expanded_dirs: HashSet<PathBuf>,
     pub search_query: String,
@@ -732,7 +690,6 @@ pub struct VKarmaApp {
     pub right_pane: Option<WorkspacePane>,
     pub active_pane: PaneSide,
 
-    pub sidebar_tab: SidebarTab,
     pub sidebar_focus: FocusHandle,
     pub selected_tree_path: Option<PathBuf>,
     pub inline_rename: Option<InlineRenameState>,
@@ -825,7 +782,7 @@ impl VKarmaApp {
         let vault = Arc::new(VaultIndex::build(&initial_ws, config.show_hidden_files));
         let watcher = WorkspaceWatcher::start(&initial_ws).ok();
 
-        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search in vault…"));
+        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search…"));
         let _search_sub = cx.subscribe_in(&search_input, window, |this, state, event, _, cx| {
             if matches!(event, InputEvent::Change | InputEvent::PressEnter { .. }) {
                 let query = state.read(cx).value().to_string();
@@ -863,7 +820,6 @@ impl VKarmaApp {
             left_pane: WorkspacePane::empty(),
             right_pane: None,
             active_pane: PaneSide::Left,
-            sidebar_tab: SidebarTab::Files,
             sidebar_focus: cx.focus_handle(),
             selected_tree_path: None,
             inline_rename: None,
@@ -1081,7 +1037,6 @@ impl VKarmaApp {
                 left_pane: std::mem::replace(&mut self.left_pane, WorkspacePane::empty()),
                 right_pane: self.right_pane.take(),
                 active_pane: self.active_pane,
-                sidebar_tab: self.sidebar_tab,
                 right_panel_tab: self.right_panel_tab,
                 expanded_dirs: std::mem::take(&mut self.expanded_dirs),
                 search_query,
@@ -1119,7 +1074,6 @@ impl VKarmaApp {
             self.left_pane = parked.left_pane;
             self.right_pane = parked.right_pane;
             self.active_pane = parked.active_pane;
-            self.sidebar_tab = parked.sidebar_tab;
             self.right_panel_tab = parked.right_panel_tab;
             self.expanded_dirs = parked.expanded_dirs;
             self.search_hits = parked.search_hits;
@@ -1138,7 +1092,6 @@ impl VKarmaApp {
             self.vault = Arc::new(VaultIndex::build(&target_root, show_hidden));
             self.watcher = WorkspaceWatcher::start(&target_root).ok();
             self.active_pane = PaneSide::Left;
-            self.sidebar_tab = SidebarTab::Files;
             self.right_panel_tab = RightPanelTab::Outline;
             self.search_input
                 .update(cx, |s, cx| s.set_value(String::new(), window, cx));
@@ -1402,6 +1355,10 @@ impl VKarmaApp {
                         let vault_clone = Arc::clone(&vault);
                         view.update(cx, |v, _| v.update_vault(vault_clone));
                     }
+                }
+                let active_query = app.search_input.read(cx).value().to_string();
+                if active_query.trim().chars().count() >= 2 {
+                    app.run_vault_search(active_query, cx);
                 }
                 trim_allocator();
                 cx.notify();
@@ -2927,8 +2884,8 @@ impl VKarmaApp {
                 return;
             }
 
-            // Create missing wikilink note cleanly like Obsidian
-            let clean = target
+            // Create missing wikilink target cleanly with extension awareness
+            let mut clean = target
                 .split('|')
                 .next()
                 .unwrap_or(&target)
@@ -2936,23 +2893,20 @@ impl VKarmaApp {
                 .next()
                 .unwrap_or(&target)
                 .trim();
+            while let Some(rest) = clean.strip_prefix("./").or_else(|| clean.strip_prefix(".\\")) {
+                clean = rest;
+            }
             if !clean.is_empty() {
-                let rel_name = if clean.ends_with(".md") {
-                    clean.to_string()
-                } else {
-                    format!("{clean}.md")
-                };
-                let dest = current_file
-                    .parent()
-                    .unwrap_or(&self.workspace_root)
-                    .join(&rel_name);
-                let title = dest
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("New Note");
-                if crate::vault::create_new_file(&dest, &format!("# {title}\n\n")).is_ok() {
-                    self.refresh_vault_index(cx);
-                    self.open_file(dest, side, window, cx);
+                let rel_name = crate::vault::normalize_new_file_name(clean);
+                if !rel_name.is_empty() {
+                    let dest = current_file
+                        .parent()
+                        .unwrap_or(&self.workspace_root)
+                        .join(&rel_name);
+                    if crate::vault::create_adaptive_file(&dest).is_ok() {
+                        self.refresh_vault_index(cx);
+                        self.open_file(dest, side, window, cx);
+                    }
                 }
             }
             return;
@@ -2960,6 +2914,14 @@ impl VKarmaApp {
 
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
             let _ = Command::new("xdg-open").arg(url_str).spawn();
+        } else if !url_str.starts_with("mailto:") && !url_str.starts_with('#') {
+            let current_file = self
+                .find_tab(side, tab_id)
+                .map(|t| t.path.clone())
+                .unwrap_or_else(|| self.workspace_root.join("note.md"));
+            if let Some(resolved) = self.vault.resolve_wikilink(url_str, &current_file) {
+                self.open_file(resolved, side, window, cx);
+            }
         }
     }
 
@@ -3473,7 +3435,11 @@ impl VKarmaApp {
             return;
         }
         self.config.sidebar_visible = true;
-        self.sidebar_tab = SidebarTab::Files;
+        if !self.search_input.read(cx).value().is_empty() {
+            self.search_input
+                .update(cx, |s, cx| s.set_value("", window, cx));
+            self.search_hits.clear();
+        }
         self.selected_tree_path = Some(target.clone());
 
         let mut cur = target.parent();
@@ -3793,73 +3759,19 @@ impl Render for VKarmaApp {
                     .gap_1()
                     .items_center()
                     .child(
-                        Button::new("new-md-btn")
+                        Button::new("new-file-btn")
                             .ghost()
                             .small()
-                            .icon(IconName::FileText)
-                            .label("+ Note")
-                            .tooltip("New Markdown Note (Ctrl+N)")
+                            .icon(IconName::FilePlus)
+                            .label("+ New File")
+                            .tooltip("New File (Ctrl+N) — adapts to extension (.md, .cs, .cpp, .fountain, .typ, .xlsx…)")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let entity = cx.entity();
                                 let dir = this.workspace_root.clone();
                                 modals::open_new_item_dialog(
                                     entity,
                                     dir,
-                                    NewItemTemplate::Markdown,
-                                    window,
-                                    cx,
-                                );
-                            })),
-                    )
-                    .child(
-                        Button::new("new-typ-btn")
-                            .ghost()
-                            .small()
-                            .icon(IconName::BookOpen)
-                            .label("+ Typst")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let entity = cx.entity();
-                                let dir = this.workspace_root.clone();
-                                modals::open_new_item_dialog(
-                                    entity,
-                                    dir,
-                                    NewItemTemplate::Typst,
-                                    window,
-                                    cx,
-                                );
-                            })),
-                    )
-                    .child(
-                        Button::new("new-sheet-btn")
-                            .ghost()
-                            .small()
-                            .icon(IconName::FileSpreadsheet)
-                            .label("+ Sheet")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let entity = cx.entity();
-                                let dir = this.workspace_root.clone();
-                                modals::open_new_item_dialog(
-                                    entity,
-                                    dir,
-                                    NewItemTemplate::Spreadsheet,
-                                    window,
-                                    cx,
-                                );
-                            })),
-                    )
-                    .child(
-                        Button::new("new-script-btn")
-                            .ghost()
-                            .small()
-                            .icon(IconName::FileText)
-                            .label("+ Script")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let entity = cx.entity();
-                                let dir = this.workspace_root.clone();
-                                modals::open_new_item_dialog(
-                                    entity,
-                                    dir,
-                                    NewItemTemplate::Fountain,
+                                    NewItemTemplate::File,
                                     window,
                                     cx,
                                 );
@@ -3930,8 +3842,8 @@ impl Render for VKarmaApp {
         if self.config.sidebar_visible {
             workspace_split = workspace_split.child(
                 resizable_panel()
-                    .size(px(260.))
-                    .size_range(px(180.)..px(440.))
+                    .size(px(276.))
+                    .size_range(px(200.)..px(440.))
                     .child(sidebar::render_sidebar(self, cx)),
             );
         }
@@ -3986,7 +3898,6 @@ impl Render for VKarmaApp {
             .on_action(cx.listener(|this, _: &VaultSearch, window, cx| {
                 this.exit_zen_mode(window, cx);
                 this.config.sidebar_visible = true;
-                this.sidebar_tab = SidebarTab::Search;
                 this.persist_workspaces();
                 this.search_input.focus_handle(cx).focus(window, cx);
                 cx.notify();
@@ -4041,7 +3952,7 @@ impl Render for VKarmaApp {
             .on_action(cx.listener(|this, _: &NewNote, window, cx| {
                 let entity = cx.entity();
                 let dir = this.workspace_root.clone();
-                modals::open_new_item_dialog(entity, dir, NewItemTemplate::Markdown, window, cx);
+                modals::open_new_item_dialog(entity, dir, NewItemTemplate::File, window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenFileDialog, window, cx| {
                 this.prompt_open_files(window, cx);

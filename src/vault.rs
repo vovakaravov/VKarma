@@ -343,7 +343,7 @@ impl VaultIndex {
     }
 
     pub fn resolve_wikilink(&self, raw_target: &str, from_file: &Path) -> Option<PathBuf> {
-        let clean = raw_target
+        let mut clean = raw_target
             .split('|')
             .next()
             .unwrap_or(raw_target)
@@ -351,19 +351,32 @@ impl VaultIndex {
             .next()
             .unwrap_or("")
             .trim();
+        while let Some(rest) = clean.strip_prefix("./").or_else(|| clean.strip_prefix(".\\")) {
+            clean = rest;
+        }
         if clean.is_empty() {
             return None;
         }
 
-        let candidates = if clean.ends_with(".md") || clean.ends_with(".markdown") {
+        let final_seg = clean.rsplit(['/', '\\']).next().unwrap_or(clean);
+        let has_explicit_ext = final_seg
+            .rfind('.')
+            .is_some_and(|dot| dot > 0 && dot + 1 < final_seg.len());
+        let lower_clean = clean.to_ascii_lowercase();
+        let ends_with_md = lower_clean.ends_with(".md") || lower_clean.ends_with(".markdown");
+
+        // Pass 0: direct sibling or vault-root lookup; check explicit extensions verbatim first.
+        let candidates = if ends_with_md {
             vec![clean.to_string()]
+        } else if has_explicit_ext {
+            vec![clean.to_string(), format!("{clean}.md")]
         } else {
             vec![format!("{clean}.md"), clean.to_string()]
         };
 
         if let Some(parent) = from_file.parent() {
             for cand in &candidates {
-                let p = parent.join(cand);
+                let p = normalize_lexical_path(&parent.join(cand));
                 if p.is_file() {
                     return Some(p);
                 }
@@ -371,47 +384,106 @@ impl VaultIndex {
         }
 
         for cand in &candidates {
-            let p = self.root.join(cand);
+            let p = normalize_lexical_path(&self.root.join(cand));
             if p.is_file() {
                 return Some(p);
             }
         }
 
-        // Case-insensitive match by relative path suffix or stem
-        let lower = clean.to_ascii_lowercase();
-        let lower_no_ext = lower.strip_suffix(".md").unwrap_or(&lower).to_string();
+        // Pass 1: case-insensitive vault-wide search across all files (markdown + non-markdown).
+        let norm = clean
+            .trim_start_matches(['/', '\\'])
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        if norm.is_empty() {
+            return None;
+        }
+        let norm_md = (!ends_with_md).then(|| format!("{norm}.md"));
+        let from_dir = from_file.parent().unwrap_or(&self.root);
 
-        if lower.contains('/') || lower.contains('\\') {
-            let norm = lower.replace('\\', "/");
-            let norm_md = if norm.ends_with(".md") {
-                norm.clone()
-            } else {
-                format!("{norm}.md")
-            };
-            if let Some(f) = self.all_files.iter().find(|f| {
-                let r = f.rel_path.to_ascii_lowercase().replace('\\', "/");
-                r == norm_md || r == norm || r.ends_with(&format!("/{norm_md}"))
-            }) {
-                return Some(f.path.clone());
+        let pick_best = |mut matches: Vec<&VaultFile>, prefer_md: bool| -> Option<PathBuf> {
+            if matches.is_empty() {
+                return None;
+            }
+            matches.sort_by_key(|f| {
+                let md_rank = if prefer_md && !matches!(f.kind, FileKind::Markdown | FileKind::Mdx) {
+                    1u8
+                } else {
+                    0u8
+                };
+                let common = common_prefix_len(from_dir, &f.path);
+                (
+                    md_rank,
+                    usize::MAX - common,
+                    f.path.as_os_str().len(),
+                    f.rel_path.to_ascii_lowercase(),
+                )
+            });
+            Some(matches[0].path.clone())
+        };
+
+        // 1a. Exact relative path or "/filename.ext" suffix match (all extensions, all folders).
+        let suffix = format!("/{norm}");
+        let exact_matches: Vec<&VaultFile> = self
+            .all_files
+            .iter()
+            .filter(|f| {
+                let rel = f.rel_path.to_ascii_lowercase().replace('\\', "/");
+                rel == norm || rel.ends_with(&suffix)
+            })
+            .collect();
+        if let Some(best) = pick_best(exact_matches, false) {
+            return Some(best);
+        }
+
+        // 1b. Exact "<target>.md" relative path or "/<target>.md" suffix match.
+        if let Some(ref nmd) = norm_md {
+            let suffix_md = format!("/{nmd}");
+            let md_matches: Vec<&VaultFile> = self
+                .all_files
+                .iter()
+                .filter(|f| {
+                    let rel = f.rel_path.to_ascii_lowercase().replace('\\', "/");
+                    rel == *nmd || rel.ends_with(&suffix_md)
+                })
+                .collect();
+            if let Some(best) = pick_best(md_matches, false) {
+                return Some(best);
             }
         }
 
-        if let Some(paths) = self.notes_by_stem.get(&lower_no_ext)
+        // 1c. Extensionless path/stem suffix match across any file kind, preferring Markdown when
+        // no explicit extension was requested.
+        let stem_matches: Vec<&VaultFile> = self
+            .all_files
+            .iter()
+            .filter(|f| {
+                let rel = f.rel_path.to_ascii_lowercase().replace('\\', "/");
+                let rel_no_ext = strip_final_ext(&rel);
+                rel_no_ext == norm || rel_no_ext.ends_with(&suffix)
+            })
+            .collect();
+        if let Some(best) = pick_best(stem_matches, !has_explicit_ext) {
+            return Some(best);
+        }
+
+        // Backup stem lookup for markdown notes.
+        let lower_no_ext = norm.strip_suffix(".md").unwrap_or(&norm).to_string();
+        if !norm.contains('/')
+            && !has_explicit_ext
+            && let Some(paths) = self.notes_by_stem.get(&lower_no_ext)
             && !paths.is_empty()
         {
             if paths.len() == 1 {
                 return Some(paths[0].clone());
             }
-            // Prefer closest sibling to `from_file`
-            let from_dir = from_file.parent().unwrap_or(&self.root);
-            let best = paths
+            return paths
                 .iter()
                 .min_by_key(|p| {
                     let common = common_prefix_len(from_dir, p);
                     (usize::MAX - common, p.as_os_str().len())
                 })
                 .cloned();
-            return best;
         }
 
         None
@@ -521,6 +593,37 @@ fn common_prefix_len(a: &Path, b: &Path) -> usize {
         .zip(b.components())
         .take_while(|(ca, cb)| ca == cb)
         .count()
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !out.has_root() {
+                    out.push(comp);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn strip_final_ext(rel_lower: &str) -> &str {
+    let seg_start = rel_lower.rfind('/').map_or(0, |i| i + 1);
+    let last_seg = &rel_lower[seg_start..];
+    if let Some(dot) = last_seg.rfind('.')
+        && dot > 0
+    {
+        &rel_lower[..seg_start + dot]
+    } else {
+        rel_lower
+    }
 }
 
 fn subsequence_score(haystack: &str, needle: &str) -> Option<i32> {
@@ -954,11 +1057,140 @@ pub fn atomic_write_string(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn normalize_new_file_name(raw_name: &str) -> String {
+    let trimmed = raw_name.trim().trim_start_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let last_seg = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    if last_seg.is_empty() || last_seg == "." || last_seg == ".." {
+        return trimmed.to_string();
+    }
+    if last_seg.starts_with('.') {
+        return trimmed.to_string();
+    }
+    let lower_seg = last_seg.to_ascii_lowercase();
+    if matches!(
+        lower_seg.as_str(),
+        "makefile"
+            | "gnumakefile"
+            | "justfile"
+            | "dockerfile"
+            | "license"
+            | "readme"
+            | "procfile"
+            | "gemfile"
+            | "rakefile"
+            | "vagrantfile"
+    ) {
+        return trimmed.to_string();
+    }
+    if last_seg.ends_with('.') {
+        let base = trimmed.trim_end_matches('.');
+        if base.is_empty() {
+            return trimmed.to_string();
+        }
+        return format!("{base}.md");
+    }
+    if last_seg.contains('.') {
+        return trimmed.to_string();
+    }
+    format!("{trimmed}.md")
+}
+
 pub fn create_new_file(path: &Path, initial_content: &str) -> Result<()> {
     if path.exists() {
         anyhow::bail!("File already exists: {}", path.display());
     }
     atomic_write_string(path, initial_content)
+}
+
+pub fn create_adaptive_file(dest: &Path) -> Result<()> {
+    if dest.exists() {
+        anyhow::bail!("File already exists: {}", dest.display());
+    }
+    let kind = detect_file_kind(dest);
+    let ext = dest
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let title = dest
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Untitled");
+
+    match kind {
+        FileKind::Markdown | FileKind::Mdx => create_new_file(dest, &format!("# {title}\n\n")),
+        FileKind::Canvas => {
+            let mut doc = crate::formats::canvas::CanvasDoc::default();
+            doc.add_text_node(0.0, 0.0, format!("# {title}\n\nDouble-click to edit card."));
+            create_new_file(dest, &doc.to_json_pretty())
+        }
+        FileKind::Kanban => {
+            let k_title = title.strip_suffix(".kanban").unwrap_or(title);
+            let starter = format!(
+                "# {k_title}\n\n## Todo\n- [ ] First task\n\n## Doing\n\n## Done\n"
+            );
+            create_new_file(dest, &starter)
+        }
+        FileKind::Mermaid => {
+            let starter = "flowchart TD\n    A[Start] --> B{Ready?}\n    B -->|Yes| C([Launch])\n    B -->|No| D[(Revise)]\n";
+            create_new_file(dest, starter)
+        }
+        FileKind::Svg => {
+            let starter = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"240\" height=\"160\" viewBox=\"0 0 240 160\">\n  <rect x=\"20\" y=\"20\" width=\"200\" height=\"120\" rx=\"14\" fill=\"#222020\" stroke=\"#8ba4b0\" stroke-width=\"3\"/>\n  <text x=\"120\" y=\"86\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"18\" fill=\"#c5c9c5\">VKarma SVG</text>\n</svg>\n";
+            create_new_file(dest, starter)
+        }
+        FileKind::Typst => create_new_file(
+            dest,
+            &format!(
+                "#set page(paper: \"a4\", margin: 2cm)\n#set text(size: 11pt)\n\n= {title}\n\nWrite Typst content here.\n"
+            ),
+        ),
+        FileKind::Spreadsheet => {
+            if ext == "xlsx" {
+                if let Some(parent) = dest.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("create parent dir {}", parent.display()))?;
+                }
+                crate::spreadsheet::SpreadsheetDoc::new_empty(dest)
+                    .and_then(|mut doc| doc.save(dest))
+            } else if ext == "tsv" {
+                create_new_file(dest, "Col1\tCol2\n")
+            } else {
+                create_new_file(dest, "Col1,Col2\n")
+            }
+        }
+        FileKind::Fountain => {
+            let f_title = if title == "Untitled" {
+                "Untitled Screenplay"
+            } else {
+                title
+            };
+            let starter = format!(
+                "Title: {f_title}\nCredit: Written by\nAuthor: \nDraft date: \n\n===\n\nFADE IN:\n\nINT. LOCATION - DAY\n\nOpening beat.\n\nCHARACTER\nFirst line of dialogue.\n\nFADE OUT.\n"
+            );
+            create_new_file(dest, &starter)
+        }
+        FileKind::Subtitle => {
+            if ext == "vtt" {
+                create_new_file(
+                    dest,
+                    "WEBVTT\n\n00:00:00.000 --> 00:00:03.000\nFirst subtitle.\n",
+                )
+            } else {
+                create_new_file(
+                    dest,
+                    "1\n00:00:00,000 --> 00:00:03,000\nFirst subtitle.\n",
+                )
+            }
+        }
+        FileKind::Code(_) | FileKind::PlainText | _ => create_new_file(dest, ""),
+    }
 }
 
 pub fn create_new_folder(path: &Path) -> Result<()> {
@@ -1243,5 +1475,157 @@ mod tests {
 
         // Reject colliding destination name
         assert!(move_entry(&root.join("Collision.md"), &sub_b).is_err());
+    }
+
+    #[test]
+    fn wikilinks_resolve_non_markdown_and_cross_folder_consistently() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+
+        let welcome = root.join("docs/welcome.md");
+        let screenplay = root.join("scripts/Screenplay.fountain");
+        fs::write(
+            &welcome,
+            "Read [[Screenplay.fountain]] and [[Screenplay]] and [[scripts/Screenplay]].\n",
+        )
+        .unwrap();
+        fs::write(&screenplay, "Title: Demo\n\nFADE IN:\n").unwrap();
+
+        let shared_a = root.join("a/Shared.fountain");
+        let shared_b = root.join("b/Shared.fountain");
+        fs::write(&shared_a, "Title: A\n").unwrap();
+        fs::write(&shared_b, "Title: B\n").unwrap();
+        let from_b = root.join("b/welcome.md");
+        fs::write(&from_b, "See [[Shared.fountain]].\n").unwrap();
+
+        let topic_md = root.join("a/Topic.md");
+        let topic_png = root.join("b/Topic.png");
+        fs::write(&topic_md, "# Topic\n").unwrap();
+        fs::write(&topic_png, [0x89u8, 0x50, 0x4E, 0x47]).unwrap();
+
+        let vault = VaultIndex::build(root, false);
+
+        assert_eq!(
+            vault.resolve_wikilink("Screenplay.fountain", &welcome),
+            Some(screenplay.clone())
+        );
+        assert_eq!(
+            vault.resolve_wikilink("screenplay.fountain|Read Script", &welcome),
+            Some(screenplay.clone())
+        );
+        assert_eq!(
+            vault.resolve_wikilink("Screenplay", &welcome),
+            Some(screenplay.clone())
+        );
+        assert_eq!(
+            vault.resolve_wikilink("scripts/Screenplay", &welcome),
+            Some(screenplay.clone())
+        );
+        assert_eq!(
+            vault.resolve_wikilink("../scripts/Screenplay.fountain", &welcome),
+            Some(screenplay.clone())
+        );
+
+        // Closest sibling wins when duplicate filenames exist across folders
+        assert_eq!(
+            vault.resolve_wikilink("Shared.fountain", &from_b),
+            Some(shared_b)
+        );
+
+        // Unqualified stem prefers Markdown over assets unless extension is specified
+        assert_eq!(vault.resolve_wikilink("Topic", &welcome), Some(topic_md));
+        assert_eq!(
+            vault.resolve_wikilink("Topic.png", &welcome),
+            Some(topic_png)
+        );
+
+        // Backlink recorded on non-markdown target too
+        assert!(
+            vault
+                .backlinks
+                .get(&screenplay)
+                .is_some_and(|entries| entries.iter().any(|e| e.source_path == welcome))
+        );
+    }
+
+    #[test]
+    fn adaptive_file_creation_matches_extension() {
+        assert_eq!(normalize_new_file_name("My Note"), "My Note.md");
+        assert_eq!(normalize_new_file_name("My Note.md"), "My Note.md");
+        assert_eq!(normalize_new_file_name("Player.cs"), "Player.cs");
+        assert_eq!(normalize_new_file_name("main.cpp"), "main.cpp");
+        assert_eq!(normalize_new_file_name("notes/Todo"), "notes/Todo.md");
+        assert_eq!(normalize_new_file_name(".gitignore"), ".gitignore");
+        assert_eq!(normalize_new_file_name("Makefile"), "Makefile");
+        assert_eq!(normalize_new_file_name("Draft."), "Draft.md");
+        assert_eq!(
+            normalize_new_file_name("  /foo/Bar.typ  "),
+            "foo/Bar.typ"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let cs = root.join("Player.cs");
+        create_adaptive_file(&cs).unwrap();
+        assert_eq!(fs::read_to_string(&cs).unwrap(), "");
+        assert_eq!(detect_file_kind(&cs), FileKind::Code("csharp"));
+
+        let cpp = root.join("main.cpp");
+        create_adaptive_file(&cpp).unwrap();
+        assert_eq!(fs::read_to_string(&cpp).unwrap(), "");
+        assert_eq!(detect_file_kind(&cpp), FileKind::Code("cpp"));
+
+        let md = root.join("Note.md");
+        create_adaptive_file(&md).unwrap();
+        assert!(fs::read_to_string(&md).unwrap().starts_with("# Note"));
+
+        let ftn = root.join("Script.fountain");
+        create_adaptive_file(&ftn).unwrap();
+        assert!(fs::read_to_string(&ftn).unwrap().contains("Title: Script"));
+
+        let typ = root.join("Doc.typ");
+        create_adaptive_file(&typ).unwrap();
+        assert!(fs::read_to_string(&typ).unwrap().contains("= Doc"));
+
+        let xlsx = root.join("Sheet.xlsx");
+        create_adaptive_file(&xlsx).unwrap();
+        assert!(xlsx.is_file());
+        assert!(crate::spreadsheet::SpreadsheetDoc::open(&xlsx).is_ok());
+
+        let kbn = root.join("Board.kanban");
+        create_adaptive_file(&kbn).unwrap();
+        assert!(fs::read_to_string(&kbn).unwrap().contains("## Todo"));
+
+        let cnv = root.join("Ideas.canvas");
+        create_adaptive_file(&cnv).unwrap();
+        assert!(fs::read_to_string(&cnv).unwrap().contains("# Ideas"));
+
+        let mmd = root.join("Flow.mmd");
+        create_adaptive_file(&mmd).unwrap();
+        assert!(fs::read_to_string(&mmd).unwrap().contains("flowchart TD"));
+
+        let svg = root.join("Icon.svg");
+        create_adaptive_file(&svg).unwrap();
+        assert!(fs::read_to_string(&svg).unwrap().contains("<svg"));
+
+        let gitignore = root.join(".gitignore");
+        create_adaptive_file(&gitignore).unwrap();
+        assert_eq!(fs::read_to_string(&gitignore).unwrap(), "");
+
+        let makefile = root.join("Makefile");
+        create_adaptive_file(&makefile).unwrap();
+        assert_eq!(fs::read_to_string(&makefile).unwrap(), "");
+
+        let nested_cs = root.join("sub/Player.cs");
+        create_adaptive_file(&nested_cs).unwrap();
+        assert!(nested_cs.is_file());
+
+        // Creating an existing file fails cleanly
+        assert!(create_adaptive_file(&cs).is_err());
     }
 }

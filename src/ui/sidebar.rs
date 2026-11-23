@@ -1,6 +1,4 @@
-use super::{
-    NewItemTemplate, PaneSide, SidebarTab, VKarmaApp, file_kind_color, modals,
-};
+use super::{NewItemTemplate, PaneSide, VKarmaApp, file_kind_color, modals};
 use crate::theme::{accent_alpha, hex_color, kd};
 use crate::vault::{TreeNode, duplicate_file};
 use gpui_kit::assets::IconName;
@@ -10,8 +8,8 @@ use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AppContext as _, ClickEvent, Context, Focusable as _, FontWeight, InteractiveElement as _,
-    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, SharedString,
+    AppContext as _, ClickEvent, Context, FontWeight, InteractiveElement as _, IntoElement,
+    KeyDownEvent, MouseButton, ParentElement, Render, SharedString,
     StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use std::path::{Path, PathBuf};
@@ -77,52 +75,95 @@ pub fn render_sidebar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> impl Into
     let fg_muted = hex_color(kd::FG_MUTED);
     let ws_root = app.workspace_root.clone();
 
+    let raw_query = app.search_input.read(cx).value().to_string();
+    let has_raw_query = !raw_query.is_empty();
+    let trimmed_query = raw_query.trim().to_string();
+
+    let search_clear_btn = Button::new("sb-search-clear")
+        .text()
+        .xsmall()
+        .tab_stop(false)
+        .icon(IconName::Close)
+        .tooltip("Clear Search")
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.search_input
+                .update(cx, |s, cx| s.set_value("", window, cx));
+            this.search_hits.clear();
+            this.sidebar_focus.focus(window, cx);
+            cx.notify();
+        }));
+
+    let search_field = div()
+        .flex_1()
+        .min_w_0()
+        .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+            if ev.keystroke.key == "escape" && !this.search_input.read(cx).value().is_empty() {
+                cx.stop_propagation();
+                this.search_input
+                    .update(cx, |s, cx| s.set_value("", window, cx));
+                this.search_hits.clear();
+                this.sidebar_focus.focus(window, cx);
+                cx.notify();
+            }
+        }))
+        .child(
+            Input::new(&app.search_input)
+                .small()
+                .prefix(Icon::new(IconName::Search).xsmall().text_color(fg_muted))
+                .when(has_raw_query, |inp| inp.suffix(search_clear_btn)),
+        );
+
     let header = h_flex()
         .h(px(36.))
         .w_full()
-        .px_2()
+        .px_1p5()
         .gap_1()
         .items_center()
-        .justify_between()
         .border_b_1()
         .border_color(border)
-        .child(
-            h_flex()
-                .gap_1()
-                .child(
-                    Button::new("sb-tab-files")
-                        .with_variant(if app.sidebar_tab == SidebarTab::Files {
-                            ButtonVariant::Secondary
-                        } else {
-                            ButtonVariant::Ghost
-                        })
-                        .xsmall()
-                        .label("Files")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.sidebar_tab = SidebarTab::Files;
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    Button::new("sb-tab-search")
-                        .with_variant(if app.sidebar_tab == SidebarTab::Search {
-                            ButtonVariant::Secondary
-                        } else {
-                            ButtonVariant::Ghost
-                        })
-                        .xsmall()
-                        .icon(IconName::Search)
-                        .label("Search")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.sidebar_tab = SidebarTab::Search;
-                            this.search_input.focus_handle(cx).focus(window, cx);
-                            cx.notify();
-                        })),
-                ),
-        )
+        .child(search_field)
         .child(
             h_flex()
                 .gap_0p5()
+                .flex_shrink_0()
+                .child(
+                    Button::new("sb-new-file")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::FilePlus)
+                        .tooltip("New File (Ctrl+N)")
+                        .on_click({
+                            let dir = ws_root.clone();
+                            cx.listener(move |_, _, window, cx| {
+                                modals::open_new_item_dialog(
+                                    cx.entity(),
+                                    dir.clone(),
+                                    NewItemTemplate::File,
+                                    window,
+                                    cx,
+                                );
+                            })
+                        }),
+                )
+                .child(
+                    Button::new("sb-new-folder")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::FolderPlus)
+                        .tooltip("New Folder")
+                        .on_click({
+                            let dir = ws_root.clone();
+                            cx.listener(move |_, _, window, cx| {
+                                modals::open_new_item_dialog(
+                                    cx.entity(),
+                                    dir.clone(),
+                                    NewItemTemplate::Folder,
+                                    window,
+                                    cx,
+                                );
+                            })
+                        }),
+                )
                 .child(
                     Button::new("sb-hidden-toggle")
                         .with_variant(if app.config.show_hidden_files {
@@ -155,251 +196,193 @@ pub fn render_sidebar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> impl Into
                 ),
         );
 
-    let body = match app.sidebar_tab {
-        SidebarTab::Files => {
-            let quick_create = h_flex()
+    let body = if trimmed_query.is_empty() {
+        let active_file = app.active_tab_ref().map(|t| t.path.clone());
+        let mut rows = Vec::new();
+        collect_tree_rows(app, &app.vault.tree, 0, active_file.as_ref(), &mut rows, cx);
+        let root_check = ws_root.clone();
+        let root_drop = ws_root;
+
+        div()
+            .id("vault-file-tree-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scrollbar()
+            .p_1()
+            .rounded(px(4.))
+            .drag_over::<DraggedTreeEntry>(move |style, drag, _, _| {
+                if can_drop_onto_dir(&drag.path, &root_check) {
+                    style
+                        .bg(accent_alpha(0x14))
+                        .border_1()
+                        .border_color(hex_color(kd::ACCENT))
+                } else {
+                    style
+                }
+            })
+            .on_drop(cx.listener(move |this, drag: &DraggedTreeEntry, window, cx| {
+                this.move_fs_entry(drag.path.clone(), root_drop.clone(), window, cx);
+            }))
+            .child(v_flex().gap_0p5().children(rows))
+            .into_any_element()
+    } else if trimmed_query.chars().count() == 1 {
+        let instant_hits = app.vault.fuzzy_search_files(&trimmed_query, 40);
+        let empty_instant = instant_hits.is_empty();
+        let hit_rows = instant_hits.into_iter().enumerate().map(|(ix, file)| {
+            let path = file.path.clone();
+            let rel = file.rel_path.clone();
+            let badge = file.kind.short_badge();
+            let badge_color = file_kind_color(file.kind);
+
+            div()
+                .id(("search-instant-hit", ix))
+                .w_full()
                 .px_2()
                 .py_1p5()
-                .gap_1()
-                .border_b_1()
-                .border_color(border)
+                .rounded(px(5.))
+                .cursor_pointer()
+                .hover(|s| s.bg(hex_color(kd::BG_PANEL)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let pane = this.active_pane;
+                    this.open_file(path.clone(), pane, window, cx);
+                }))
                 .child(
-                    Button::new("sb-new-note")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::FilePlus)
-                        .tooltip("New Markdown Note")
-                        .on_click({
-                            let dir = ws_root.clone();
-                            cx.listener(move |_, _, window, cx| {
-                                modals::open_new_item_dialog(
-                                    cx.entity(),
-                                    dir.clone(),
-                                    NewItemTemplate::Markdown,
-                                    window,
-                                    cx,
-                                );
-                            })
-                        }),
-                )
-                .child(
-                    Button::new("sb-new-typ")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::BookOpen)
-                        .tooltip("New Typst Document")
-                        .on_click({
-                            let dir = ws_root.clone();
-                            cx.listener(move |_, _, window, cx| {
-                                modals::open_new_item_dialog(
-                                    cx.entity(),
-                                    dir.clone(),
-                                    NewItemTemplate::Typst,
-                                    window,
-                                    cx,
-                                );
-                            })
-                        }),
-                )
-                .child(
-                    Button::new("sb-new-xlsx")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::FileSpreadsheet)
-                        .tooltip("New Spreadsheet (.xlsx)")
-                        .on_click({
-                            let dir = ws_root.clone();
-                            cx.listener(move |_, _, window, cx| {
-                                modals::open_new_item_dialog(
-                                    cx.entity(),
-                                    dir.clone(),
-                                    NewItemTemplate::Spreadsheet,
-                                    window,
-                                    cx,
-                                );
-                            })
-                        }),
-                )
-                .child(
-                    Button::new("sb-new-fountain")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::FileText)
-                        .tooltip("New Screenplay (.fountain)")
-                        .on_click({
-                            let dir = ws_root.clone();
-                            cx.listener(move |_, _, window, cx| {
-                                modals::open_new_item_dialog(
-                                    cx.entity(),
-                                    dir.clone(),
-                                    NewItemTemplate::Fountain,
-                                    window,
-                                    cx,
-                                );
-                            })
-                        }),
-                )
-                .child(
-                    Button::new("sb-new-folder")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::FolderPlus)
-                        .tooltip("New Folder")
-                        .on_click({
-                            let dir = ws_root.clone();
-                            cx.listener(move |_, _, window, cx| {
-                                modals::open_new_item_dialog(
-                                    cx.entity(),
-                                    dir.clone(),
-                                    NewItemTemplate::Folder,
-                                    window,
-                                    cx,
-                                );
-                            })
-                        }),
-                );
-
-            let active_file = app.active_tab_ref().map(|t| t.path.clone());
-            let mut rows = Vec::new();
-            collect_tree_rows(app, &app.vault.tree, 0, active_file.as_ref(), &mut rows, cx);
-            let root_check = ws_root.clone();
-            let root_drop = ws_root.clone();
-
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .track_focus(&app.sidebar_focus)
-                .child(quick_create)
-                .child(
-                    div()
-                        .id("vault-file-tree-scroll")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scrollbar()
-                        .p_1()
-                        .rounded(px(4.))
-                        .drag_over::<DraggedTreeEntry>(move |style, drag, _, _| {
-                            if can_drop_onto_dir(&drag.path, &root_check) {
-                                style
-                                    .bg(accent_alpha(0x14))
-                                    .border_1()
-                                    .border_color(hex_color(kd::ACCENT))
-                            } else {
-                                style
-                            }
-                        })
-                        .on_drop(cx.listener(move |this, drag: &DraggedTreeEntry, window, cx| {
-                            this.move_fs_entry(drag.path.clone(), root_drop.clone(), window, cx);
-                        }))
-                        .child(v_flex().gap_0p5().children(rows)),
-                )
-                .into_any_element()
-        }
-        SidebarTab::Search => {
-            let hit_rows = app.search_hits.iter().enumerate().map(|(ix, hit)| {
-                let path = hit.path.clone();
-                let rel = hit.rel_path.clone();
-                let line = hit.line_text.clone();
-                let line_num = hit.line_num;
-                let is_title = hit.is_title_match;
-
-                div()
-                    .id(("search-hit", ix))
-                    .w_full()
-                    .px_2()
-                    .py_1p5()
-                    .rounded(px(5.))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(hex_color(kd::BG_PANEL)))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let pane = this.active_pane;
-                        this.open_file(path.clone(), pane, window, cx);
-                    }))
-                    .child(
-                        v_flex()
-                            .gap_0p5()
-                            .child(
-                                h_flex()
-                                    .justify_between()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .text_xs()
-                                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                            .text_color(hex_color(kd::ACCENT))
-                                            .truncate()
-                                            .child(rel),
-                                    )
-                                    .child(if is_title {
-                                        div()
-                                            .flex_shrink_0()
-                                            .text_xs()
-                                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                            .text_color(hex_color(kd::GREEN))
-                                            .child("Title")
-                                    } else {
-                                        div()
-                                            .flex_shrink_0()
-                                            .text_xs()
-                                            .text_color(fg_muted)
-                                            .child(format!("L{line_num}"))
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(hex_color(kd::FG_SUBTLE))
-                                    .truncate()
-                                    .child(line),
-                            ),
-                    )
-            });
-
-            let has_query = app.search_input.read(cx).value().trim().chars().count() >= 2;
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .child(
-                    div()
-                        .p_2()
-                        .border_b_1()
-                        .border_color(border)
+                    v_flex()
+                        .gap_0p5()
                         .child(
-                            Input::new(&app.search_input)
-                                .small()
-                                .prefix(Icon::new(IconName::Search).xsmall().text_color(fg_muted)),
+                            h_flex()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(hex_color(kd::ACCENT))
+                                        .truncate()
+                                        .child(rel),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(badge_color)
+                                        .child(badge),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(hex_color(kd::FG_SUBTLE))
+                                .truncate()
+                                .child("Filename match"),
                         ),
                 )
+        });
+
+        div()
+            .id("vault-search-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scrollbar()
+            .p_1()
+            .child(if empty_instant {
+                div()
+                    .p_3()
+                    .text_xs()
+                    .text_color(fg_muted)
+                    .child("Type 2+ characters to search inside files…")
+                    .into_any_element()
+            } else {
+                v_flex().gap_0p5().children(hit_rows).into_any_element()
+            })
+            .into_any_element()
+    } else {
+        let hit_rows = app.search_hits.iter().enumerate().map(|(ix, hit)| {
+            let path = hit.path.clone();
+            let rel = hit.rel_path.clone();
+            let line = hit.line_text.clone();
+            let line_num = hit.line_num;
+            let is_title = hit.is_title_match;
+
+            div()
+                .id(("search-hit", ix))
+                .w_full()
+                .px_2()
+                .py_1p5()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .hover(|s| s.bg(hex_color(kd::BG_PANEL)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let pane = this.active_pane;
+                    this.open_file(path.clone(), pane, window, cx);
+                }))
                 .child(
-                    div()
-                        .id("vault-search-scroll")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scrollbar()
-                        .p_1()
-                        .child(if app.search_hits.is_empty() {
-                            div()
-                                .p_3()
-                                .text_xs()
-                                .text_color(fg_muted)
-                                .child(if has_query {
-                                    "No title or content matches found."
+                    v_flex()
+                        .gap_0p5()
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(hex_color(kd::ACCENT))
+                                        .truncate()
+                                        .child(rel),
+                                )
+                                .child(if is_title {
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(hex_color(kd::GREEN))
+                                        .child("Title")
                                 } else {
-                                    "Type 2+ characters to search titles and contents across notes, Typst docs, CSVs, and configs."
-                                })
-                                .into_any_element()
-                        } else {
-                            v_flex().gap_0p5().children(hit_rows).into_any_element()
-                        }),
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_xs()
+                                        .text_color(fg_muted)
+                                        .child(format!("L{line_num}"))
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(hex_color(kd::FG_SUBTLE))
+                                .truncate()
+                                .child(line),
+                        ),
                 )
-                .into_any_element()
-        }
+        });
+
+        div()
+            .id("vault-search-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scrollbar()
+            .p_1()
+            .child(if app.search_hits.is_empty() {
+                div()
+                    .p_3()
+                    .text_xs()
+                    .text_color(fg_muted)
+                    .child("No title or content matches found.")
+                    .into_any_element()
+            } else {
+                v_flex().gap_0p5().children(hit_rows).into_any_element()
+            })
+            .into_any_element()
     };
 
     v_flex()
         .size_full()
+        .track_focus(&app.sidebar_focus)
         .bg(sidebar_bg)
         .border_r_1()
         .border_color(border)
@@ -546,142 +529,29 @@ fn collect_tree_rows(
                     }
                 }))
                 .context_menu(move |menu, _, _| {
-                    let app_md = app_entity.clone();
-                    let app_typ = app_entity.clone();
-                    let app_xls = app_entity.clone();
-                    let app_fnt = app_entity.clone();
+                    let app_file = app_entity.clone();
                     let app_fld = app_entity.clone();
                     let app_ren = app_entity.clone();
                     let app_del = app_entity.clone();
 
                     let d1 = dir_for_menu.clone();
                     let d2 = dir_for_menu.clone();
-                    let d3 = dir_for_menu.clone();
-                    let d_fnt = dir_for_menu.clone();
-                    let d4 = dir_for_menu.clone();
                     let d5 = dir_for_menu.clone();
                     let d6 = dir_for_menu.clone();
                     let d7 = dir_for_menu.clone();
 
                     menu.label(node_name.clone())
                         .item(
-                            PopupMenuItem::new("New Note Here…")
+                            PopupMenuItem::new("New File Here…")
                                 .icon(IconName::FilePlus)
                                 .on_click(move |_, window, cx| {
                                     modals::open_new_item_dialog(
-                                        app_md.clone(),
+                                        app_file.clone(),
                                         d1.clone(),
-                                        NewItemTemplate::Markdown,
+                                        NewItemTemplate::File,
                                         window,
                                         cx,
                                     );
-                                }),
-                        )
-                        .item(
-                            PopupMenuItem::new("New Typst Here…")
-                                .icon(IconName::BookOpen)
-                                .on_click(move |_, window, cx| {
-                                    modals::open_new_item_dialog(
-                                        app_typ.clone(),
-                                        d2.clone(),
-                                        NewItemTemplate::Typst,
-                                        window,
-                                        cx,
-                                    );
-                                }),
-                        )
-                        .item(
-                            PopupMenuItem::new("New Sheet Here…")
-                                .icon(IconName::FileSpreadsheet)
-                                .on_click(move |_, window, cx| {
-                                    modals::open_new_item_dialog(
-                                        app_xls.clone(),
-                                        d3.clone(),
-                                        NewItemTemplate::Spreadsheet,
-                                        window,
-                                        cx,
-                                    );
-                                }),
-                        )
-                        .item(
-                            PopupMenuItem::new("New Screenplay Here…")
-                                .icon(IconName::FileText)
-                                .on_click(move |_, window, cx| {
-                                    modals::open_new_item_dialog(
-                                        app_fnt.clone(),
-                                        d_fnt.clone(),
-                                        NewItemTemplate::Fountain,
-                                        window,
-                                        cx,
-                                    );
-                                }),
-                        )
-                        .item(
-                            PopupMenuItem::new("New Canvas Here…")
-                                .icon(IconName::Columns2)
-                                .on_click({
-                                    let app_cnv = app_entity.clone();
-                                    let d_cnv = dir_for_menu.clone();
-                                    move |_, window, cx| {
-                                        modals::open_new_item_dialog(
-                                            app_cnv.clone(),
-                                            d_cnv.clone(),
-                                            NewItemTemplate::Canvas,
-                                            window,
-                                            cx,
-                                        );
-                                    }
-                                }),
-                        )
-                        .item(
-                            PopupMenuItem::new("New Kanban Here…")
-                                .icon(IconName::Check)
-                                .on_click({
-                                    let app_kbn = app_entity.clone();
-                                    let d_kbn = dir_for_menu.clone();
-                                    move |_, window, cx| {
-                                        modals::open_new_item_dialog(
-                                            app_kbn.clone(),
-                                            d_kbn.clone(),
-                                            NewItemTemplate::Kanban,
-                                            window,
-                                            cx,
-                                        );
-                                    }
-                                }),
-                        )
-                        .item(
-                            PopupMenuItem::new("New Mermaid Diagram…")
-                                .icon(IconName::Split)
-                                .on_click({
-                                    let app_mmd = app_entity.clone();
-                                    let d_mmd = dir_for_menu.clone();
-                                    move |_, window, cx| {
-                                        modals::open_new_item_dialog(
-                                            app_mmd.clone(),
-                                            d_mmd.clone(),
-                                            NewItemTemplate::Mermaid,
-                                            window,
-                                            cx,
-                                        );
-                                    }
-                                }),
-                        )
-                        .item(
-                            PopupMenuItem::new("New SVG Graphic…")
-                                .icon(IconName::Code)
-                                .on_click({
-                                    let app_svg = app_entity.clone();
-                                    let d_svg = dir_for_menu.clone();
-                                    move |_, window, cx| {
-                                        modals::open_new_item_dialog(
-                                            app_svg.clone(),
-                                            d_svg.clone(),
-                                            NewItemTemplate::Svg,
-                                            window,
-                                            cx,
-                                        );
-                                    }
                                 }),
                         )
                         .item(
@@ -690,7 +560,7 @@ fn collect_tree_rows(
                                 .on_click(move |_, window, cx| {
                                     modals::open_new_item_dialog(
                                         app_fld.clone(),
-                                        d4.clone(),
+                                        d2.clone(),
                                         NewItemTemplate::Folder,
                                         window,
                                         cx,
