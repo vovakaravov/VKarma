@@ -2372,8 +2372,73 @@ impl LiveDocBuffer {
         }
         .max(first_li);
 
-        if first_li == last_li && !self.has_selection() && !outdent {
-            self.replace_range(self.head..self.head, "  ", EditKind::Atomic);
+        if first_li == last_li && !self.has_selection() {
+            let line = self.line_str(first_li);
+            let line_start = self.lines[first_li].byte_start;
+            let prev_head = self.head;
+            let leading_remove = if line.starts_with('\t') {
+                1
+            } else if line.starts_with("  ") {
+                2
+            } else if line.starts_with(' ') {
+                1
+            } else {
+                0
+            };
+
+            let is_list_or_task = matches!(
+                self.lines[first_li].ctx,
+                LineBlockContext::ListItem { .. } | LineBlockContext::TaskItem { .. }
+            );
+
+            if is_list_or_task {
+                if outdent {
+                    if leading_remove > 0 {
+                        self.replace_range(
+                            line_start..line_start + leading_remove,
+                            "",
+                            EditKind::Atomic,
+                        );
+                        let target = prev_head.saturating_sub(leading_remove).max(line_start);
+                        self.set_cursor(target, false);
+                    }
+                } else {
+                    self.replace_range(line_start..line_start, "  ", EditKind::Atomic);
+                    let target = (prev_head + 2).min(self.text.len());
+                    self.set_cursor(target, false);
+                }
+                return;
+            }
+
+            if !outdent {
+                self.replace_range(self.head..self.head, "  ", EditKind::Atomic);
+            } else if leading_remove > 0 {
+                self.replace_range(
+                    line_start..line_start + leading_remove,
+                    "",
+                    EditKind::Atomic,
+                );
+                let target = prev_head.saturating_sub(leading_remove).max(line_start);
+                self.set_cursor(target, false);
+            } else if prev_head > line_start {
+                let before = &self.text[line_start..prev_head];
+                let inline_remove = if before.ends_with('\t') {
+                    1
+                } else if before.ends_with("  ") {
+                    2
+                } else if before.ends_with(' ') {
+                    1
+                } else {
+                    0
+                };
+                if inline_remove > 0 {
+                    self.replace_range(
+                        prev_head - inline_remove..prev_head,
+                        "",
+                        EditKind::Atomic,
+                    );
+                }
+            }
             return;
         }
 
@@ -2399,6 +2464,9 @@ impl LiveDocBuffer {
                 rebuilt.push_str("  ");
                 rebuilt.push_str(line);
             }
+        }
+        if rebuilt == self.text[block_start..block_end] {
+            return;
         }
         let end_after = block_start + rebuilt.len();
         self.replace_range(block_start..block_end, &rebuilt, EditKind::Atomic);
@@ -3719,5 +3787,59 @@ mod tests {
             buf.line_str(1),
             "  ![[attachments/photo.png|420|right|wrap|border]]"
         );
+    }
+
+    #[test]
+    fn indent_and_outdent_behave_cleanly_for_lists_prose_and_selections() {
+        // List item mid-line: Tab indents whole item and preserves caret position in text
+        let mut list_buf = LiveDocBuffer::new("- First item\n- [ ] Task item".to_string(), false);
+        let item_pos = list_buf.text.find("item").unwrap();
+        list_buf.set_cursor(item_pos, false);
+        list_buf.indent_lines(false);
+        assert_eq!(list_buf.line_str(0), "  - First item");
+        assert_eq!(&list_buf.text[list_buf.head..list_buf.head + 4], "item");
+
+        list_buf.indent_lines(true);
+        assert_eq!(list_buf.line_str(0), "- First item");
+        assert_eq!(&list_buf.text[list_buf.head..list_buf.head + 4], "item");
+
+        // Task item nests too
+        let task_pos = list_buf.text.find("Task").unwrap();
+        list_buf.set_cursor(task_pos, false);
+        list_buf.indent_lines(false);
+        assert_eq!(list_buf.line_str(1), "  - [ ] Task item");
+        assert_eq!(&list_buf.text[list_buf.head..list_buf.head + 4], "Task");
+
+        // Prose line: Tab inserts two spaces at caret, Shift+Tab removes inline or leading indent cleanly
+        let mut prose = LiveDocBuffer::new("Hello world".to_string(), false);
+        prose.set_cursor(5, false);
+        prose.indent_lines(false);
+        assert_eq!(prose.text, "Hello   world");
+        assert_eq!(prose.head, 7);
+        prose.indent_lines(true);
+        assert_eq!(prose.text, "Hello world");
+        assert_eq!(prose.head, 5);
+
+        // Leading-indented prose outdents cleanly while preserving caret on the same character
+        let mut indented_prose = LiveDocBuffer::new("  Paragraph body".to_string(), false);
+        let body_pos = indented_prose.text.find("body").unwrap();
+        indented_prose.set_cursor(body_pos, false);
+        indented_prose.indent_lines(true);
+        assert_eq!(indented_prose.text, "Paragraph body");
+        assert_eq!(&indented_prose.text[indented_prose.head..indented_prose.head + 4], "body");
+
+        // Multi-line selection indents and outdents as a block + supports undo/redo
+        let mut multi = LiveDocBuffer::new("Alpha\nBeta".to_string(), false);
+        multi.set_selection(0, multi.text.len());
+        multi.indent_lines(false);
+        assert_eq!(multi.text, "  Alpha\n  Beta");
+        multi.indent_lines(true);
+        assert_eq!(multi.text, "Alpha\nBeta");
+        // No-op outdent on unindented lines does not add an extra undo step
+        let ver = multi.version;
+        multi.indent_lines(true);
+        assert_eq!(multi.version, ver);
+        assert!(multi.undo());
+        assert_eq!(multi.text, "  Alpha\n  Beta");
     }
 }

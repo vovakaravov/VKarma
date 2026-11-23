@@ -259,6 +259,16 @@ pub fn register_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-pageup", PrevWorkspace, None),
         KeyBinding::new("ctrl-pagedown", NextWorkspace, None),
         KeyBinding::new("ctrl-alt-n", NewWorkspaceDialog, None),
+        KeyBinding::new(
+            "tab",
+            live_editor::LiveEditorTab,
+            Some(live_editor::LIVE_EDITOR_CONTEXT),
+        ),
+        KeyBinding::new(
+            "shift-tab",
+            live_editor::LiveEditorShiftTab,
+            Some(live_editor::LIVE_EDITOR_CONTEXT),
+        ),
     ]);
 }
 
@@ -4045,6 +4055,8 @@ impl Render for VKarmaApp {
                 } else if this.quick_switcher.is_some() {
                     this.quick_switcher = None;
                     cx.notify();
+                } else {
+                    cx.propagate();
                 }
             }))
             .on_action(cx.listener(|this, _: &RenameSelectedTreeItem, window, cx| {

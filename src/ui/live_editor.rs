@@ -19,9 +19,13 @@ use gpui_kit::{
     InspectorElementId, InteractiveElement as _, IntoElement, KeyDownEvent, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render,
     ScrollEvent, SharedString, Size, StrikethroughStyle, Style, Styled, StyledImage as _,
-    TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine, div, fill, img, point,
-    prelude::FluentBuilder as _, px, quad, relative, size,
+    TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill,
+    img, point, prelude::FluentBuilder as _, px, quad, relative, size,
 };
+
+pub const LIVE_EDITOR_CONTEXT: &str = "VKarmaLiveEditor";
+
+actions!(vkarma_live_editor, [LiveEditorTab, LiveEditorShiftTab]);
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -2118,24 +2122,7 @@ impl LiveMarkdownEditor {
             }
             "tab" if !ctrl && !alt => {
                 cx.stop_propagation();
-                self.preferred_x = None;
-                let prev_ver = self.doc.version;
-                if self.doc.table_tab_move(shift) {
-                    if self.doc.version != prev_ver {
-                        self.sync_height_table_after_edit();
-                        cx.emit(LiveEditorEvent::Changed);
-                    }
-                    self.ensure_caret_visible();
-                    self.reset_caret_blink();
-                    cx.notify();
-                } else {
-                    self.doc.indent_lines(shift);
-                    self.sync_height_table_after_edit();
-                    self.ensure_caret_visible();
-                    self.reset_caret_blink();
-                    cx.emit(LiveEditorEvent::Changed);
-                    cx.notify();
-                }
+                self.handle_tab_key(shift, cx);
             }
             "escape" => {
                 if self.active_image_resize.take().is_some() {
@@ -2472,6 +2459,27 @@ impl LiveMarkdownEditor {
         }
         self.selected_image_line = Some(resize.line_ix);
         true
+    }
+
+    fn handle_tab_key(&mut self, shift: bool, cx: &mut Context<Self>) {
+        if self
+            .selected_image_line
+            .is_some_and(|img_li| self.doc.line_index_for_byte(self.doc.head) != img_li)
+        {
+            self.selected_image_line = None;
+        }
+        self.preferred_x = None;
+        let prev_ver = self.doc.version;
+        if !self.doc.table_tab_move(shift) {
+            self.doc.indent_lines(shift);
+        }
+        if self.doc.version != prev_ver {
+            self.sync_height_table_after_edit();
+            cx.emit(LiveEditorEvent::Changed);
+        }
+        self.ensure_caret_visible();
+        self.reset_caret_blink();
+        cx.notify();
     }
 }
 
@@ -3184,6 +3192,15 @@ impl Render for LiveMarkdownEditor {
                 },
             )
             .track_focus(&self.focus_handle)
+            .key_context(LIVE_EDITOR_CONTEXT)
+            .on_action(cx.listener(|this, _: &LiveEditorTab, _window, cx| {
+                cx.stop_propagation();
+                this.handle_tab_key(false, cx);
+            }))
+            .on_action(cx.listener(|this, _: &LiveEditorShiftTab, _window, cx| {
+                cx.stop_propagation();
+                this.handle_tab_key(true, cx);
+            }))
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 this.handle_key_down(ev, window, cx);
             }))
