@@ -15,12 +15,16 @@
 - **Blender-Style Workspace Tabs:** Top-bar workspaces where each workspace binds its own root folder, sidebar/panel layout, Markdown mode defaults, open tabs, split state, and navigation history — persisting cleanly across launches and reopening in your last active workspace. Create with `+`, **drag to reorder**, or right-click to rename, rebind folder, duplicate, or delete.
 - **Unified Live Markdown & MDX Editor:**
   - Native GPUI **Live Markdown Editor (`Edit`)**, **`Split`**, and **`Reading`** views plus **Source Mode (`Ctrl+M`)** for raw Markdown.
-  - Inline styling and block rendering for YAML frontmatter, wikilinks (`[[Note]]` / `[[Note|Alias]]`), image embeds (`![[img.png|width|align]]`), tables, code fences, callouts, blockquotes, task checkboxes, `==highlight==`, smart typography, single-Enter line breaks, and chapter pagination for long fiction.
+  - Inline styling and block rendering for YAML frontmatter, wikilinks (`[[Note]]` / `[[Note|Alias]]`), code fences, callouts, blockquotes, task checkboxes, `==highlight==`, smart typography, single-Enter line breaks, and chapter pagination for long fiction.
+  - **Live Editable Tables:** Rendered grid cells with left/center/right column alignment, `Tab` / `Shift+Tab` cell navigation (auto-appending rows at the last cell), structure-preserving `Enter`/`Backspace`, and a floating `+ Row / + Col / Align / − Row / − Col` micro-toolbar.
+  - **Image Resize Gizmos, Alignment & Float Text Wrapping:** Click any image to reveal 6 aspect-locked resize handles (backed by PNG/JPEG/WebP/GIF/BMP header dimension probing) with a live `W × H px` readout plus a floating `L` / `C` / `R` / `Wrap` / `Frame` / `1:1` / `</>` toolbar. Floated `left`/`right` + `wrap` images (`![[img.png|width|left|wrap]]`) genuinely wrap adjacent prose, lists, tasks, blockquotes, callouts, and `H3–H6` subheadings in both **Live Edit** and **Reading** modes.
+  - **Writing-Friendly `Tab` / `Shift+Tab`:** Stays focused inside the editor — nests/un-nests list and task items from anywhere on the line, jumps table cells, and indents/outdents prose cleanly without hopping focus to toolbar widgets.
   - **Zen Mode (`F11` / `Ctrl+Alt+Z`):** Toggleable from the bottom-right status bar or keyboard shortcut for distraction-free writing with a readable centered column and hover-reveal exit button.
 - **Sidebar, Vault Search & Multi-Pane Navigation:**
-  - **Drag-and-drop** files and folders to move entries directly in the sidebar, press **`F2` or double-click** for inline rename, or right-click to reveal in your file manager.
+  - **Drag-and-drop** files and folders to move entries directly in the sidebar (dropping into collapsed folders moves without expanding them), press **`F2` or double-click** for inline rename, or right-click to reveal in your file manager.
   - **Vault Search (`Ctrl+Shift+F`)** searches both filenames and file contents across the workspace, alongside **Quick Open (`Ctrl+P`)** and Enter-to-submit modals.
   - Mix any document types side-by-side (`Ctrl+\` or middle-click in sidebar), close tabs with `Ctrl+W` or middle-click, cycle tabs with `Ctrl+Tab`, and jump back/forward via mouse side buttons or `Alt+←` / `Alt+→`.
+- **Memory & Binary Efficiency:** Lazy Source-mode editor allocation, bounded 48-entry LRU image cache, 6 MiB capped undo history, allocator trimming on tab close/mode switches, and stripped ThinLTO release builds.
 - **Fountain Screenplay Studio (`.fountain`):** Structured screenplay parser, live formatted script preview, scene navigator, and Typst-backed PDF export.
 - **Typst Live Studio (`.typ`):** Live Typst editing with side-by-side PNG preview and PDF export.
 - **Native PDF Preview (`.pdf`):** Built-in multi-page PDF rendering (`pdfinfo` / `pdftoppm`) with quick external open.
@@ -53,6 +57,7 @@
 | `Ctrl+Shift+F` | Search Filenames & Contents in Active Workspace |
 | `Ctrl+E` | Cycle View Mode (Edit / Split / Reading) |
 | `Ctrl+M` | Toggle Markdown Source Mode |
+| `Tab` / `Shift+Tab` | Indent / outdent prose & lists, or navigate table cells inside editor |
 | `F11` / `Ctrl+Alt+Z` | Toggle Zen Mode |
 | `Ctrl+\` | Split Active Tab to Right Pane |
 | `Ctrl+Tab` | Switch to Next Tab |
@@ -63,7 +68,7 @@
 | `Ctrl+S` / `Ctrl+Shift+S` | Save Active Tab / Save All |
 | `Ctrl+Shift+O` | Bind Current Workspace Folder |
 | `Ctrl+O` / `Ctrl+N` | Open File(s) / New Note |
-| `Escape` | Close Active Modal |
+| `Escape` | Close modal, cancel image resize, or clear image selection |
 
 ---
 
