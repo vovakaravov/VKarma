@@ -1,6 +1,14 @@
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TableAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LineBlockContext {
     Frontmatter {
@@ -20,6 +28,9 @@ pub enum LineBlockContext {
         is_delim: bool,
         is_first: bool,
         is_last: bool,
+        table_start_line: usize,
+        table_end_line: usize,
+        body_row_index: usize,
     },
     Callout {
         kind: String,
@@ -292,7 +303,7 @@ pub fn classify_document_lines(raw: &str, is_mdx: bool) -> Vec<DocLine> {
         if has_table_pipe(trimmed)
             && !trimmed.is_empty()
             && i + 1 < lines.len()
-            && is_table_delimiter(lines[i + 1].text)
+            && is_table_delimiter(lines[i].text, lines[i + 1].text)
         {
             let mut end_idx = i + 1;
             while end_idx + 1 < lines.len()
@@ -309,6 +320,9 @@ pub fn classify_document_lines(raw: &str, is_mdx: bool) -> Vec<DocLine> {
                         is_delim: j == i + 1,
                         is_first: j == i,
                         is_last: j == end_idx,
+                        table_start_line: i,
+                        table_end_line: end_idx,
+                        body_row_index: j.saturating_sub(i + 2),
                     },
                 });
             }
@@ -842,9 +856,12 @@ fn emit_table_row(
     cursor: &Option<Range<usize>>,
 ) {
     let raw = b.raw;
-    while b.raw_pos < raw.len() {
-        let start = b.raw_pos;
-        if raw.as_bytes()[start] == b'|' {
+    let pipes = collect_top_level_pipes(raw);
+    for pipe_pos in pipes {
+        if pipe_pos > b.raw_pos {
+            emit_inline(b, pipe_pos, base, cursor);
+        }
+        if b.raw_pos == pipe_pos {
             b.push_verbatim(
                 1,
                 InlineStyle {
@@ -853,11 +870,200 @@ fn emit_table_row(
                     ..base
                 },
             );
-            continue;
         }
-        let rel_pipe = raw[start..].find('|').unwrap_or(raw.len() - start);
-        emit_inline(b, start + rel_pipe, base, cursor);
     }
+    if b.raw_pos < raw.len() {
+        emit_inline(b, raw.len(), base, cursor);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawTableCell {
+    pub inner_range: Range<usize>,
+    pub content_range: Range<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedTableCell {
+    pub inner_range: Option<Range<usize>>,
+    pub raw_offset: usize,
+    pub projected: ProjectedLine,
+}
+
+pub fn parse_table_row_cells(raw_line: &str) -> Vec<RawTableCell> {
+    let pipes = collect_top_level_pipes(raw_line);
+    if pipes.is_empty() {
+        return vec![make_raw_cell(raw_line, 0, raw_line.len())];
+    }
+
+    let first_pipe = pipes[0];
+    let last_pipe = *pipes.last().unwrap();
+    let has_leading_pipe = raw_line[..first_pipe].trim().is_empty();
+    let has_trailing_pipe = (pipes.len() >= 2 || !has_leading_pipe)
+        && raw_line[last_pipe + 1..].trim().is_empty();
+
+    let mut raw_spans: Vec<(usize, usize)> = Vec::new();
+    if !has_leading_pipe {
+        raw_spans.push((0, first_pipe));
+    }
+    for win in pipes.windows(2) {
+        raw_spans.push((win[0] + 1, win[1]));
+    }
+    if !has_trailing_pipe {
+        raw_spans.push((last_pipe + 1, raw_line.len()));
+    }
+
+    if raw_spans.is_empty() {
+        raw_spans.push((first_pipe + 1, raw_line.len()));
+    }
+
+    raw_spans
+        .into_iter()
+        .map(|(s, e)| make_raw_cell(raw_line, s, e))
+        .collect()
+}
+
+fn make_raw_cell(raw_line: &str, start: usize, end: usize) -> RawTableCell {
+    let slice = &raw_line[start..end];
+    let trimmed = slice.trim();
+    let content_range = if trimmed.is_empty() {
+        let pos = if slice.starts_with(' ') {
+            (start + 1).min(end)
+        } else {
+            start
+        };
+        pos..pos
+    } else {
+        let leading = slice.len() - slice.trim_start().len();
+        let trailing = slice.len() - slice.trim_end().len();
+        (start + leading)..(end - trailing)
+    };
+    RawTableCell {
+        inner_range: start..end,
+        content_range,
+    }
+}
+
+pub fn parse_table_alignments(delim_line: &str) -> Vec<TableAlign> {
+    parse_table_row_cells(delim_line)
+        .into_iter()
+        .map(|c| {
+            let t = delim_line[c.content_range].trim();
+            let left = t.starts_with(':');
+            let right = t.ends_with(':') && t.len() >= 2;
+            match (left, right) {
+                (true, true) => TableAlign::Center,
+                (false, true) => TableAlign::Right,
+                _ => TableAlign::Left,
+            }
+        })
+        .collect()
+}
+
+pub fn table_cell_at_local_byte(raw_line: &str, local_byte: usize) -> (Vec<RawTableCell>, usize) {
+    let cells = parse_table_row_cells(raw_line);
+    if cells.is_empty() {
+        return (cells, 0);
+    }
+    let lb = local_byte.min(raw_line.len());
+    for (ix, cell) in cells.iter().enumerate() {
+        if (lb >= cell.inner_range.start && lb <= cell.inner_range.end)
+            || lb < cell.inner_range.start
+        {
+            return (cells, ix);
+        }
+    }
+    let last = cells.len() - 1;
+    (cells, last)
+}
+
+pub fn project_table_cells(
+    raw_line: &str,
+    is_header: bool,
+    min_cols: usize,
+    cursor_on_line: Option<Range<usize>>,
+) -> (Vec<ProjectedTableCell>, Option<usize>) {
+    let raw_cells = parse_table_row_cells(raw_line);
+    let active_col = cursor_on_line.as_ref().and_then(|c| {
+        if raw_cells.is_empty() {
+            None
+        } else {
+            let (_, ix) = table_cell_at_local_byte(raw_line, c.end);
+            Some(ix)
+        }
+    });
+
+    let base = InlineStyle {
+        bold: is_header,
+        ..Default::default()
+    };
+
+    let mut out = Vec::with_capacity(raw_cells.len().max(min_cols));
+    for cell in &raw_cells {
+        let mut vis_start = cell.content_range.start;
+        let mut vis_end = cell.content_range.end;
+        let mut cell_cursor = None;
+
+        if let Some(ref c) = cursor_on_line
+            && c.start <= cell.inner_range.end
+            && c.end >= cell.inner_range.start
+        {
+            let ov_s = c.start.max(cell.inner_range.start);
+            let ov_e = c.end.min(cell.inner_range.end);
+            vis_start = clamp_char_boundary(raw_line, vis_start.min(ov_s));
+            vis_end = clamp_char_boundary(raw_line, vis_end.max(ov_e));
+            cell_cursor = Some((ov_s, ov_e));
+        }
+
+        let cell_slice = &raw_line[vis_start..vis_end];
+        let local_cursor = cell_cursor.map(|(cs, ce)| {
+            let ls = clamp_char_boundary(
+                cell_slice,
+                cs.saturating_sub(vis_start).min(cell_slice.len()),
+            );
+            let le = clamp_char_boundary(
+                cell_slice,
+                ce.saturating_sub(vis_start).min(cell_slice.len()),
+            );
+            ls..le
+        });
+
+        let mut b = ProjectionBuilder::new(cell_slice);
+        emit_inline(&mut b, cell_slice.len(), base, &local_cursor);
+        if b.raw_pos < cell_slice.len() {
+            b.push_verbatim(cell_slice.len() - b.raw_pos, base);
+        }
+
+        out.push(ProjectedTableCell {
+            inner_range: Some(cell.inner_range.clone()),
+            raw_offset: vis_start,
+            projected: ProjectedLine {
+                display_text: b.display_text,
+                spans: b.spans,
+                segments: b.segments,
+                links: b.links,
+                prefix_visual: PrefixVisual::None,
+                raw_len: cell_slice.len(),
+            },
+        });
+    }
+
+    while out.len() < min_cols {
+        out.push(ProjectedTableCell {
+            inner_range: None,
+            raw_offset: raw_line.len(),
+            projected: ProjectedLine {
+                display_text: String::new(),
+                spans: Vec::new(),
+                segments: Vec::new(),
+                links: Vec::new(),
+                prefix_visual: PrefixVisual::None,
+                raw_len: 0,
+            },
+        });
+    }
+
+    (out, active_col)
 }
 
 fn emit_inline(
@@ -1328,26 +1534,45 @@ fn is_fence_close(trimmed: &str, fence_ch: char, min_len: usize) -> bool {
     count >= min_len && trimmed[count..].trim().is_empty()
 }
 
-fn is_table_delimiter(line: &str) -> bool {
+fn is_delim_cell(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let inner = t.strip_prefix(':').unwrap_or(t);
+    let inner = inner.strip_suffix(':').unwrap_or(inner);
+    !inner.is_empty() && inner.bytes().all(|b| b == b'-')
+}
+
+fn is_table_delimiter(header: &str, line: &str) -> bool {
     let t = line.trim();
     if t.is_empty() || !t.contains('-') {
         return false;
     }
-    if !t.contains('|') && !t.contains("---") {
+    if !t.contains('|') && parse_table_row_cells(header).len() > 1 {
         return false;
     }
-    t.chars()
-        .all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
+    let cells = parse_table_row_cells(line);
+    !cells.is_empty() && cells.iter().all(|c| is_delim_cell(&line[c.inner_range.clone()]))
 }
 
-fn has_table_pipe(s: &str) -> bool {
+fn collect_top_level_pipes(s: &str) -> Vec<usize> {
     let bytes = s.as_bytes();
+    let mut pipes = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'\\' {
             i += 1;
             if let Some(ch) = s[i..].chars().next() {
                 i += ch.len_utf8();
+            }
+        } else if bytes[i] == b'`' {
+            let tick_len = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+            let delim = &s[i..i + tick_len];
+            if let Some(close_rel) = s[i + tick_len..].find(delim) {
+                i += tick_len + close_rel + tick_len;
+            } else {
+                i += tick_len;
             }
         } else if bytes[i] >= 0x80 {
             if let Some(ch) = s[i..].chars().next() {
@@ -1360,12 +1585,17 @@ fn has_table_pipe(s: &str) -> bool {
         {
             i += 2 + close + 2;
         } else if bytes[i] == b'|' {
-            return true;
+            pipes.push(i);
+            i += 1;
         } else {
             i += 1;
         }
     }
-    false
+    pipes
+}
+
+fn has_table_pipe(s: &str) -> bool {
+    !collect_top_level_pipes(s).is_empty()
 }
 
 fn is_table_continuation_line(line: &str, is_mdx: bool) -> bool {
@@ -1815,6 +2045,34 @@ impl LiveDocBuffer {
         let before = &line_text[..local_pos];
         let after = &line_text[local_pos..];
 
+        // Handle Markdown GFM table rows.
+        if let LineBlockContext::Table {
+            is_header,
+            is_delim,
+            table_start_line,
+            table_end_line,
+            ..
+        } = dl.ctx
+        {
+            if !is_header && !is_delim && li == table_end_line {
+                let raw = self.line_str(li);
+                let all_empty = parse_table_row_cells(raw)
+                    .iter()
+                    .all(|c| raw[c.content_range.clone()].is_empty());
+                if all_empty {
+                    // Replace empty trailing row with a blank line below the table.
+                    self.replace_range(dl.byte_start..dl.byte_end, "", EditKind::Atomic);
+                    return;
+                }
+            }
+            if is_delim {
+                self.table_insert_row_below(table_start_line);
+            } else {
+                self.table_insert_row_below(li);
+            }
+            return;
+        }
+
         // Auto-expand opening code fence if Enter pressed at end of ```lang line.
         if after.trim().is_empty()
             && let Some((fence_ch, fence_len, _)) = parse_fence_open(before.trim())
@@ -1875,6 +2133,48 @@ impl LiveDocBuffer {
         if self.head == 0 {
             return;
         }
+        let li = self.line_index_for_byte(self.head);
+        if let Some(dl) = self.lines.get(li).cloned()
+            && let LineBlockContext::Table {
+                is_header,
+                is_delim: false,
+                table_end_line,
+                ..
+            } = dl.ctx
+        {
+            let raw = self.line_str(li);
+            let local = self.head.saturating_sub(dl.byte_start).min(raw.len());
+            let (cells, col_ix) = table_cell_at_local_byte(raw, local);
+            if let Some(cell) = cells.get(col_ix) {
+                if local > cell.inner_range.end {
+                    self.set_cursor(dl.byte_start + cell.content_range.end, false);
+                    return;
+                }
+                let min_byte = dl.byte_start + cell.content_range.start;
+                if self.head <= min_byte {
+                    if !is_header
+                        && li == table_end_line
+                        && col_ix == 0
+                        && cells.iter().all(|c| raw[c.content_range.clone()].is_empty())
+                    {
+                        self.table_delete_row(li);
+                    }
+                    return;
+                }
+                let mut target = if by_word {
+                    prev_word_boundary(&self.text, self.head)
+                } else {
+                    prev_char_boundary(&self.text, self.head)
+                };
+                if target < min_byte {
+                    target = min_byte;
+                }
+                if target < self.head {
+                    self.replace_range(target..self.head, "", EditKind::Delete);
+                }
+                return;
+            }
+        }
         let target = if by_word {
             prev_word_boundary(&self.text, self.head)
         } else {
@@ -1898,6 +2198,43 @@ impl LiveDocBuffer {
         }
         if self.head >= self.text.len() {
             return;
+        }
+        let li = self.line_index_for_byte(self.head);
+        if let Some(dl) = self.lines.get(li).cloned()
+            && let LineBlockContext::Table {
+                is_delim: false, ..
+            } = dl.ctx
+        {
+            let raw = self.line_str(li);
+            let local = self.head.saturating_sub(dl.byte_start).min(raw.len());
+            let (cells, col_ix) = table_cell_at_local_byte(raw, local);
+            if let Some(cell) = cells.get(col_ix) {
+                let trailing_pad = usize::from(
+                    raw.as_bytes().get(cell.inner_range.end) == Some(&b'|')
+                        && cell.inner_range.end > cell.content_range.end
+                        && raw.as_bytes().get(cell.inner_range.end - 1) == Some(&b' '),
+                );
+                let max_local = cell
+                    .content_range
+                    .end
+                    .max(cell.inner_range.end.saturating_sub(trailing_pad));
+                let max_byte = dl.byte_start + max_local;
+                if self.head >= max_byte {
+                    return;
+                }
+                let mut target = if by_word {
+                    next_word_boundary(&self.text, self.head)
+                } else {
+                    next_char_boundary(&self.text, self.head)
+                };
+                if target > max_byte {
+                    target = max_byte;
+                }
+                if target > self.head {
+                    self.replace_range(self.head..target, "", EditKind::Delete);
+                }
+                return;
+            }
         }
         let target = if by_word {
             next_word_boundary(&self.text, self.head)
@@ -2036,12 +2373,392 @@ impl LiveDocBuffer {
         true
     }
 
+    pub fn table_column_count(&self, start_li: usize, end_li: usize) -> usize {
+        let mut cols = 1usize;
+        let end = end_li.min(self.lines.len().saturating_sub(1));
+        for li in start_li..=end {
+            cols = cols.max(parse_table_row_cells(self.line_str(li)).len());
+        }
+        cols
+    }
+
+    fn set_cursor_in_table_cell(&mut self, row_li: usize, col_ix: usize, at_end: bool) {
+        let Some(dl) = self.lines.get(row_li) else {
+            return;
+        };
+        let raw = &self.text[dl.byte_start..dl.byte_end];
+        let cells = parse_table_row_cells(raw);
+        if let Some(cell) = cells.get(col_ix).or_else(|| cells.last()) {
+            let local = if at_end {
+                cell.content_range.end
+            } else {
+                cell.content_range.start
+            };
+            self.set_cursor(dl.byte_start + local, false);
+        }
+    }
+
+    fn rebuild_table_columns<F>(&mut self, start_li: usize, end_li: usize, mut edit_row: F) -> bool
+    where
+        F: FnMut(usize, &mut Vec<String>),
+    {
+        if start_li > end_li || end_li >= self.lines.len() {
+            return false;
+        }
+        let num_cols = self.table_column_count(start_li, end_li);
+        let block_start = self.lines[start_li].byte_start;
+        let block_end = self.lines[end_li].byte_end;
+        let delim_li = start_li + 1;
+        let mut rebuilt = String::new();
+        for li in start_li..=end_li {
+            if li > start_li {
+                rebuilt.push('\n');
+            }
+            let raw = self.line_str(li);
+            let mut texts: Vec<String> = parse_table_row_cells(raw)
+                .into_iter()
+                .map(|c| raw[c.content_range].to_string())
+                .collect();
+            let pad = if li == delim_li { "---" } else { "" };
+            while texts.len() < num_cols {
+                texts.push(pad.to_string());
+            }
+            edit_row(li, &mut texts);
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            rebuilt.push_str(&format_table_row(&refs));
+        }
+        self.replace_range(block_start..block_end, &rebuilt, EditKind::Atomic);
+        true
+    }
+
+    pub fn table_ensure_cell(&mut self, line_ix: usize, col_ix: usize) -> bool {
+        let Some(dl) = self.lines.get(line_ix).cloned() else {
+            return false;
+        };
+        if !matches!(
+            dl.ctx,
+            LineBlockContext::Table {
+                is_delim: false,
+                ..
+            }
+        ) {
+            return false;
+        }
+        let raw = self.line_str(line_ix).to_string();
+        let cells = parse_table_row_cells(&raw);
+        if col_ix < cells.len() {
+            self.set_cursor_in_table_cell(line_ix, col_ix, true);
+            return true;
+        }
+        let mut texts: Vec<String> = cells
+            .iter()
+            .map(|c| raw[c.content_range.clone()].to_string())
+            .collect();
+        while texts.len() <= col_ix {
+            texts.push(String::new());
+        }
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let rebuilt = format_table_row(&refs);
+        self.replace_range(dl.byte_start..dl.byte_end, &rebuilt, EditKind::Atomic);
+        self.set_cursor_in_table_cell(line_ix, col_ix, true);
+        true
+    }
+
+    pub fn table_insert_row_below(&mut self, row_li: usize) -> bool {
+        let Some(dl) = self.lines.get(row_li).cloned() else {
+            return false;
+        };
+        let LineBlockContext::Table {
+            is_header,
+            table_start_line,
+            table_end_line,
+            ..
+        } = dl.ctx
+        else {
+            return false;
+        };
+        let insert_after = if is_header {
+            (table_start_line + 1).min(self.lines.len().saturating_sub(1))
+        } else {
+            row_li
+        };
+        let Some(anchor_dl) = self.lines.get(insert_after).cloned() else {
+            return false;
+        };
+        let num_cols = self.table_column_count(table_start_line, table_end_line);
+        let empties = vec![""; num_cols];
+        let new_row = format!("\n{}", format_table_row(&empties));
+        self.replace_range(
+            anchor_dl.byte_end..anchor_dl.byte_end,
+            &new_row,
+            EditKind::Atomic,
+        );
+        self.set_cursor_in_table_cell(insert_after + 1, 0, false);
+        true
+    }
+
+    pub fn table_delete_row(&mut self, row_li: usize) -> bool {
+        let Some(dl) = self.lines.get(row_li).cloned() else {
+            return false;
+        };
+        let LineBlockContext::Table {
+            is_header,
+            is_delim,
+            table_start_line,
+            ..
+        } = dl.ctx
+        else {
+            return false;
+        };
+        if is_header || is_delim {
+            return false;
+        }
+        let del_range = if dl.byte_start > 0 {
+            let mut start = dl.byte_start - 1;
+            if start > 0 && self.text.as_bytes()[start - 1] == b'\r' {
+                start -= 1;
+            }
+            start..dl.byte_end
+        } else {
+            dl.byte_start..dl.byte_end
+        };
+        let prev_non_delim = if row_li > table_start_line + 2 {
+            row_li - 1
+        } else {
+            table_start_line
+        };
+        self.replace_range(del_range, "", EditKind::Atomic);
+        self.set_cursor_in_table_cell(prev_non_delim, 0, true);
+        true
+    }
+
+    pub fn table_insert_col_after(&mut self, row_li: usize, col_ix: usize) -> bool {
+        let Some(dl) = self.lines.get(row_li).cloned() else {
+            return false;
+        };
+        let LineBlockContext::Table {
+            is_delim,
+            table_start_line,
+            table_end_line,
+            ..
+        } = dl.ctx
+        else {
+            return false;
+        };
+        let num_cols = self.table_column_count(table_start_line, table_end_line);
+        let insert_pos = (col_ix + 1).min(num_cols);
+        let delim_li = table_start_line + 1;
+        if !self.rebuild_table_columns(table_start_line, table_end_line, |li, texts| {
+            let val = if li == delim_li { "---" } else { "" };
+            texts.insert(insert_pos.min(texts.len()), val.to_string());
+        }) {
+            return false;
+        }
+        let target_row = if is_delim { table_start_line } else { row_li };
+        self.set_cursor_in_table_cell(target_row, insert_pos, false);
+        true
+    }
+
+    pub fn table_delete_col(&mut self, row_li: usize, col_ix: usize) -> bool {
+        let Some(dl) = self.lines.get(row_li).cloned() else {
+            return false;
+        };
+        let LineBlockContext::Table {
+            is_delim,
+            table_start_line,
+            table_end_line,
+            ..
+        } = dl.ctx
+        else {
+            return false;
+        };
+        let num_cols = self.table_column_count(table_start_line, table_end_line);
+        if num_cols <= 1 {
+            return false;
+        }
+        let rem_col = col_ix.min(num_cols - 1);
+        if !self.rebuild_table_columns(table_start_line, table_end_line, |_, texts| {
+            if rem_col < texts.len() {
+                texts.remove(rem_col);
+            }
+        }) {
+            return false;
+        }
+        let target_row = if is_delim { table_start_line } else { row_li };
+        let target_col = rem_col.min(num_cols - 2);
+        self.set_cursor_in_table_cell(target_row, target_col, true);
+        true
+    }
+
+    pub fn table_cycle_col_align(&mut self, row_li: usize, col_ix: usize) -> bool {
+        let Some(dl) = self.lines.get(row_li).cloned() else {
+            return false;
+        };
+        let LineBlockContext::Table {
+            is_delim,
+            table_start_line,
+            table_end_line,
+            ..
+        } = dl.ctx
+        else {
+            return false;
+        };
+        let delim_li = table_start_line + 1;
+        let Some(delim_dl) = self.lines.get(delim_li).cloned() else {
+            return false;
+        };
+        let num_cols = self.table_column_count(table_start_line, table_end_line);
+        let target_col = col_ix.min(num_cols - 1);
+
+        let rel_in_cell = if !is_delim {
+            let raw_row = self.line_str(row_li);
+            let local = self.head.saturating_sub(dl.byte_start).min(raw_row.len());
+            let (cells, _) = table_cell_at_local_byte(raw_row, local);
+            cells
+                .get(target_col)
+                .map(|c| local.saturating_sub(c.content_range.start))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let mut aligns = parse_table_alignments(self.line_str(delim_li));
+        aligns.resize(num_cols, TableAlign::Left);
+        aligns[target_col] = match aligns[target_col] {
+            TableAlign::Left => TableAlign::Center,
+            TableAlign::Center => TableAlign::Right,
+            TableAlign::Right => TableAlign::Left,
+        };
+        let delim_strs: Vec<&str> = aligns.iter().copied().map(format_delim_cell).collect();
+        let rebuilt = format_table_row(&delim_strs);
+        self.replace_range(
+            delim_dl.byte_start..delim_dl.byte_end,
+            &rebuilt,
+            EditKind::Atomic,
+        );
+
+        if is_delim {
+            self.set_cursor_in_table_cell(delim_li, target_col, true);
+        } else if let Some(new_dl) = self.lines.get(row_li) {
+            let raw_row = &self.text[new_dl.byte_start..new_dl.byte_end];
+            let cells = parse_table_row_cells(raw_row);
+            if let Some(cell) = cells.get(target_col).or_else(|| cells.last()) {
+                let local = (cell.content_range.start + rel_in_cell).min(cell.content_range.end);
+                self.set_cursor(new_dl.byte_start + local, false);
+            }
+        }
+        true
+    }
+
+    pub fn table_tab_move(&mut self, shift: bool) -> bool {
+        let li = self.line_index_for_byte(self.head);
+        let Some(dl) = self.lines.get(li).cloned() else {
+            return false;
+        };
+        let LineBlockContext::Table {
+            is_header,
+            is_delim,
+            table_start_line,
+            table_end_line,
+            ..
+        } = dl.ctx
+        else {
+            return false;
+        };
+        self.break_undo_coalescing();
+        let num_cols = self.table_column_count(table_start_line, table_end_line);
+
+        if is_delim {
+            if shift {
+                self.table_ensure_cell(table_start_line, num_cols.saturating_sub(1));
+            } else if table_end_line > table_start_line + 1 {
+                self.table_ensure_cell(table_start_line + 2, 0);
+            } else {
+                self.table_insert_row_below(table_start_line);
+            }
+            return true;
+        }
+
+        let raw = self.line_str(li);
+        let local = self.head.saturating_sub(dl.byte_start).min(raw.len());
+        let (_, col_ix) = table_cell_at_local_byte(raw, local);
+
+        if shift {
+            if col_ix > 0 {
+                self.table_ensure_cell(li, col_ix - 1);
+            } else if li > table_start_line + 2 {
+                self.table_ensure_cell(li - 1, num_cols.saturating_sub(1));
+            } else if !is_header {
+                self.table_ensure_cell(table_start_line, num_cols.saturating_sub(1));
+            } else {
+                self.set_cursor_in_table_cell(li, 0, false);
+            }
+        } else if col_ix + 1 < num_cols {
+            self.table_ensure_cell(li, col_ix + 1);
+        } else if is_header {
+            if table_end_line > table_start_line + 1 {
+                self.table_ensure_cell(table_start_line + 2, 0);
+            } else {
+                self.table_insert_row_below(table_start_line);
+            }
+        } else if li < table_end_line {
+            self.table_ensure_cell(li + 1, 0);
+        } else {
+            self.table_insert_row_below(li);
+        }
+        true
+    }
+
     pub fn move_left(&mut self, by_word: bool, extend: bool) {
         self.break_undo_coalescing();
         if !extend && self.has_selection() && !by_word {
             let start = self.selection_range().start;
             self.set_cursor(start, false);
             return;
+        }
+        if !by_word && !extend && !self.has_selection() {
+            let li = self.line_index_for_byte(self.head);
+            if let Some(dl) = self.lines.get(li)
+                && let LineBlockContext::Table {
+                    is_header,
+                    is_delim: false,
+                    table_start_line,
+                    ..
+                } = dl.ctx
+            {
+                let raw = &self.text[dl.byte_start..dl.byte_end];
+                let local = self.head.saturating_sub(dl.byte_start).min(raw.len());
+                let (cells, col_ix) = table_cell_at_local_byte(raw, local);
+                if let Some(cell) = cells.get(col_ix) {
+                    if local > cell.inner_range.end {
+                        self.set_cursor(dl.byte_start + cell.content_range.end, false);
+                        return;
+                    }
+                    if local <= cell.content_range.start {
+                        if col_ix > 0 {
+                            self.set_cursor(
+                                dl.byte_start + cells[col_ix - 1].content_range.end,
+                                false,
+                            );
+                        } else if !is_header {
+                            let prev_li = if li == table_start_line + 2 {
+                                table_start_line
+                            } else {
+                                li - 1
+                            };
+                            let prev_cells = parse_table_row_cells(self.line_str(prev_li));
+                            let target = prev_cells.last().map_or(
+                                self.lines[prev_li].byte_end,
+                                |c| self.lines[prev_li].byte_start + c.content_range.end,
+                            );
+                            self.set_cursor(target, false);
+                        } else if li > 0 {
+                            self.set_cursor(self.lines[li - 1].byte_end, false);
+                        }
+                        return;
+                    }
+                }
+            }
         }
         let target = if by_word {
             prev_word_boundary(&self.text, self.head)
@@ -2058,6 +2775,54 @@ impl LiveDocBuffer {
             self.set_cursor(end, false);
             return;
         }
+        if !by_word && !extend && !self.has_selection() {
+            let li = self.line_index_for_byte(self.head);
+            if let Some(dl) = self.lines.get(li)
+                && let LineBlockContext::Table {
+                    is_header,
+                    is_delim: false,
+                    table_start_line,
+                    table_end_line,
+                    ..
+                } = dl.ctx
+            {
+                let raw = &self.text[dl.byte_start..dl.byte_end];
+                let local = self.head.saturating_sub(dl.byte_start).min(raw.len());
+                let (cells, col_ix) = table_cell_at_local_byte(raw, local);
+                if let Some(cell) = cells.get(col_ix) {
+                    if local < cell.content_range.start {
+                        self.set_cursor(dl.byte_start + cell.content_range.start, false);
+                        return;
+                    }
+                    if local >= cell.content_range.end {
+                        if col_ix + 1 < cells.len() {
+                            self.set_cursor(
+                                dl.byte_start + cells[col_ix + 1].content_range.start,
+                                false,
+                            );
+                        } else {
+                            let next_row = if is_header {
+                                if table_end_line > table_start_line + 1 {
+                                    Some(table_start_line + 2)
+                                } else {
+                                    None
+                                }
+                            } else if li < table_end_line {
+                                Some(li + 1)
+                            } else {
+                                None
+                            };
+                            if let Some(nli) = next_row {
+                                self.set_cursor_in_table_cell(nli, 0, false);
+                            } else if table_end_line + 1 < self.lines.len() {
+                                self.set_cursor(self.lines[table_end_line + 1].byte_start, false);
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+        }
         let target = if by_word {
             next_word_boundary(&self.text, self.head)
         } else {
@@ -2069,6 +2834,25 @@ impl LiveDocBuffer {
     pub fn move_line_start(&mut self, extend: bool) {
         self.break_undo_coalescing();
         let li = self.line_index_for_byte(self.head);
+        if !extend
+            && let Some(dl) = self.lines.get(li)
+            && matches!(dl.ctx, LineBlockContext::Table { is_delim: false, .. })
+        {
+            let raw = self.line_str(li);
+            let local = self.head.saturating_sub(dl.byte_start).min(raw.len());
+            let (cells, col_ix) = table_cell_at_local_byte(raw, local);
+            if let Some(cell) = cells.get(col_ix) {
+                let cell_start = dl.byte_start + cell.content_range.start;
+                let row_start = dl.byte_start + cells[0].content_range.start;
+                let target = if self.head == cell_start {
+                    row_start
+                } else {
+                    cell_start
+                };
+                self.set_cursor(target, false);
+                return;
+            }
+        }
         let target = self.lines.get(li).map_or(0, |l| l.byte_start);
         self.set_cursor(target, extend);
     }
@@ -2076,6 +2860,25 @@ impl LiveDocBuffer {
     pub fn move_line_end(&mut self, extend: bool) {
         self.break_undo_coalescing();
         let li = self.line_index_for_byte(self.head);
+        if !extend
+            && let Some(dl) = self.lines.get(li)
+            && matches!(dl.ctx, LineBlockContext::Table { is_delim: false, .. })
+        {
+            let raw = self.line_str(li);
+            let local = self.head.saturating_sub(dl.byte_start).min(raw.len());
+            let (cells, col_ix) = table_cell_at_local_byte(raw, local);
+            if let Some(cell) = cells.get(col_ix) {
+                let cell_end = dl.byte_start + cell.content_range.end;
+                let row_end = dl.byte_start + cells.last().unwrap().content_range.end;
+                let target = if self.head == cell_end {
+                    row_end
+                } else {
+                    cell_end
+                };
+                self.set_cursor(target, false);
+                return;
+            }
+        }
         let target = self
             .lines
             .get(li)
@@ -2119,6 +2922,22 @@ impl LiveDocBuffer {
     pub fn select_line_at(&mut self, byte_offset: usize) {
         let li = self.line_index_for_byte(byte_offset);
         if let Some(dl) = self.lines.get(li) {
+            if matches!(dl.ctx, LineBlockContext::Table { is_delim: false, .. }) {
+                let raw = self.line_str(li);
+                let local = byte_offset.saturating_sub(dl.byte_start).min(raw.len());
+                let (cells, col_ix) = table_cell_at_local_byte(raw, local);
+                if let Some(cell) = cells.get(col_ix) {
+                    if !cell.content_range.is_empty() {
+                        self.set_selection(
+                            dl.byte_start + cell.content_range.start,
+                            dl.byte_start + cell.content_range.end,
+                        );
+                    } else {
+                        self.set_cursor(dl.byte_start + cell.content_range.start, false);
+                    }
+                    return;
+                }
+            }
             self.set_selection(dl.byte_start, dl.byte_end);
         }
     }
@@ -2163,6 +2982,24 @@ impl LiveDocBuffer {
         self.marked_range = None;
         self.last_edit = None;
         true
+    }
+}
+
+fn format_table_row(cells: &[&str]) -> String {
+    let mut out = String::from("|");
+    for cell in cells {
+        out.push(' ');
+        out.push_str(cell.trim());
+        out.push_str(" |");
+    }
+    out
+}
+
+fn format_delim_cell(align: TableAlign) -> &'static str {
+    match align {
+        TableAlign::Left => "---",
+        TableAlign::Center => ":---:",
+        TableAlign::Right => "---:",
     }
 }
 
@@ -2335,9 +3172,23 @@ pub fn estimate_line_height(raw_line: &str, ctx: &LineBlockContext, col_width: f
         LineBlockContext::ImageEmbed { .. } => 280.0,
         LineBlockContext::SceneBreak => 24.0,
         LineBlockContext::Blank => 24.75,
+        LineBlockContext::Table {
+            is_delim,
+            is_header,
+            is_first,
+            is_last,
+            ..
+        } => {
+            if *is_delim {
+                0.0
+            } else if *is_header {
+                38.0 + if *is_first { 6.0 } else { 0.0 }
+            } else {
+                34.0 + if *is_last { 8.0 } else { 0.0 }
+            }
+        }
         LineBlockContext::CodeFence { .. }
         | LineBlockContext::Frontmatter { .. }
-        | LineBlockContext::Table { .. }
         | LineBlockContext::MdxBlock { .. } => {
             let rows = ((chars * 8.1) / usable_w).ceil().max(1.0);
             rows * 21.0 + 4.0
@@ -2496,5 +3347,178 @@ mod tests {
         assert_eq!(table.line_for_y(31.0), 1);
         assert_eq!(table.line_for_y(89.9), 2);
         assert_eq!(table.line_for_y(119.0), 3);
+    }
+
+    #[test]
+    fn parses_table_cells_and_alignments_across_edge_cases() {
+        let std_row = "| Name | Role | Notes |";
+        let cells = parse_table_row_cells(std_row);
+        assert_eq!(cells.len(), 3);
+        assert_eq!(&std_row[cells[0].content_range.clone()], "Name");
+        assert_eq!(&std_row[cells[1].content_range.clone()], "Role");
+        assert_eq!(&std_row[cells[2].content_range.clone()], "Notes");
+
+        let bare = "left | center | right";
+        let bare_cells = parse_table_row_cells(bare);
+        assert_eq!(bare_cells.len(), 3);
+        assert_eq!(&bare[bare_cells[0].content_range.clone()], "left");
+        assert_eq!(&bare[bare_cells[1].content_range.clone()], "center");
+        assert_eq!(&bare[bare_cells[2].content_range.clone()], "right");
+
+        let empty = "|  |  |";
+        let empty_cells = parse_table_row_cells(empty);
+        assert_eq!(empty_cells.len(), 2);
+        assert_eq!(empty_cells[0].content_range, 2..2);
+        assert_eq!(empty_cells[1].content_range, 5..5);
+
+        let tricky = r"| A \| B | `x | y` | [[Note|Alias]] | Привет 🚀 |";
+        let tricky_cells = parse_table_row_cells(tricky);
+        assert_eq!(tricky_cells.len(), 4);
+        assert_eq!(&tricky[tricky_cells[0].content_range.clone()], r"A \| B");
+        assert_eq!(&tricky[tricky_cells[1].content_range.clone()], "`x | y`");
+        assert_eq!(
+            &tricky[tricky_cells[2].content_range.clone()],
+            "[[Note|Alias]]"
+        );
+        assert_eq!(&tricky[tricky_cells[3].content_range.clone()], "Привет 🚀");
+
+        let aligns = parse_table_alignments("| :--- | :---: | ---: | --- |");
+        assert_eq!(
+            aligns,
+            vec![
+                TableAlign::Left,
+                TableAlign::Center,
+                TableAlign::Right,
+                TableAlign::Left
+            ]
+        );
+    }
+
+    #[test]
+    fn hr_below_pipe_paragraph_is_not_misclassified_as_table() {
+        let doc = "foo | bar\n---";
+        let lines = classify_document_lines(doc, false);
+        assert!(matches!(lines[0].ctx, LineBlockContext::Paragraph));
+        assert!(matches!(lines[1].ctx, LineBlockContext::SceneBreak));
+    }
+
+    #[test]
+    fn projects_table_cells_with_conceal_trailing_space_and_utf8_roundtrip() {
+        let row = "| **Bold** | [[Target|Алиас]] 🚀 | Plain |";
+        let (concealed, active) = project_table_cells(row, false, 4, None);
+        assert_eq!(active, None);
+        assert_eq!(concealed.len(), 4);
+        assert_eq!(concealed[0].projected.display_text, "Bold");
+        assert_eq!(concealed[1].projected.display_text, "Алиас 🚀");
+        assert_eq!(concealed[2].projected.display_text, "Plain");
+        assert!(concealed[3].inner_range.is_none());
+
+        // Cursor touching cell 0 reveals **Bold** ONLY in cell 0.
+        let bold_mid = row.find("Bold").unwrap() + 1;
+        let (revealed, active_col) = project_table_cells(row, false, 3, Some(bold_mid..bold_mid));
+        assert_eq!(active_col, Some(0));
+        assert_eq!(revealed[0].projected.display_text, "**Bold**");
+        assert_eq!(revealed[1].projected.display_text, "Алиас 🚀");
+
+        // Bijective char boundary invariants inside Unicode table cell.
+        let c1 = &concealed[1];
+        let raw_slice = &row[c1.raw_offset..c1.raw_offset + c1.projected.raw_len];
+        for (rb, _) in raw_slice.char_indices() {
+            let db = c1.projected.raw_to_display(rb);
+            assert!(c1.projected.display_text.is_char_boundary(db));
+        }
+        for (db, _) in c1.projected.display_text.char_indices() {
+            let rb = c1.projected.display_to_raw(raw_slice, db);
+            assert!(raw_slice.is_char_boundary(rb));
+        }
+
+        // Cursor-expanded trailing space visibility while typing in cell.
+        let typing_space = "| Foo  | Bar |";
+        let (typed, active2) = project_table_cells(typing_space, false, 2, Some(6..6));
+        assert_eq!(active2, Some(0));
+        assert_eq!(typed[0].projected.display_text, "Foo ");
+        assert_eq!(
+            typed[0]
+                .projected
+                .raw_to_display(6 - typed[0].raw_offset),
+            4
+        );
+    }
+
+    #[test]
+    fn doc_buffer_table_navigation_protection_and_structural_edits() {
+        let initial = "| Col1 | Col2 |\n| --- | --- |\n| A | B |";
+        let mut buf = LiveDocBuffer::new(initial.to_string(), false);
+
+        // Tab from header cell 0 -> header cell 1 -> body row 0 cell 0 -> cell 1 -> append new row
+        let a_start = parse_table_row_cells(buf.line_str(0))[0].content_range.start;
+        buf.set_cursor(buf.lines[0].byte_start + a_start, false);
+        assert!(buf.table_tab_move(false));
+        assert_eq!(buf.line_index_for_byte(buf.head), 0);
+        assert!(buf.table_tab_move(false));
+        assert_eq!(buf.line_index_for_byte(buf.head), 2);
+        assert!(buf.table_tab_move(false));
+        assert_eq!(buf.line_index_for_byte(buf.head), 2);
+        assert!(buf.table_tab_move(false));
+        assert_eq!(buf.line_index_for_byte(buf.head), 3);
+        assert_eq!(buf.line_str(3), "|  |  |");
+
+        // Shift+Tab navigates back cleanly across rows and skips delim
+        assert!(buf.table_tab_move(true));
+        assert_eq!(buf.line_index_for_byte(buf.head), 2);
+        assert!(buf.table_tab_move(true));
+        assert_eq!(buf.line_index_for_byte(buf.head), 2);
+        assert!(buf.table_tab_move(true));
+        assert_eq!(buf.line_index_for_byte(buf.head), 0);
+
+        // Pipe protection on Backspace & Delete inside a cell
+        let row2_start = buf.lines[2].byte_start;
+        let row2_cells = parse_table_row_cells(buf.line_str(2));
+        buf.set_cursor(row2_start + row2_cells[1].content_range.start, false);
+        buf.backspace(false);
+        assert_eq!(buf.line_str(2), "| A | B |");
+        buf.set_cursor(row2_start + row2_cells[1].content_range.end, false);
+        buf.delete(false);
+        assert_eq!(buf.line_str(2), "| A | B |");
+
+        // Enter on empty trailing row exits table onto blank line; undo brings it back
+        let row3_cells = parse_table_row_cells(buf.line_str(3));
+        buf.set_cursor(buf.lines[3].byte_start + row3_cells[0].content_range.start, false);
+        buf.smart_enter();
+        assert_eq!(buf.text, "| Col1 | Col2 |\n| --- | --- |\n| A | B |\n");
+        assert!(buf.undo());
+        assert_eq!(
+            buf.text,
+            "| Col1 | Col2 |\n| --- | --- |\n| A | B |\n|  |  |"
+        );
+
+        // Delete body row 3 cleanly, pad ragged cell, insert/delete col, cycle align
+        assert!(buf.table_delete_row(3));
+        assert_eq!(buf.text, "| Col1 | Col2 |\n| --- | --- |\n| A | B |");
+
+        assert!(buf.table_ensure_cell(2, 2));
+        assert_eq!(buf.line_str(2), "| A | B |  |");
+
+        assert!(buf.table_insert_col_after(0, 0));
+        assert_eq!(buf.line_str(0), "| Col1 |  | Col2 |  |");
+        assert_eq!(buf.line_str(1), "| --- | --- | --- | --- |");
+        assert_eq!(buf.line_str(2), "| A |  | B |  |");
+
+        assert!(buf.table_cycle_col_align(0, 1));
+        assert_eq!(buf.line_str(1), "| --- | :---: | --- | --- |");
+        assert!(buf.table_cycle_col_align(0, 1));
+        assert_eq!(buf.line_str(1), "| --- | ---: | --- | --- |");
+
+        assert!(buf.table_delete_col(0, 1));
+        assert_eq!(buf.line_str(0), "| Col1 | Col2 |  |");
+        assert!(buf.undo());
+        assert_eq!(buf.line_str(0), "| Col1 |  | Col2 |  |");
+        assert!(buf.redo());
+        assert_eq!(buf.line_str(0), "| Col1 | Col2 |  |");
+
+        // Selecting entire table and deleting still removes the table normally
+        buf.select_all();
+        buf.backspace(false);
+        assert_eq!(buf.text, "");
     }
 }

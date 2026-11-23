@@ -1,6 +1,7 @@
 use crate::live_md::{
     DocLine, EditKind, InlineStyle, LineBlockContext, LineHeightTable, LinkTarget, LiveDocBuffer,
-    PrefixVisual, ProjectedLine, clamp_char_boundary, list_indent_px_from_cols, project_line,
+    PrefixVisual, ProjectedLine, TableAlign, clamp_char_boundary, list_indent_px_from_cols,
+    parse_table_alignments, project_line, project_table_cells, table_cell_at_local_byte,
     utf8_to_utf16_offset, utf16_to_utf8_offset,
 };
 use crate::markdown::{ImageAlign, parse_image_spec};
@@ -127,14 +128,51 @@ impl ScrollbarHandle for LiveEditorScrollbarHandle {
     }
 }
 
+const TABLE_CELL_PAD_X: f32 = 12.0;
+const TABLE_FONT_SIZE: f32 = 14.0;
+const TABLE_LINE_HEIGHT: f32 = 21.0;
+const TABLE_TOOLBAR_RESERVE: f32 = 30.0;
+
+#[derive(Clone)]
+struct TableBlockLayout {
+    col_widths: Vec<f32>,
+    col_xs: Vec<f32>,
+    alignments: Vec<TableAlign>,
+    num_cols: usize,
+    total_width: f32,
+}
+
+struct CachedTableCell {
+    inner_range: Option<Range<usize>>,
+    raw_offset: usize,
+    projected: ProjectedLine,
+    shaped: Option<WrappedLine>,
+    x_rel: f32,
+    width: f32,
+    align: TableAlign,
+}
+
+struct CachedTableRow {
+    cells: Vec<CachedTableCell>,
+    active_col: Option<usize>,
+    table_width: f32,
+    cell_pad_y: f32,
+    frame_top_margin: f32,
+    frame_bottom_margin: f32,
+    is_visual_last: bool,
+}
+
 struct CachedLine {
     doc_version: u64,
     cursor_key: Option<(usize, usize)>,
     wrap_width: f32,
     raw_len: usize,
+    table_active: bool,
+    delim_expanded: bool,
     ctx: LineBlockContext,
     projected: ProjectedLine,
     shaped: Option<WrappedLine>,
+    table_row: Option<CachedTableRow>,
     line_height: f32,
     total_height: f32,
     y_top: f32,
@@ -148,6 +186,132 @@ impl CachedLine {
         self.shaped
             .as_ref()
             .map_or(1, |wl| wl.wrap_boundaries.len() + 1)
+    }
+}
+
+fn gpui_text_align(align: TableAlign) -> TextAlign {
+    match align {
+        TableAlign::Left => TextAlign::Left,
+        TableAlign::Center => TextAlign::Center,
+        TableAlign::Right => TextAlign::Right,
+    }
+}
+
+fn compute_table_layout(
+    doc: &LiveDocBuffer,
+    start_li: usize,
+    end_li: usize,
+    col_width: f32,
+) -> TableBlockLayout {
+    let clamped_end = end_li.min(doc.lines.len().saturating_sub(1));
+    let delim_li = start_li + 1;
+    let alignments = doc
+        .lines
+        .get(delim_li)
+        .map(|dl| parse_table_alignments(&doc.text[dl.byte_start..dl.byte_end]))
+        .unwrap_or_default();
+
+    let mut num_cols = alignments.len().max(1);
+    let mut max_chars: Vec<usize> = vec![3; num_cols];
+    let scan_end = clamped_end.min(start_li + 500);
+
+    for li in start_li..=scan_end {
+        if li == delim_li {
+            continue;
+        }
+        let Some(dl) = doc.lines.get(li) else {
+            continue;
+        };
+        let raw = &doc.text[dl.byte_start..dl.byte_end];
+        let (cells, _) = project_table_cells(raw, li == start_li, num_cols, None);
+        if cells.len() > num_cols {
+            num_cols = cells.len();
+            max_chars.resize(num_cols, 3);
+        }
+        let header_bonus = if li == start_li { 2 } else { 0 };
+        for (cix, cell) in cells.iter().enumerate() {
+            let ch_count = cell.projected.display_text.chars().count() + header_bonus;
+            max_chars[cix] = max_chars[cix].max(ch_count).max(3);
+        }
+    }
+
+    let mut col_alignments = alignments;
+    col_alignments.resize(num_cols, TableAlign::Left);
+
+    let min_w = (col_width / num_cols as f32).min(64.0).max(24.0);
+    let pref_w: Vec<f32> = max_chars
+        .iter()
+        .map(|&ch| (ch as f32 * 8.4 + 2.0 * TABLE_CELL_PAD_X).max(min_w))
+        .collect();
+    let sum_pref: f32 = pref_w.iter().sum();
+
+    let mut col_widths = vec![min_w; num_cols];
+    if sum_pref <= col_width && sum_pref > 0.0 {
+        let slack = col_width - sum_pref;
+        for c in 0..num_cols {
+            col_widths[c] = pref_w[c] + slack * (pref_w[c] / sum_pref);
+        }
+    } else {
+        let remain = (col_width - min_w * num_cols as f32).max(0.0);
+        let weights: Vec<f32> = pref_w
+            .iter()
+            .map(|&pw| (pw - min_w).max(1.0).powf(0.75))
+            .collect();
+        let sum_w: f32 = weights.iter().sum();
+        if sum_w > 0.0 {
+            for c in 0..num_cols {
+                col_widths[c] = min_w + remain * (weights[c] / sum_w);
+            }
+        }
+    }
+
+    let mut col_xs = Vec::with_capacity(num_cols);
+    let mut cur_x = 0.0f32;
+    for &w in &col_widths {
+        col_xs.push(cur_x);
+        cur_x += w;
+    }
+    if let (Some(last_w), Some(last_x)) = (col_widths.last_mut(), col_xs.last()) {
+        *last_w = (col_width - *last_x).max(20.0);
+    }
+
+    TableBlockLayout {
+        col_widths,
+        col_xs,
+        alignments: col_alignments,
+        num_cols,
+        total_width: col_width,
+    }
+}
+
+fn table_state_for_line(
+    doc: &LiveDocBuffer,
+    ctx: &LineBlockContext,
+) -> (Option<(usize, usize)>, bool, bool) {
+    if let LineBlockContext::Table {
+        table_start_line,
+        table_end_line,
+        ..
+    } = ctx
+    {
+        let delim_li = table_start_line + 1;
+        let delim_expanded = doc
+            .lines
+            .get(delim_li)
+            .is_some_and(|ddl| cursor_range_for_line(doc, ddl, true).is_some());
+        let sel = doc.selection_range();
+        let table_active = doc
+            .lines
+            .get(*table_start_line)
+            .zip(doc.lines.get(*table_end_line))
+            .is_some_and(|(s_dl, e_dl)| sel.end >= s_dl.byte_start && sel.start <= e_dl.byte_end);
+        (
+            Some((*table_start_line, *table_end_line)),
+            table_active,
+            delim_expanded,
+        )
+    } else {
+        (None, false, false)
     }
 }
 
@@ -279,7 +443,14 @@ fn build_text_runs(
         .iter()
         .map(|sp| {
             let st: InlineStyle = sp.style;
-            let mut font = if st.monospace || matches!(ctx, LineBlockContext::CodeFence { .. } | LineBlockContext::Frontmatter { .. } | LineBlockContext::Table { .. }) {
+            let mut font = if st.monospace
+                || matches!(
+                    ctx,
+                    LineBlockContext::CodeFence { .. }
+                        | LineBlockContext::Frontmatter { .. }
+                        | LineBlockContext::Table { is_delim: true, .. }
+                )
+            {
                 mono_font.clone()
             } else {
                 prose_font.clone()
@@ -419,17 +590,283 @@ fn row_right_x(shaped: Option<&WrappedLine>, row: usize, line_height: Pixels) ->
     (row_end_x - row_start_x).max(0.0)
 }
 
+fn row_align_offset_x(
+    shaped: Option<&WrappedLine>,
+    row: usize,
+    align: TextAlign,
+    align_width: f32,
+    line_height: Pixels,
+) -> f32 {
+    match align {
+        TextAlign::Left => 0.0,
+        TextAlign::Center => {
+            ((align_width - row_right_x(shaped, row, line_height)) * 0.5).max(0.0)
+        }
+        TextAlign::Right => (align_width - row_right_x(shaped, row, line_height)).max(0.0),
+    }
+}
+
+fn find_table_cell_for_local_raw(tr: &CachedTableRow, local_raw: usize) -> Option<usize> {
+    for (ix, cell) in tr.cells.iter().enumerate() {
+        if let Some(ref inner) = cell.inner_range
+            && ((local_raw >= inner.start && local_raw <= inner.end) || local_raw < inner.start)
+        {
+            return Some(ix);
+        }
+    }
+    tr.active_col
+        .filter(|&c| {
+            tr.cells
+                .get(c)
+                .is_some_and(|cell| cell.inner_range.is_some())
+        })
+        .or_else(|| tr.cells.iter().rposition(|c| c.inner_range.is_some()))
+}
+
+fn raw_offset_to_visual_point(c: &CachedLine, local_raw: usize) -> (f32, f32, f32) {
+    if let Some(tr) = &c.table_row
+        && let Some(cix) = find_table_cell_for_local_raw(tr, local_raw)
+    {
+        let cell = &tr.cells[cix];
+        let cell_local = local_raw
+            .saturating_sub(cell.raw_offset)
+            .min(cell.projected.raw_len);
+        let disp = cell.projected.raw_to_display(cell_local);
+        let pt = disp_position_for_index(
+            cell.shaped.as_ref(),
+            cell.projected.display_text.len(),
+            disp,
+            px(c.line_height),
+        );
+        let wrap_row = (f32::from(pt.y) / c.line_height).round().max(0.0) as usize;
+        let inner_w = (cell.width - 2.0 * TABLE_CELL_PAD_X).max(20.0);
+        let align_dx = row_align_offset_x(
+            cell.shaped.as_ref(),
+            wrap_row,
+            gpui_text_align(cell.align),
+            inner_w,
+            px(c.line_height),
+        );
+        return (
+            cell.x_rel + TABLE_CELL_PAD_X + align_dx + f32::from(pt.x),
+            tr.frame_top_margin + tr.cell_pad_y + f32::from(pt.y),
+            c.line_height,
+        );
+    }
+
+    let disp = c.projected.raw_to_display(local_raw);
+    let pt = disp_position_for_index(
+        c.shaped.as_ref(),
+        c.projected.display_text.len(),
+        disp,
+        px(c.line_height),
+    );
+    (
+        c.text_x_rel + f32::from(pt.x),
+        c.text_y_rel + f32::from(pt.y),
+        c.line_height,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn shape_cached_line(
     dl: &DocLine,
     raw_line: &str,
     cursor_local: Option<Range<usize>>,
     col_width: f32,
     doc_version: u64,
+    table_layout: Option<&TableBlockLayout>,
+    table_active: bool,
+    delim_expanded: bool,
     prose_font: &Font,
     mono_font: &Font,
     window: &Window,
 ) -> CachedLine {
     let cursor_key = cursor_local.as_ref().map(|r| (r.start, r.end));
+
+    if let LineBlockContext::Table {
+        is_header,
+        is_delim,
+        is_first,
+        is_last,
+        table_start_line,
+        table_end_line,
+        ..
+    } = &dl.ctx
+    {
+        if *is_delim {
+            let empty_proj = ProjectedLine {
+                display_text: String::new(),
+                spans: Vec::new(),
+                segments: Vec::new(),
+                links: Vec::new(),
+                prefix_visual: PrefixVisual::None,
+                raw_len: raw_line.len(),
+            };
+            if cursor_local.is_none() {
+                return CachedLine {
+                    doc_version,
+                    cursor_key,
+                    wrap_width: col_width,
+                    raw_len: raw_line.len(),
+                    table_active,
+                    delim_expanded,
+                    ctx: dl.ctx.clone(),
+                    projected: empty_proj,
+                    shaped: None,
+                    table_row: None,
+                    line_height: TABLE_LINE_HEIGHT,
+                    total_height: 0.0,
+                    y_top: 0.0,
+                    text_x_rel: 12.0,
+                    text_y_rel: 0.0,
+                    checkbox_rect: None,
+                };
+            }
+            let projected = project_line(raw_line, &dl.ctx, cursor_local);
+            let avail_w = (col_width - 24.0).max(120.0);
+            let shaped = if projected.display_text.is_empty() {
+                None
+            } else {
+                let runs = build_text_runs(&projected, &dl.ctx, prose_font, mono_font);
+                let shared: SharedString = projected.display_text.clone().into();
+                window
+                    .text_system()
+                    .shape_text(shared, px(13.5), &runs, Some(px(avail_w)), None)
+                    .ok()
+                    .and_then(|mut v| if v.is_empty() { None } else { Some(v.remove(0)) })
+            };
+            let wrap_rows = shaped
+                .as_ref()
+                .map_or(1, |wl| wl.wrap_boundaries.len() + 1) as f32;
+            let frame_bot = if *is_last {
+                if table_active {
+                    TABLE_TOOLBAR_RESERVE
+                } else {
+                    8.0
+                }
+            } else {
+                0.0
+            };
+            let pad_bot = if *is_last { 4.0 + frame_bot } else { 4.0 };
+            let total_height = 4.0 + wrap_rows * TABLE_LINE_HEIGHT + pad_bot;
+            return CachedLine {
+                doc_version,
+                cursor_key,
+                wrap_width: col_width,
+                raw_len: raw_line.len(),
+                table_active,
+                delim_expanded,
+                ctx: dl.ctx.clone(),
+                projected,
+                shaped,
+                table_row: None,
+                line_height: TABLE_LINE_HEIGHT,
+                total_height,
+                y_top: 0.0,
+                text_x_rel: 12.0,
+                text_y_rel: 4.0,
+                checkbox_rect: None,
+            };
+        }
+
+        if let Some(tbl) = table_layout {
+            let (proj_cells, active_col) =
+                project_table_cells(raw_line, *is_header, tbl.num_cols, cursor_local);
+            let mut cached_cells = Vec::with_capacity(tbl.num_cols);
+            let mut max_wrap_rows = 1usize;
+
+            for (cix, pcell) in proj_cells.into_iter().enumerate() {
+                let x_rel = tbl.col_xs.get(cix).copied().unwrap_or(0.0);
+                let width = tbl.col_widths.get(cix).copied().unwrap_or(64.0);
+                let align = tbl.alignments.get(cix).copied().unwrap_or(TableAlign::Left);
+                let avail_cell_w = (width - 2.0 * TABLE_CELL_PAD_X).max(20.0);
+                let shaped = if pcell.projected.display_text.is_empty() {
+                    None
+                } else {
+                    let runs = build_text_runs(&pcell.projected, &dl.ctx, prose_font, mono_font);
+                    let shared: SharedString = pcell.projected.display_text.clone().into();
+                    window
+                        .text_system()
+                        .shape_text(
+                            shared,
+                            px(TABLE_FONT_SIZE),
+                            &runs,
+                            Some(px(avail_cell_w)),
+                            None,
+                        )
+                        .ok()
+                        .and_then(|mut v| if v.is_empty() { None } else { Some(v.remove(0)) })
+                };
+                let rows = shaped
+                    .as_ref()
+                    .map_or(1, |wl| wl.wrap_boundaries.len() + 1);
+                max_wrap_rows = max_wrap_rows.max(rows);
+                cached_cells.push(CachedTableCell {
+                    inner_range: pcell.inner_range,
+                    raw_offset: pcell.raw_offset,
+                    projected: pcell.projected,
+                    shaped,
+                    x_rel,
+                    width,
+                    align,
+                });
+            }
+
+            let is_visual_last =
+                *is_last || (*is_header && *table_end_line == *table_start_line + 1 && !delim_expanded);
+            let frame_top_margin = if *is_first { 6.0 } else { 0.0 };
+            let frame_bottom_margin = if is_visual_last {
+                if table_active {
+                    TABLE_TOOLBAR_RESERVE
+                } else {
+                    8.0
+                }
+            } else {
+                0.0
+            };
+            let cell_pad_y = if *is_header { 8.0 } else { 6.5 };
+            let total_height = frame_top_margin
+                + cell_pad_y * 2.0
+                + max_wrap_rows as f32 * TABLE_LINE_HEIGHT
+                + frame_bottom_margin;
+
+            return CachedLine {
+                doc_version,
+                cursor_key,
+                wrap_width: col_width,
+                raw_len: raw_line.len(),
+                table_active,
+                delim_expanded,
+                ctx: dl.ctx.clone(),
+                projected: ProjectedLine {
+                    display_text: String::new(),
+                    spans: Vec::new(),
+                    segments: Vec::new(),
+                    links: Vec::new(),
+                    prefix_visual: PrefixVisual::None,
+                    raw_len: raw_line.len(),
+                },
+                shaped: None,
+                table_row: Some(CachedTableRow {
+                    cells: cached_cells,
+                    active_col,
+                    table_width: tbl.total_width,
+                    cell_pad_y,
+                    frame_top_margin,
+                    frame_bottom_margin,
+                    is_visual_last,
+                }),
+                line_height: TABLE_LINE_HEIGHT,
+                total_height,
+                y_top: 0.0,
+                text_x_rel: TABLE_CELL_PAD_X,
+                text_y_rel: frame_top_margin + cell_pad_y,
+                checkbox_rect: None,
+            };
+        }
+    }
+
     let projected = project_line(raw_line, &dl.ctx, cursor_local);
     let (font_size_f, lh_f, base_pt, base_pb) = line_typography(&dl.ctx);
     let indent_x = line_text_indent_x(&dl.ctx, &projected.prefix_visual);
@@ -480,9 +917,12 @@ fn shape_cached_line(
         cursor_key,
         wrap_width: col_width,
         raw_len: raw_line.len(),
+        table_active,
+        delim_expanded,
         ctx: dl.ctx.clone(),
         projected,
         shaped,
+        table_row: None,
         line_height: lh_f,
         total_height,
         y_top: 0.0,
@@ -490,6 +930,14 @@ fn shape_cached_line(
         text_y_rel: base_pt,
         checkbox_rect: None,
     }
+}
+
+struct HitTestResult {
+    raw_byte: usize,
+    line_ix: usize,
+    clicked_link: Option<LinkTarget>,
+    clicked_checkbox: bool,
+    phantom_table_cell: Option<(usize, usize)>,
 }
 
 /// Obsidian-style unified native GPUI Live Markdown editor.
@@ -702,22 +1150,30 @@ impl LiveMarkdownEditor {
         let col_w = self.last_col_geo.map_or(760.0, |g| g.1);
         let cursor_local = cursor_range_for_line(&self.doc, &dl, true);
         let key = cursor_local.as_ref().map(|r| (r.start, r.end));
-        let raw_line = &self.doc.text[dl.byte_start..dl.byte_end];
+        let raw_len = dl.byte_end - dl.byte_start;
+        let (table_span, table_active, delim_expanded) = table_state_for_line(&self.doc, &dl.ctx);
 
         let hit = self.layout_cache.get(&li).is_some_and(|c| {
             c.doc_version == self.doc.version
                 && c.cursor_key == key
                 && (c.wrap_width - col_w).abs() < 0.5
-                && c.raw_len == raw_line.len()
+                && c.raw_len == raw_len
+                && c.table_active == table_active
+                && c.delim_expanded == delim_expanded
         });
         if !hit {
+            let tbl = table_span.map(|(s, e)| compute_table_layout(&self.doc, s, e, col_w));
             let (prose, mono) = self.resolved_fonts(window, cx);
+            let raw_line = &self.doc.text[dl.byte_start..dl.byte_end];
             let cached = shape_cached_line(
                 &dl,
                 raw_line,
                 cursor_local,
                 col_w,
                 self.doc.version,
+                tbl.as_ref(),
+                table_active,
+                delim_expanded,
                 &prose,
                 &mono,
                 window,
@@ -728,33 +1184,52 @@ impl LiveMarkdownEditor {
         self.layout_cache.get(&li).cloned()
     }
 
-    fn hit_test_byte_at_point(&mut self, pos: Point<Pixels>) -> Option<(usize, usize, Option<LinkTarget>, bool)> {
+    fn hit_test_byte_at_point(&mut self, pos: Point<Pixels>) -> Option<HitTestResult> {
         let st = self.scroll.borrow();
         let bounds = st.viewport_bounds;
         if bounds.size.width <= px(1.) || self.doc.lines.is_empty() {
             return None;
         }
         let doc_y = (f32::from(pos.y - bounds.origin.y) + st.scroll_y).max(0.0);
-        let (_, col_width, top_pad) = self.last_col_geo.unwrap_or_else(|| {
+        let (col_left_rel, col_width, top_pad) = self.last_col_geo.unwrap_or_else(|| {
             let g = compute_column_geometry(f32::from(bounds.size.width), self.centered, self.zen_mode);
             (g.col_left_rel, g.col_width, g.top_pad)
         });
         let rel_doc_y = (doc_y - top_pad).max(0.0);
+        let scroll_y = st.scroll_y;
         drop(st);
 
         if rel_doc_y >= self.height_table.total_height() {
-            return Some((self.doc.text.len(), self.doc.lines.len() - 1, None, false));
+            return Some(HitTestResult {
+                raw_byte: self.doc.text.len(),
+                line_ix: self.doc.lines.len() - 1,
+                clicked_link: None,
+                clicked_checkbox: false,
+                phantom_table_cell: None,
+            });
         }
 
-        let li = self
+        let mut li = self
             .height_table
             .line_for_y(rel_doc_y)
             .min(self.doc.lines.len() - 1);
+        if let Some(c) = self.layout_cache.get(&li)
+            && c.total_height <= 0.5
+            && li > 0
+        {
+            li -= 1;
+        }
         let dl = &self.doc.lines[li];
         let raw_line = &self.doc.text[dl.byte_start..dl.byte_end];
 
         let Some(cached) = self.layout_cache.get(&li) else {
-            return Some((dl.byte_start, li, None, false));
+            return Some(HitTestResult {
+                raw_byte: dl.byte_start,
+                line_ix: li,
+                clicked_link: None,
+                clicked_checkbox: false,
+                phantom_table_cell: None,
+            });
         };
 
         // Check checkbox click first.
@@ -764,19 +1239,106 @@ impl LiveMarkdownEditor {
                 size: size(cb_rect.size.width + px(8.), cb_rect.size.height + px(8.)),
             };
             if expanded.contains(&pos) {
-                return Some((dl.byte_start, li, None, true));
+                return Some(HitTestResult {
+                    raw_byte: dl.byte_start,
+                    line_ix: li,
+                    clicked_link: None,
+                    clicked_checkbox: true,
+                    phantom_table_cell: None,
+                });
             }
         }
 
-        let col_left = bounds.origin.x
-            + px(self.last_col_geo.map_or(32.0, |g| g.0));
+        let col_left = bounds.origin.x + px(col_left_rel);
+        let y_line = self.height_table.y_for_line(li);
+
+        if let Some(tr) = &cached.table_row {
+            let rel_x = f32::from(pos.x - col_left);
+            let col_ix = tr
+                .cells
+                .iter()
+                .position(|c| rel_x < c.x_rel + c.width)
+                .unwrap_or_else(|| tr.cells.len().saturating_sub(1));
+            let cell = &tr.cells[col_ix];
+            if cell.inner_range.is_none() {
+                return Some(HitTestResult {
+                    raw_byte: dl.byte_end,
+                    line_ix: li,
+                    clicked_link: None,
+                    clicked_checkbox: false,
+                    phantom_table_cell: Some((li, col_ix)),
+                });
+            }
+            let slice_end = (cell.raw_offset + cell.projected.raw_len).min(raw_line.len());
+            let cell_raw = &raw_line[cell.raw_offset..slice_end];
+            let Some(wl) = cell.shaped.as_ref() else {
+                let local_raw = cell.raw_offset + cell.projected.display_to_raw(cell_raw, 0);
+                let abs_raw = clamp_char_boundary(&self.doc.text, dl.byte_start + local_raw);
+                return Some(HitTestResult {
+                    raw_byte: abs_raw,
+                    line_ix: li,
+                    clicked_link: None,
+                    clicked_checkbox: false,
+                    phantom_table_cell: None,
+                });
+            };
+            let num_rows = wl.wrap_boundaries.len() + 1;
+            let cell_text_top = bounds.origin.y
+                + px(top_pad + y_line - scroll_y + tr.frame_top_margin + tr.cell_pad_y);
+            let cell_text_left = col_left + px(cell.x_rel + TABLE_CELL_PAD_X);
+            let cell_inner_w = (cell.width - 2.0 * TABLE_CELL_PAD_X).max(20.0);
+            let max_local_y = (num_rows as f32 * cached.line_height - 0.5).max(0.0);
+            let local_y = f32::from(pos.y - cell_text_top).clamp(0.0, max_local_y);
+            let wrap_row = ((local_y / cached.line_height).floor() as usize)
+                .min(num_rows.saturating_sub(1));
+            let align_dx = row_align_offset_x(
+                Some(wl),
+                wrap_row,
+                gpui_text_align(cell.align),
+                cell_inner_w,
+                px(cached.line_height),
+            );
+            let local_x = (f32::from(pos.x - cell_text_left) - align_dx).max(0.0);
+            let disp_idx = match wl
+                .closest_index_for_position(point(px(local_x), px(local_y)), px(cached.line_height))
+            {
+                Ok(i) | Err(i) => i,
+            }
+            .min(cell.projected.display_text.len());
+
+            let mut clicked_link = None;
+            if let Ok(exact_i) =
+                wl.index_for_position(point(px(local_x), px(local_y)), px(cached.line_height))
+            {
+                for link in &cell.projected.links {
+                    if link.concealed && exact_i >= link.disp_range.start && exact_i < link.disp_range.end {
+                        clicked_link = Some(link.target.clone());
+                        break;
+                    }
+                }
+            }
+            let local_raw = cell.raw_offset + cell.projected.display_to_raw(cell_raw, disp_idx);
+            let abs_raw = clamp_char_boundary(&self.doc.text, dl.byte_start + local_raw);
+            return Some(HitTestResult {
+                raw_byte: abs_raw,
+                line_ix: li,
+                clicked_link,
+                clicked_checkbox: false,
+                phantom_table_cell: None,
+            });
+        }
+
         let text_left = col_left + px(cached.text_x_rel);
-        let text_top = bounds.origin.y
-            + px(top_pad + self.height_table.y_for_line(li) - self.scroll.borrow().scroll_y
-                + cached.text_y_rel);
+        let text_top = bounds.origin.y + px(top_pad + y_line - scroll_y + cached.text_y_rel);
 
         let Some(wl) = cached.shaped.as_ref() else {
-            return Some((dl.byte_start, li, None, false));
+            return Some(HitTestResult {
+                raw_byte: dl.byte_start,
+                line_ix: li,
+                clicked_link: None,
+                clicked_checkbox: false,
+                phantom_table_cell: None,
+            });
         };
 
         let num_rows = wl.wrap_boundaries.len() + 1;
@@ -785,16 +1347,23 @@ impl LiveMarkdownEditor {
         let local_y = f32::from(pos.y - text_top).clamp(0.0, max_local_y);
         let _ = col_width;
 
-        let disp_idx = match wl.closest_index_for_position(point(px(local_x), px(local_y)), px(cached.line_height)) {
+        let disp_idx = match wl
+            .closest_index_for_position(point(px(local_x), px(local_y)), px(cached.line_height))
+        {
             Ok(i) | Err(i) => i,
         }
         .min(cached.projected.display_text.len());
 
         // Check link click only if user clicked strictly inside a concealed link glyph span.
         let mut clicked_link = None;
-        if let Ok(exact_i) = wl.index_for_position(point(px(local_x), px(local_y)), px(cached.line_height)) {
+        if let Ok(exact_i) =
+            wl.index_for_position(point(px(local_x), px(local_y)), px(cached.line_height))
+        {
             for link in &cached.projected.links {
-                if link.concealed && exact_i >= link.disp_range.start && exact_i < link.disp_range.end {
+                if link.concealed
+                    && exact_i >= link.disp_range.start
+                    && exact_i < link.disp_range.end
+                {
                     clicked_link = Some(link.target.clone());
                     break;
                 }
@@ -803,7 +1372,13 @@ impl LiveMarkdownEditor {
 
         let local_raw = cached.projected.display_to_raw(raw_line, disp_idx);
         let abs_raw = clamp_char_boundary(&self.doc.text, dl.byte_start + local_raw);
-        Some((abs_raw, li, clicked_link, false))
+        Some(HitTestResult {
+            raw_byte: abs_raw,
+            line_ix: li,
+            clicked_link,
+            clicked_checkbox: false,
+            phantom_table_cell: None,
+        })
     }
 
     fn move_vertical(
@@ -825,28 +1400,55 @@ impl LiveMarkdownEditor {
 
         let li = self.doc.line_index_for_byte(self.doc.head);
         let dl = self.doc.lines[li].clone();
-        let local_head = self.doc.head.saturating_sub(dl.byte_start).min(dl.byte_end - dl.byte_start);
-        let (cur_x, vis_row, num_rows, lh) = if let Some(c) = self.ensure_line_cached(li, window, cx) {
-            let disp_idx = c.projected.raw_to_display(local_head);
-            let pt = disp_position_for_index(
-                c.shaped.as_ref(),
-                c.projected.display_text.len(),
-                disp_idx,
-                px(c.line_height),
-            );
-            let row = (f32::from(pt.y) / c.line_height).round().max(0.0) as usize;
-            (f32::from(pt.x), row, c.num_wrap_rows(), c.line_height)
-        } else {
-            (0.0, 0, 1, 24.75)
-        };
+        let local_head = self
+            .doc
+            .head
+            .saturating_sub(dl.byte_start)
+            .min(dl.byte_end - dl.byte_start);
+        let (cur_x, vis_row, num_rows, cur_col_ix) =
+            if let Some(c) = self.ensure_line_cached(li, window, cx) {
+                let (vx, _, _) = raw_offset_to_visual_point(&c, local_head);
+                if let Some(tr) = &c.table_row {
+                    let cix = find_table_cell_for_local_raw(tr, local_head).unwrap_or(0);
+                    let cell = &tr.cells[cix];
+                    let cell_local = local_head
+                        .saturating_sub(cell.raw_offset)
+                        .min(cell.projected.raw_len);
+                    let disp_idx = cell.projected.raw_to_display(cell_local);
+                    let pt = disp_position_for_index(
+                        cell.shaped.as_ref(),
+                        cell.projected.display_text.len(),
+                        disp_idx,
+                        px(c.line_height),
+                    );
+                    let row = (f32::from(pt.y) / c.line_height).round().max(0.0) as usize;
+                    let rows = cell
+                        .shaped
+                        .as_ref()
+                        .map_or(1, |wl| wl.wrap_boundaries.len() + 1);
+                    (vx, row, rows, Some(cix))
+                } else {
+                    let disp_idx = c.projected.raw_to_display(local_head);
+                    let pt = disp_position_for_index(
+                        c.shaped.as_ref(),
+                        c.projected.display_text.len(),
+                        disp_idx,
+                        px(c.line_height),
+                    );
+                    let row = (f32::from(pt.y) / c.line_height).round().max(0.0) as usize;
+                    (vx, row, c.num_wrap_rows(), None)
+                }
+            } else {
+                (0.0, 0, 1, None)
+            };
 
         let target_x = *self.preferred_x.get_or_insert(cur_x);
 
-        let (target_li, target_row) = if delta < 0 {
+        let (mut target_li, target_row, same_cell_col) = if delta < 0 {
             if vis_row > 0 {
-                (li, Some(vis_row - 1))
+                (li, Some(vis_row - 1), cur_col_ix)
             } else if li > 0 {
-                (li - 1, None)
+                (li - 1, None, None)
             } else {
                 self.doc.set_cursor(0, extend);
                 self.ensure_caret_visible();
@@ -854,9 +1456,9 @@ impl LiveMarkdownEditor {
                 return;
             }
         } else if vis_row + 1 < num_rows {
-            (li, Some(vis_row + 1))
+            (li, Some(vis_row + 1), cur_col_ix)
         } else if li + 1 < self.doc.lines.len() {
-            (li + 1, Some(0))
+            (li + 1, Some(0), None)
         } else {
             self.doc.set_cursor(self.doc.text.len(), extend);
             self.ensure_caret_visible();
@@ -864,15 +1466,89 @@ impl LiveMarkdownEditor {
             return;
         };
 
-        let _ = lh;
+        // Skip collapsed GFM table delimiter rows when stepping vertically.
+        if same_cell_col.is_none()
+            && matches!(
+                self.doc.lines[target_li].ctx,
+                LineBlockContext::Table { is_delim: true, .. }
+            )
+        {
+            if delta < 0 {
+                if target_li > 0 {
+                    target_li -= 1;
+                } else {
+                    self.doc.set_cursor(0, extend);
+                    self.ensure_caret_visible();
+                    cx.notify();
+                    return;
+                }
+            } else if target_li + 1 < self.doc.lines.len() {
+                target_li += 1;
+            } else {
+                self.doc.set_cursor(self.doc.text.len(), extend);
+                self.ensure_caret_visible();
+                cx.notify();
+                return;
+            }
+        }
+
         let target_start = self.doc.lines[target_li].byte_start;
         let target_raw = self.doc.line_str(target_li).to_string();
         let new_abs = if let Some(c) = self.ensure_line_cached(target_li, window, cx) {
-            if let Some(wl) = c.shaped.as_ref() {
+            if let Some(tr) = &c.table_row {
+                let mut col_ix = same_cell_col.unwrap_or_else(|| {
+                    tr.cells
+                        .iter()
+                        .position(|cell| target_x < cell.x_rel + cell.width)
+                        .unwrap_or_else(|| tr.cells.len().saturating_sub(1))
+                });
+                if tr.cells[col_ix].inner_range.is_none() {
+                    col_ix = tr
+                        .cells
+                        .iter()
+                        .rposition(|cell| cell.inner_range.is_some())
+                        .unwrap_or(0);
+                }
+                let cell = &tr.cells[col_ix];
+                let slice_end = (cell.raw_offset + cell.projected.raw_len).min(target_raw.len());
+                let cell_raw = &target_raw[cell.raw_offset..slice_end];
+                if let Some(wl) = cell.shaped.as_ref() {
+                    let rows = wl.wrap_boundaries.len() + 1;
+                    let row = target_row
+                        .unwrap_or_else(|| rows.saturating_sub(1))
+                        .min(rows - 1);
+                    let inner_w = (cell.width - 2.0 * TABLE_CELL_PAD_X).max(20.0);
+                    let align_dx = row_align_offset_x(
+                        Some(wl),
+                        row,
+                        gpui_text_align(cell.align),
+                        inner_w,
+                        px(c.line_height),
+                    );
+                    let local_x = (target_x - (cell.x_rel + TABLE_CELL_PAD_X) - align_dx).max(0.0);
+                    let y = row as f32 * c.line_height + c.line_height * 0.5;
+                    let disp_idx = match wl.closest_index_for_position(
+                        point(px(local_x), px(y)),
+                        px(c.line_height),
+                    ) {
+                        Ok(i) | Err(i) => i,
+                    }
+                    .min(cell.projected.display_text.len());
+                    let local_raw = cell.raw_offset + cell.projected.display_to_raw(cell_raw, disp_idx);
+                    target_start + local_raw
+                } else {
+                    target_start + cell.raw_offset + cell.projected.display_to_raw(cell_raw, 0)
+                }
+            } else if let Some(wl) = c.shaped.as_ref() {
                 let rows = wl.wrap_boundaries.len() + 1;
-                let row = target_row.unwrap_or_else(|| rows.saturating_sub(1)).min(rows - 1);
+                let row = target_row
+                    .unwrap_or_else(|| rows.saturating_sub(1))
+                    .min(rows - 1);
+                let local_x = (target_x - c.text_x_rel).max(0.0);
                 let y = row as f32 * c.line_height + c.line_height * 0.5;
-                let disp_idx = match wl.closest_index_for_position(point(px(target_x), px(y)), px(c.line_height)) {
+                let disp_idx = match wl
+                    .closest_index_for_position(point(px(local_x), px(y)), px(c.line_height))
+                {
                     Ok(i) | Err(i) => i,
                 }
                 .min(c.projected.display_text.len());
@@ -1018,12 +1694,23 @@ impl LiveMarkdownEditor {
             "tab" if !ctrl && !alt => {
                 cx.stop_propagation();
                 self.preferred_x = None;
-                self.doc.indent_lines(shift);
-                self.sync_height_table_after_edit();
-                self.ensure_caret_visible();
-                self.reset_caret_blink();
-                cx.emit(LiveEditorEvent::Changed);
-                cx.notify();
+                let prev_ver = self.doc.version;
+                if self.doc.table_tab_move(shift) {
+                    if self.doc.version != prev_ver {
+                        self.sync_height_table_after_edit();
+                        cx.emit(LiveEditorEvent::Changed);
+                    }
+                    self.ensure_caret_visible();
+                    self.reset_caret_blink();
+                    cx.notify();
+                } else {
+                    self.doc.indent_lines(shift);
+                    self.sync_height_table_after_edit();
+                    self.ensure_caret_visible();
+                    self.reset_caret_blink();
+                    cx.emit(LiveEditorEvent::Changed);
+                    cx.notify();
+                }
             }
             "escape" if self.doc.has_selection() => {
                 cx.stop_propagation();
@@ -1266,20 +1953,13 @@ impl EntityInputHandler for LiveMarkdownEditor {
         let (col_left_rel, _, top_pad) = self.last_col_geo?;
         let cached = self.layout_cache.get(&li)?;
         let local_raw = pos_u8.saturating_sub(dl.byte_start);
-        let disp = cached.projected.raw_to_display(local_raw);
-        let rel_pt = disp_position_for_index(
-            cached.shaped.as_ref(),
-            cached.projected.display_text.len(),
-            disp,
-            px(cached.line_height),
-        );
-        let origin_x = element_bounds.origin.x + px(col_left_rel + cached.text_x_rel) + rel_pt.x;
-        let origin_y = element_bounds.origin.y
-            + px(top_pad + self.height_table.y_for_line(li) - st.scroll_y + cached.text_y_rel)
-            + rel_pt.y;
+        let (vx, vy, lh) = raw_offset_to_visual_point(cached, local_raw);
+        let origin_x = element_bounds.origin.x + px(col_left_rel + vx);
+        let origin_y =
+            element_bounds.origin.y + px(top_pad + self.height_table.y_for_line(li) - st.scroll_y + vy);
         Some(Bounds {
             origin: point(origin_x, origin_y),
-            size: size(px(2.), px(cached.line_height)),
+            size: size(px(2.), px(lh)),
         })
     }
 
@@ -1289,8 +1969,8 @@ impl EntityInputHandler for LiveMarkdownEditor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        let (raw_byte, _, _, _) = self.hit_test_byte_at_point(point)?;
-        Some(utf8_to_utf16_offset(&self.doc.text, raw_byte))
+        let hit = self.hit_test_byte_at_point(point)?;
+        Some(utf8_to_utf16_offset(&self.doc.text, hit.raw_byte))
     }
 
     fn set_selected_text_range(
@@ -1314,6 +1994,66 @@ impl EntityInputHandler for LiveMarkdownEditor {
     }
 }
 
+impl LiveMarkdownEditor {
+    fn run_table_action<F>(&mut self, window: &mut Window, cx: &mut Context<Self>, action: F)
+    where
+        F: FnOnce(&mut LiveDocBuffer) -> bool,
+    {
+        if action(&mut self.doc) {
+            self.sync_height_table_after_edit();
+            self.preferred_x = None;
+            self.ensure_caret_visible();
+            self.reset_caret_blink();
+            self.focus_handle.focus(window, cx);
+            cx.emit(LiveEditorEvent::Changed);
+            cx.notify();
+        }
+    }
+}
+
+fn table_tool_pill(
+    id: &'static str,
+    label: impl Into<SharedString>,
+    accent: bool,
+    danger: bool,
+    ed: Entity<LiveMarkdownEditor>,
+    on_press: impl Fn(&mut LiveDocBuffer) -> bool + 'static,
+) -> AnyElement {
+    let text_col = if danger {
+        hex_color(kd::RED)
+    } else if accent {
+        hex_color(kd::ACCENT)
+    } else {
+        hex_color(kd::FG_SUBTLE)
+    };
+    div()
+        .id(id)
+        .h(px(18.))
+        .px_1p5()
+        .rounded(px(4.))
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .text_size(px(11.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(text_col)
+        .hover(move |s| {
+            s.bg(hex_color(kd::BG_PANEL)).text_color(if danger {
+                hex_color(kd::RED)
+            } else {
+                hex_color(kd::FG)
+            })
+        })
+        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+            cx.stop_propagation();
+            ed.update(cx, |this, cx| {
+                this.run_table_action(window, cx, &on_press);
+            });
+        })
+        .child(label.into())
+        .into_any_element()
+}
+
 impl Render for LiveMarkdownEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let scroll_state = self.scroll.borrow();
@@ -1323,8 +2063,9 @@ impl Render for LiveMarkdownEditor {
         let scroll_y = scroll_state.scroll_y;
         drop(scroll_state);
 
-        // Build visible ImageEmbed overlays on the same frame from deterministic heights.
+        // Build visible ImageEmbed overlays & active-table micro-toolbar on the same frame.
         let mut image_overlays: Vec<AnyElement> = Vec::new();
+        let mut table_toolbar: Option<AnyElement> = None;
         if vp_w > 20.0 && vp_h > 20.0 && !self.doc.lines.is_empty() {
             let col_geo = compute_column_geometry(vp_w, self.centered, self.zen_mode);
             let rel_start_y = (scroll_y - col_geo.top_pad - 360.0).max(0.0);
@@ -1402,6 +2143,131 @@ impl Render for LiveMarkdownEditor {
                     image_overlays.push(ov);
                 }
             }
+
+            let caret_li = self.doc.line_index_for_byte(self.doc.head);
+            if let Some(caret_dl) = self.doc.lines.get(caret_li)
+                && let LineBlockContext::Table {
+                    is_header,
+                    is_delim,
+                    table_start_line,
+                    table_end_line,
+                    ..
+                } = caret_dl.ctx
+            {
+                let delim_li = table_start_line + 1;
+                let delim_expanded = is_delim
+                    || self
+                        .doc
+                        .lines
+                        .get(delim_li)
+                        .is_some_and(|ddl| cursor_range_for_line(&self.doc, ddl, true).is_some());
+                let visual_last_li = if table_end_line == delim_li && !delim_expanded {
+                    table_start_line
+                } else {
+                    table_end_line
+                };
+                let y_last = self.height_table.y_for_line(visual_last_li);
+                let frame_h_last = if let Some(cached) = self.layout_cache.get(&visual_last_li) {
+                    let bot_margin = if let Some(tr) = &cached.table_row {
+                        tr.frame_bottom_margin
+                    } else if visual_last_li == delim_li && cached.total_height > 0.5 {
+                        if cached.table_active {
+                            TABLE_TOOLBAR_RESERVE
+                        } else {
+                            8.0
+                        }
+                    } else {
+                        0.0
+                    };
+                    (cached.total_height - bot_margin).max(0.0)
+                } else {
+                    let raw_last = self.doc.line_str(visual_last_li);
+                    let est = crate::live_md::estimate_line_height(
+                        raw_last,
+                        &self.doc.lines[visual_last_li].ctx,
+                        col_geo.col_width,
+                    );
+                    (est - if visual_last_li == delim_li { 0.0 } else { 8.0 }).max(0.0)
+                };
+                let bar_top = col_geo.top_pad + y_last + frame_h_last - scroll_y + 4.0;
+                if bar_top > -28.0 && bar_top < vp_h + 4.0 {
+                    let raw_caret = self.doc.line_str(caret_li);
+                    let local_head = self
+                        .doc
+                        .head
+                        .saturating_sub(caret_dl.byte_start)
+                        .min(raw_caret.len());
+                    let (_, col_ix) = table_cell_at_local_byte(raw_caret, local_head);
+                    let num_cols = self
+                        .doc
+                        .table_column_count(table_start_line, table_end_line);
+                    let aligns = parse_table_alignments(self.doc.line_str(delim_li));
+                    let align_label = match aligns.get(col_ix).copied().unwrap_or(TableAlign::Left) {
+                        TableAlign::Left => "Align: L",
+                        TableAlign::Center => "Align: C",
+                        TableAlign::Right => "Align: R",
+                    };
+                    let ed = cx.entity();
+                    let mut buttons: Vec<AnyElement> = vec![
+                        table_tool_pill("tbl-add-row", "+ Row", true, false, ed.clone(), move |doc| {
+                            doc.table_insert_row_below(caret_li)
+                        }),
+                        table_tool_pill("tbl-add-col", "+ Col", false, false, ed.clone(), move |doc| {
+                            doc.table_insert_col_after(caret_li, col_ix)
+                        }),
+                        table_tool_pill("tbl-align", align_label, false, false, ed.clone(), move |doc| {
+                            doc.table_cycle_col_align(caret_li, col_ix)
+                        }),
+                    ];
+                    if !is_header && !is_delim {
+                        buttons.push(table_tool_pill(
+                            "tbl-del-row",
+                            "− Row",
+                            false,
+                            true,
+                            ed.clone(),
+                            move |doc| doc.table_delete_row(caret_li),
+                        ));
+                    }
+                    if num_cols > 1 {
+                        buttons.push(table_tool_pill(
+                            "tbl-del-col",
+                            "− Col",
+                            false,
+                            true,
+                            ed,
+                            move |doc| doc.table_delete_col(caret_li, col_ix),
+                        ));
+                    }
+                    table_toolbar = Some(
+                        div()
+                            .absolute()
+                            .top(px(bar_top))
+                            .left(px(col_geo.col_left_rel))
+                            .w(px(col_geo.col_width))
+                            .flex()
+                            .justify_end()
+                            .child(
+                                div()
+                                    .h(px(22.))
+                                    .px_1()
+                                    .gap_0p5()
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(6.))
+                                    .bg(hex_color(kd::BG_SIDEBAR))
+                                    .border_1()
+                                    .border_color(hex_color(kd::BORDER))
+                                    .shadow_sm()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .children(buttons),
+                            )
+                            .into_any_element(),
+                    );
+                }
+            }
         }
 
         div()
@@ -1420,14 +2286,22 @@ impl Render for LiveMarkdownEditor {
                     cx.stop_propagation();
                     this.focus_handle.focus(window, cx);
                     this.doc.break_undo_coalescing();
-                    let Some((byte_off, li, clicked_link, clicked_checkbox)) =
-                        this.hit_test_byte_at_point(ev.position)
-                    else {
+                    let Some(hit) = this.hit_test_byte_at_point(ev.position) else {
                         return;
                     };
 
-                    if clicked_checkbox {
-                        if this.doc.toggle_task_on_line(li) {
+                    if let Some((row_li, col_ix)) = hit.phantom_table_cell {
+                        this.doc.table_ensure_cell(row_li, col_ix);
+                        this.sync_height_table_after_edit();
+                        this.preferred_x = None;
+                        this.reset_caret_blink();
+                        cx.emit(LiveEditorEvent::Changed);
+                        cx.notify();
+                        return;
+                    }
+
+                    if hit.clicked_checkbox {
+                        if this.doc.toggle_task_on_line(hit.line_ix) {
                             this.sync_height_table_after_edit();
                             this.reset_caret_blink();
                             cx.emit(LiveEditorEvent::Changed);
@@ -1438,7 +2312,7 @@ impl Render for LiveMarkdownEditor {
 
                     // Follow wikilink / URL unless Alt is held to edit its text directly.
                     if ev.click_count == 1 && !ev.modifiers.alt
-                        && let Some(target) = clicked_link
+                        && let Some(target) = hit.clicked_link
                     {
                         cx.emit(LiveEditorEvent::OpenLink {
                             target,
@@ -1450,13 +2324,13 @@ impl Render for LiveMarkdownEditor {
                     this.preferred_x = None;
                     match ev.click_count {
                         2 => {
-                            this.doc.select_word_at(byte_off);
+                            this.doc.select_word_at(hit.raw_byte);
                         }
                         n if n >= 3 => {
-                            this.doc.select_line_at(byte_off);
+                            this.doc.select_line_at(hit.raw_byte);
                         }
                         _ => {
-                            this.doc.set_cursor(byte_off, ev.modifiers.shift);
+                            this.doc.set_cursor(hit.raw_byte, ev.modifiers.shift);
                             this.dragging = true;
                         }
                     }
@@ -1471,9 +2345,9 @@ impl Render for LiveMarkdownEditor {
                     }
                     return;
                 }
-                if let Some((byte_off, _, _, _)) = this.hit_test_byte_at_point(ev.position) {
-                    if byte_off != this.doc.head {
-                        this.doc.set_cursor(byte_off, true);
+                if let Some(hit) = this.hit_test_byte_at_point(ev.position) {
+                    if hit.raw_byte != this.doc.head {
+                        this.doc.set_cursor(hit.raw_byte, true);
                         this.ensure_caret_visible();
                         cx.notify();
                     }
@@ -1510,6 +2384,7 @@ impl Render for LiveMarkdownEditor {
                 editor: cx.entity(),
             })
             .children(image_overlays)
+            .children(table_toolbar)
             .child(Scrollbar::vertical(&self.scrollbar))
     }
 }
@@ -1540,6 +2415,71 @@ impl IntoElement for LiveCanvasElement {
     type Element = Self;
     fn into_element(self) -> Self::Element {
         self
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_wrapped_selection_rects(
+    shaped: Option<&WrappedLine>,
+    projected: &ProjectedLine,
+    raw_offset: usize,
+    raw_len: usize,
+    ls: usize,
+    le: usize,
+    inc_trailing_pad: bool,
+    text_x: Pixels,
+    text_y: Pixels,
+    line_height_f: f32,
+    align: TextAlign,
+    align_width: f32,
+    sel_bg: gpui_kit::Hsla,
+    window: &mut Window,
+) {
+    let cs = ls.saturating_sub(raw_offset).min(raw_len);
+    let ce = le.saturating_sub(raw_offset).min(raw_len);
+    let ds = projected.raw_to_display(cs);
+    let de = projected.raw_to_display(ce);
+    let disp_len = projected.display_text.len();
+    let lh = px(line_height_f);
+    let p0 = disp_position_for_index(shaped, disp_len, ds, lh);
+    let p1 = disp_position_for_index(shaped, disp_len, de, lh);
+    let r0 = (f32::from(p0.y) / line_height_f).round().max(0.0) as usize;
+    let r1 = (f32::from(p1.y) / line_height_f).round().max(0.0) as usize;
+    let nl_pad = if inc_trailing_pad { 8.0 } else { 0.0 };
+
+    if r0 == r1 {
+        let align_dx = row_align_offset_x(shaped, r0, align, align_width, lh);
+        let x0 = align_dx + f32::from(p0.x);
+        let x1 = align_dx + f32::from(p1.x) + nl_pad;
+        if x1 > x0 {
+            window.paint_quad(fill(
+                Bounds {
+                    origin: point(text_x + px(x0), text_y + p0.y),
+                    size: size(px(x1 - x0), lh),
+                },
+                sel_bg,
+            ));
+        }
+    } else {
+        for r in r0..=r1 {
+            let align_dx = row_align_offset_x(shaped, r, align, align_width, lh);
+            let rx0 = align_dx + if r == r0 { f32::from(p0.x) } else { 0.0 };
+            let rx1 = align_dx
+                + if r == r1 {
+                    f32::from(p1.x) + nl_pad
+                } else {
+                    row_right_x(shaped, r, lh).max(8.0)
+                };
+            if rx1 > rx0 {
+                window.paint_quad(fill(
+                    Bounds {
+                        origin: point(text_x + px(rx0), text_y + px(r as f32 * line_height_f)),
+                        size: size(px(rx1 - rx0), lh),
+                    },
+                    sel_bg,
+                ));
+            }
+        }
     }
 }
 
@@ -1610,26 +2550,39 @@ impl Element for LiveCanvasElement {
                 .line_for_y(rel_end_y)
                 .min(total_lines - 1);
 
+            let mut table_layouts: HashMap<usize, TableBlockLayout> = HashMap::new();
             let mut visible_indices = Vec::with_capacity(last_li.saturating_sub(first_li) + 1);
             for ix in first_li..=last_li {
                 let dl = &ed.doc.lines[ix];
                 let raw_line = &ed.doc.text[dl.byte_start..dl.byte_end];
                 let cursor_local = cursor_range_for_line(&ed.doc, dl, true);
                 let cursor_key = cursor_local.as_ref().map(|r| (r.start, r.end));
+                let (table_span, table_active, delim_expanded) =
+                    table_state_for_line(&ed.doc, &dl.ctx);
 
                 let hit = ed.layout_cache.get(&ix).is_some_and(|c| {
                     c.doc_version == ed.doc.version
                         && c.cursor_key == cursor_key
                         && (c.wrap_width - geo.col_width).abs() < 0.5
                         && c.raw_len == raw_line.len()
+                        && c.table_active == table_active
+                        && c.delim_expanded == delim_expanded
                 });
                 if !hit {
+                    let tbl_ref = table_span.map(|(s, e)| {
+                        &*table_layouts
+                            .entry(s)
+                            .or_insert_with(|| compute_table_layout(&ed.doc, s, e, geo.col_width))
+                    });
                     let cached = shape_cached_line(
                         dl,
                         raw_line,
                         cursor_local,
                         geo.col_width,
                         ed.doc.version,
+                        tbl_ref,
+                        table_active,
+                        delim_expanded,
                         &prose_font,
                         &mono_font,
                         window,
@@ -1697,14 +2650,7 @@ impl Element for LiveCanvasElement {
                     .head
                     .saturating_sub(dl.byte_start)
                     .min(dl.byte_end - dl.byte_start);
-                let disp_ix = c.projected.raw_to_display(local_head);
-                let pt = disp_position_for_index(
-                    c.shaped.as_ref(),
-                    c.projected.display_text.len(),
-                    disp_ix,
-                    px(c.line_height),
-                );
-                (f32::from(pt.x), f32::from(pt.y), c.line_height)
+                raw_offset_to_visual_point(c, local_head)
             });
 
             let mut prose_bold_font = prose_font.clone();
@@ -1759,11 +2705,318 @@ impl Element for LiveCanvasElement {
         window.with_content_mask(Some(ContentMask { bounds: snap.bounds }), |window| {
             // Pass 1: Block cards, accent bars, rules, checkboxes, bullets, and selection rects.
             for (dl, c) in &snap.paint_rows {
+                if c.total_height <= 0.5 {
+                    continue;
+                }
                 let top_y = snap.bounds.origin.y + px(snap.top_pad + c.y_top - snap.scroll_y);
                 let row_h = px(c.total_height);
 
-                // Block background & accents
+                if let Some(tr) = &c.table_row {
+                    let (is_header, is_first, body_row_ix) = match &c.ctx {
+                        LineBlockContext::Table {
+                            is_header,
+                            is_first,
+                            body_row_index,
+                            ..
+                        } => (*is_header, *is_first, *body_row_index),
+                        _ => (false, false, 0),
+                    };
+                    let row_top = top_y + px(tr.frame_top_margin);
+                    let frame_h =
+                        (row_h - px(tr.frame_top_margin + tr.frame_bottom_margin)).max(px(1.));
+                    let row_w = px(tr.table_width);
+                    let bg_col = if is_header {
+                        hex_color(kd::BG_PANEL)
+                    } else if body_row_ix % 2 == 0 {
+                        hex_color(kd::BG_MAIN)
+                    } else {
+                        hex_color(kd::BG_SIDEBAR)
+                    };
+                    let r_top = if is_first { px(6.) } else { px(0.) };
+                    let r_bot = if tr.is_visual_last { px(6.) } else { px(0.) };
+                    let card_h = if tr.is_visual_last {
+                        frame_h
+                    } else {
+                        frame_h + px(0.5)
+                    };
+                    window.paint_quad(quad(
+                        Bounds {
+                            origin: point(col_left, row_top),
+                            size: size(row_w, card_h),
+                        },
+                        gpui_kit::Corners {
+                            top_left: r_top,
+                            top_right: r_top,
+                            bottom_right: r_bot,
+                            bottom_left: r_bot,
+                        },
+                        bg_col,
+                        gpui_kit::Edges {
+                            top: if is_first { px(1.) } else { px(0.) },
+                            right: px(1.),
+                            bottom: if tr.is_visual_last { px(1.) } else { px(0.) },
+                            left: px(1.),
+                        },
+                        hex_color(kd::BORDER),
+                        BorderStyle::Solid,
+                    ));
+
+                    if !tr.is_visual_last {
+                        let sep_h = if is_header { px(1.5) } else { px(1.) };
+                        let sep_col = if is_header {
+                            hex_color(kd::BORDER)
+                        } else {
+                            hex_color(kd::BORDER_SUBTLE)
+                        };
+                        window.paint_quad(fill(
+                            Bounds {
+                                origin: point(col_left + px(1.), row_top + frame_h - sep_h),
+                                size: size(row_w - px(2.), sep_h),
+                            },
+                            sep_col,
+                        ));
+                    }
+
+                    let div_top = row_top + if is_first { px(1.) } else { px(0.) };
+                    let div_h = (frame_h
+                        - if is_first { px(1.) } else { px(0.) }
+                        - if tr.is_visual_last { px(1.) } else { px(0.) })
+                    .max(px(1.));
+                    for (cix, cell) in tr.cells.iter().enumerate() {
+                        if cix >= 1 {
+                            window.paint_quad(fill(
+                                Bounds {
+                                    origin: point(col_left + px(cell.x_rel), div_top),
+                                    size: size(px(1.), div_h),
+                                },
+                                hex_color(kd::BORDER_SUBTLE),
+                            ));
+                        }
+                        if snap.focused && tr.active_col == Some(cix) {
+                            let inset_l = if cix == 0 { 1.0 } else { 0.5 };
+                            let inset_r = if cix + 1 == tr.cells.len() { 1.0 } else { 0.0 };
+                            let inset_t = if is_first { 1.0 } else { 0.0 };
+                            let inset_b = if tr.is_visual_last {
+                                1.0
+                            } else if is_header {
+                                1.5
+                            } else {
+                                1.0
+                            };
+                            window.paint_quad(quad(
+                                Bounds {
+                                    origin: point(
+                                        col_left + px(cell.x_rel + inset_l),
+                                        row_top + px(inset_t),
+                                    ),
+                                    size: size(
+                                        px((cell.width - inset_l - inset_r).max(2.0)),
+                                        (frame_h - px(inset_t + inset_b)).max(px(2.)),
+                                    ),
+                                },
+                                px(2.),
+                                accent_alpha(0x14),
+                                gpui_kit::Edges::all(px(1.5)),
+                                hex_color(kd::ACCENT),
+                                BorderStyle::Solid,
+                            ));
+                        }
+                    }
+
+                    let sel = &snap.selection_range;
+                    let raw_len = dl.byte_end - dl.byte_start;
+                    let row_has_sel =
+                        sel.start < sel.end && sel.start <= dl.byte_end && sel.end >= dl.byte_start;
+                    let ls = sel.start.saturating_sub(dl.byte_start).min(raw_len);
+                    let le = sel.end.saturating_sub(dl.byte_start).min(raw_len);
+                    let inc_nl = sel.end > dl.byte_end;
+
+                    for cell in &tr.cells {
+                        let cell_clip = Bounds {
+                            origin: point(col_left + px(cell.x_rel + 1.0), row_top + px(1.0)),
+                            size: size(
+                                px((cell.width - 2.0).max(1.0)),
+                                (frame_h - px(2.0)).max(px(1.)),
+                            ),
+                        };
+                        let cell_inner_w = (cell.width - 2.0 * TABLE_CELL_PAD_X).max(20.0);
+                        let cell_text_x = col_left + px(cell.x_rel + TABLE_CELL_PAD_X);
+                        let cell_text_y = row_top + px(tr.cell_pad_y);
+                        let cell_align = gpui_text_align(cell.align);
+
+                        window.with_content_mask(
+                            Some(ContentMask { bounds: cell_clip }),
+                            |window| {
+                                if row_has_sel && let Some(ref inner) = cell.inner_range {
+                                    let cell_raw_end = cell.raw_offset + cell.projected.raw_len;
+                                    if ls <= cell_raw_end && le >= cell.raw_offset {
+                                        let cross = le > inner.end && (inc_nl || ls <= inner.start);
+                                        paint_wrapped_selection_rects(
+                                            cell.shaped.as_ref(),
+                                            &cell.projected,
+                                            cell.raw_offset,
+                                            cell.projected.raw_len,
+                                            ls,
+                                            le,
+                                            cross,
+                                            cell_text_x,
+                                            cell_text_y,
+                                            c.line_height,
+                                            cell_align,
+                                            cell_inner_w,
+                                            sel_bg,
+                                            window,
+                                        );
+                                    }
+                                }
+
+                                if let Some(wl) = cell.shaped.as_ref() {
+                                    let align_bounds = Bounds {
+                                        origin: point(cell_text_x, cell_text_y),
+                                        size: size(px(cell_inner_w), frame_h),
+                                    };
+                                    let lh = px(c.line_height);
+                                    let _ = wl.paint_background(
+                                        point(cell_text_x, cell_text_y),
+                                        lh,
+                                        cell_align,
+                                        Some(align_bounds),
+                                        window,
+                                        cx,
+                                    );
+                                    let _ = wl.paint(
+                                        point(cell_text_x, cell_text_y),
+                                        lh,
+                                        cell_align,
+                                        Some(align_bounds),
+                                        window,
+                                        cx,
+                                    );
+                                }
+
+                                if let Some(mr) = &snap.marked_range
+                                    && mr.start < mr.end
+                                    && mr.start <= dl.byte_end
+                                    && mr.end >= dl.byte_start
+                                    && cell.inner_range.is_some()
+                                {
+                                    let ms = mr.start.saturating_sub(dl.byte_start).min(raw_len);
+                                    let me = mr.end.saturating_sub(dl.byte_start).min(raw_len);
+                                    let cell_raw_end = cell.raw_offset + cell.projected.raw_len;
+                                    if ms <= cell_raw_end && me >= cell.raw_offset {
+                                        let ds = cell.projected.raw_to_display(
+                                            ms.saturating_sub(cell.raw_offset)
+                                                .min(cell.projected.raw_len),
+                                        );
+                                        let de = cell.projected.raw_to_display(
+                                            me.saturating_sub(cell.raw_offset)
+                                                .min(cell.projected.raw_len),
+                                        );
+                                        let disp_len = cell.projected.display_text.len();
+                                        let lh = px(c.line_height);
+                                        let p0 = disp_position_for_index(
+                                            cell.shaped.as_ref(),
+                                            disp_len,
+                                            ds,
+                                            lh,
+                                        );
+                                        let p1 = disp_position_for_index(
+                                            cell.shaped.as_ref(),
+                                            disp_len,
+                                            de,
+                                            lh,
+                                        );
+                                        if (f32::from(p1.x) - f32::from(p0.x)) > 1.0
+                                            && p0.y == p1.y
+                                        {
+                                            let row = (f32::from(p0.y) / c.line_height)
+                                                .round()
+                                                .max(0.0)
+                                                as usize;
+                                            let align_dx = row_align_offset_x(
+                                                cell.shaped.as_ref(),
+                                                row,
+                                                cell_align,
+                                                cell_inner_w,
+                                                lh,
+                                            );
+                                            let uy = cell_text_y + p0.y + lh - px(2.);
+                                            window.paint_quad(fill(
+                                                Bounds {
+                                                    origin: point(
+                                                        cell_text_x + px(align_dx) + p0.x,
+                                                        uy,
+                                                    ),
+                                                    size: size(p1.x - p0.x, px(1.5)),
+                                                },
+                                                hex_color(kd::YELLOW),
+                                            ));
+                                        }
+                                    }
+                                }
+                            },
+                        );
+                    }
+                    continue;
+                }
+
+                // Expanded table delimiter band or non-table block backgrounds & accents
                 match &c.ctx {
+                    LineBlockContext::Table {
+                        is_delim: true,
+                        is_last,
+                        ..
+                    } => {
+                        let bot_margin = if *is_last {
+                            if c.table_active {
+                                TABLE_TOOLBAR_RESERVE
+                            } else {
+                                8.0
+                            }
+                        } else {
+                            0.0
+                        };
+                        let frame_h = (row_h - px(bot_margin)).max(px(1.));
+                        let r_bot = if *is_last { px(6.) } else { px(0.) };
+                        let card_h = if *is_last {
+                            frame_h
+                        } else {
+                            frame_h + px(0.5)
+                        };
+                        window.paint_quad(quad(
+                            Bounds {
+                                origin: point(col_left, top_y),
+                                size: size(col_w, card_h),
+                            },
+                            gpui_kit::Corners {
+                                top_left: px(0.),
+                                top_right: px(0.),
+                                bottom_right: r_bot,
+                                bottom_left: r_bot,
+                            },
+                            hex_color(kd::BG_DEEP),
+                            gpui_kit::Edges {
+                                top: px(0.),
+                                right: px(1.),
+                                bottom: if *is_last { px(1.) } else { px(0.) },
+                                left: px(1.),
+                            },
+                            hex_color(kd::BORDER),
+                            BorderStyle::Solid,
+                        ));
+                        if !*is_last {
+                            window.paint_quad(fill(
+                                Bounds {
+                                    origin: point(
+                                        col_left + px(1.),
+                                        top_y + frame_h - px(1.),
+                                    ),
+                                    size: size(col_w - px(2.), px(1.)),
+                                },
+                                hex_color(kd::BORDER_SUBTLE),
+                            ));
+                        }
+                    }
                     LineBlockContext::CodeFence {
                         is_first, is_last, ..
                     } => {
@@ -1984,52 +3237,22 @@ impl Element for LiveCanvasElement {
                     let ls = sel.start.saturating_sub(dl.byte_start).min(raw_len);
                     let le = sel.end.saturating_sub(dl.byte_start).min(raw_len);
                     let inc_nl = sel.end > dl.byte_end;
-                    let ds = c.projected.raw_to_display(ls);
-                    let de = c.projected.raw_to_display(le);
-                    let disp_len = c.projected.display_text.len();
-                    let lh = px(c.line_height);
-                    let text_x = col_left + px(c.text_x_rel);
-                    let text_y = top_y + px(c.text_y_rel);
-                    let p0 = disp_position_for_index(c.shaped.as_ref(), disp_len, ds, lh);
-                    let p1 = disp_position_for_index(c.shaped.as_ref(), disp_len, de, lh);
-                    let r0 = (f32::from(p0.y) / c.line_height).round().max(0.0) as usize;
-                    let r1 = (f32::from(p1.y) / c.line_height).round().max(0.0) as usize;
-                    let nl_pad = if inc_nl { 8.0 } else { 0.0 };
-
-                    if r0 == r1 {
-                        let x0 = f32::from(p0.x);
-                        let x1 = f32::from(p1.x) + nl_pad;
-                        if x1 > x0 {
-                            window.paint_quad(fill(
-                                Bounds {
-                                    origin: point(text_x + px(x0), text_y + p0.y),
-                                    size: size(px(x1 - x0), lh),
-                                },
-                                sel_bg,
-                            ));
-                        }
-                    } else {
-                        for r in r0..=r1 {
-                            let rx0 = if r == r0 { f32::from(p0.x) } else { 0.0 };
-                            let rx1 = if r == r1 {
-                                f32::from(p1.x) + nl_pad
-                            } else {
-                                row_right_x(c.shaped.as_ref(), r, lh).max(8.0)
-                            };
-                            if rx1 > rx0 {
-                                window.paint_quad(fill(
-                                    Bounds {
-                                        origin: point(
-                                            text_x + px(rx0),
-                                            text_y + px(r as f32 * c.line_height),
-                                        ),
-                                        size: size(px(rx1 - rx0), lh),
-                                    },
-                                    sel_bg,
-                                ));
-                            }
-                        }
-                    }
+                    paint_wrapped_selection_rects(
+                        c.shaped.as_ref(),
+                        &c.projected,
+                        0,
+                        raw_len,
+                        ls,
+                        le,
+                        inc_nl,
+                        col_left + px(c.text_x_rel),
+                        top_y + px(c.text_y_rel),
+                        c.line_height,
+                        TextAlign::Left,
+                        snap.col_width,
+                        sel_bg,
+                        window,
+                    );
                 }
 
                 // Inline code & highlight run backgrounds + shaped text
@@ -2068,12 +3291,12 @@ impl Element for LiveCanvasElement {
 
             // Pass 2: Blinking Caret
             if snap.focused && snap.caret_visible
-                && let Some((rel_x, rel_y, lh)) = snap.caret_disp_x_y
+                && let Some((vx, vy, lh)) = snap.caret_disp_x_y
                 && let Some(c) = snap.caret_cached.as_ref()
             {
-                let caret_x = col_left + px(c.text_x_rel + rel_x);
-                let caret_y = snap.bounds.origin.y
-                    + px(snap.top_pad + c.y_top - snap.scroll_y + c.text_y_rel + rel_y + 1.0);
+                let caret_x = col_left + px(vx);
+                let caret_y =
+                    snap.bounds.origin.y + px(snap.top_pad + c.y_top - snap.scroll_y + vy + 1.0);
                 window.paint_quad(fill(
                     Bounds {
                         origin: point(caret_x, caret_y),

@@ -3417,17 +3417,29 @@ impl VKarmaApp {
         match crate::vault::move_entry(&src, &dest_dir) {
             Ok(new_path) => {
                 if new_path != src_canon {
-                    if dest_dir != self.workspace_root {
-                        self.expanded_dirs.insert(dest_dir);
-                    }
+                    let dest_is_visible =
+                        dest_dir == self.workspace_root || self.expanded_dirs.contains(&dest_dir);
                     let name = new_path
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("item")
                         .to_string();
-                    self.selected_tree_path = Some(new_path.clone());
+                    self.selected_tree_path = Some(if dest_is_visible {
+                        new_path.clone()
+                    } else {
+                        dest_dir.clone()
+                    });
                     self.apply_path_relocation(&src, &new_path, cx);
-                    self.set_status(format!("Moved {name}"), cx);
+                    let msg = if dest_dir != self.workspace_root {
+                        let dest_name = dest_dir
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("folder");
+                        format!("Moved {name} → {dest_name}")
+                    } else {
+                        format!("Moved {name}")
+                    };
+                    self.set_status(msg, cx);
                 }
             }
             Err(err) => {
