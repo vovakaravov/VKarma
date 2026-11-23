@@ -275,7 +275,7 @@ pub fn canvas_color_u32(color: Option<&str>) -> Option<u32> {
         "2" => Some(0xb6927b), // Orange
         "3" => Some(0xc4b28a), // Yellow
         "4" => Some(0x87a987), // Green
-        "5" => Some(0x7ca6d8), // Blue / Aqua
+        "5" => Some(0x8ba4b0), // Blue / Aqua
         "6" => Some(0xa292a3), // Violet
         _ => {
             let hex = c.strip_prefix('#')?;

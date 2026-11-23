@@ -30,7 +30,7 @@ pub fn render_quick_switcher_overlay(
         .id("quick-switcher-backdrop")
         .absolute()
         .inset_0()
-        .bg(hex_alpha(0x0e0b14a8))
+        .bg(hex_alpha(0x0e0c0fa8))
         .flex()
         .justify_center()
         .items_start()

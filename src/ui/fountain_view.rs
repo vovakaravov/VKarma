@@ -295,7 +295,7 @@ fn script_palette(paper_light: bool) -> ScriptPalette {
         }
     } else {
         ScriptPalette {
-            sheet_bg: hex_color(0x1a1524),
+            sheet_bg: hex_color(0x1c1a1e),
             sheet_border: hex_color(kd::BORDER_SUBTLE),
             ink: hex_color(kd::FG),
             muted: hex_color(kd::FG_MUTED),

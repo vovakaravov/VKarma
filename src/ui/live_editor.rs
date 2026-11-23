@@ -325,7 +325,7 @@ fn build_text_runs(
             let background_color = if st.highlight {
                 Some(hex_alpha(0xc4b28a44))
             } else if st.code && !st.syntax_muted {
-                Some(hex_alpha(0x241d33e0))
+                Some(hex_alpha(0x28262be0))
             } else {
                 None
             };

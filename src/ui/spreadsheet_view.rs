@@ -440,7 +440,7 @@ pub fn render_spreadsheet_tab(
                                         .border_color(hex_color(kd::ACCENT))
                                 })
                                 .when(!is_active_cell, |d| {
-                                    d.hover(|s| s.bg(hex_alpha(0x241d3399)))
+                                    d.hover(|s| s.bg(hex_alpha(0x28262b99)))
                                 })
                                 .cursor_pointer()
                                 .on_mouse_down(

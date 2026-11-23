@@ -5,7 +5,7 @@
 <h1 align="center">VKarma</h1>
 
 <p align="center">
-  Native, GPU-accelerated Rust + <a href="https://gpui.rs">GPUI</a> all-in-one workspace for Markdown &amp; MDX notes, Fountain screenplays, Typst documents, spreadsheets, code, and 12 native format studios — styled in <strong>Amethyst Obsidian</strong> with zero Chromium/Electron overhead.
+  Native, GPU-accelerated Rust + <a href="https://gpui.rs">GPUI</a> all-in-one workspace for Markdown &amp; MDX notes, Fountain screenplays, Typst documents, spreadsheets, code, and 12 native format studios — styled in <strong>Kanagawa Dragon</strong> with an Obsidian-violet accent and zero Chromium/Electron overhead.
 </p>
 
 ---
