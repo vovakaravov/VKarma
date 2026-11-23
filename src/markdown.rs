@@ -1,16 +1,21 @@
 use crate::theme::{hex_alpha, hex_color, kd};
 use crate::vault::{VaultIndex, is_image_extension};
+use gpui_kit::component::h_flex;
 use gpui_kit::component::text::{
-    MarkdownNode, MarkdownParseContext, MarkdownPlugin, markdown_ast,
+    MarkdownNode, MarkdownParseContext, MarkdownPlugin, TextView, markdown_ast,
 };
 use gpui_kit::{
-    App, ImageSource, IntoElement, ObjectFit, ParentElement as _, SharedUri, Styled,
+    App, ImageSource, IntoElement, ObjectFit, ParentElement as _, SharedString, SharedUri, Styled,
     StyledImage as _, Window, div, img, prelude::FluentBuilder as _, px, relative,
 };
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use std::borrow::Cow;
-use std::fs;
+use std::collections::hash_map::DefaultHasher;
+use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub const VKARMA_NOTE_SCHEME: &str = "vkarma-note://";
 pub const VKARMA_IMG_SCHEME: &str = "vkarma-img://";
@@ -59,6 +64,7 @@ pub struct StyledImageSpec {
     pub width: Option<f32>,
     pub height: Option<f32>,
     pub align: ImageAlign,
+    pub wrap: bool,
     pub rounded: bool,
     pub border: bool,
     pub caption: Option<String>,
@@ -70,10 +76,18 @@ impl Default for StyledImageSpec {
             width: None,
             height: None,
             align: ImageAlign::Left,
+            wrap: false,
             rounded: true,
             border: false,
             caption: None,
         }
+    }
+}
+
+impl StyledImageSpec {
+    /// True when the image floats left or right so adjacent text wraps beside it.
+    pub fn is_floated(&self) -> bool {
+        self.wrap && matches!(self.align, ImageAlign::Left | ImageAlign::Right)
     }
 }
 
@@ -91,6 +105,16 @@ pub fn parse_image_spec(alt: &str) -> StyledImageSpec {
             "left" => spec.align = ImageAlign::Left,
             "center" | "centre" => spec.align = ImageAlign::Center,
             "right" => spec.align = ImageAlign::Right,
+            "wrap" | "float" => spec.wrap = true,
+            "float-left" | "left-wrap" => {
+                spec.align = ImageAlign::Left;
+                spec.wrap = true;
+            }
+            "float-right" | "right-wrap" => {
+                spec.align = ImageAlign::Right;
+                spec.wrap = true;
+            }
+            "nowrap" | "block" => spec.wrap = false,
             "rounded" | "round" => spec.rounded = true,
             "square" | "sharp" => spec.rounded = false,
             "border" | "framed" => spec.border = true,
@@ -125,14 +149,259 @@ pub fn parse_image_spec(alt: &str) -> StyledImageSpec {
     spec
 }
 
+/// Serialize a `StyledImageSpec` into compact, Obsidian-compatible pipe-separated options.
+pub fn format_image_spec(spec: &StyledImageSpec) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    match (spec.width, spec.height) {
+        (Some(w), Some(h)) => {
+            parts.push(format!("{}x{}", w.round().max(1.0) as u32, h.round().max(1.0) as u32));
+        }
+        (Some(w), None) => {
+            parts.push(format!("{}", w.round().max(1.0) as u32));
+        }
+        _ => {}
+    }
+
+    match spec.align {
+        ImageAlign::Center => parts.push("center".to_string()),
+        ImageAlign::Right => parts.push("right".to_string()),
+        ImageAlign::Left => {
+            if spec.wrap {
+                parts.push("left".to_string());
+            }
+        }
+    }
+
+    if spec.wrap {
+        parts.push("wrap".to_string());
+    }
+    if !spec.rounded {
+        parts.push("square".to_string());
+    }
+    if spec.border {
+        parts.push("border".to_string());
+    }
+    if let Some(caption) = spec.caption.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(caption.to_string());
+    }
+
+    parts.join("|")
+}
+
+/// Probe intrinsic pixel `(width, height)` from image header bytes (PNG, GIF, BMP, WebP, JPEG).
+pub fn read_image_dimensions_from_bytes(data: &[u8]) -> Option<(f32, f32)> {
+    // PNG: 8-byte signature + IHDR chunk (width at 16..20, height at 20..24)
+    if data.len() >= 24 && &data[..8] == b"\x89PNG\r\n\x1a\n" && &data[12..16] == b"IHDR" {
+        let w = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
+        let h = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
+        if w > 0 && h > 0 {
+            return Some((w as f32, h as f32));
+        }
+        return None;
+    }
+
+    // GIF: GIF87a / GIF89a
+    if data.len() >= 10 && (&data[..6] == b"GIF87a" || &data[..6] == b"GIF89a") {
+        let w = u16::from_le_bytes([data[6], data[7]]) as u32;
+        let h = u16::from_le_bytes([data[8], data[9]]) as u32;
+        if w > 0 && h > 0 {
+            return Some((w as f32, h as f32));
+        }
+        return None;
+    }
+
+    // BMP: "BM" + DIB header
+    if data.len() >= 26 && &data[..2] == b"BM" {
+        let dib_size = u32::from_le_bytes([data[14], data[15], data[16], data[17]]);
+        let (w, h) = if dib_size >= 40 {
+            let w = i32::from_le_bytes([data[18], data[19], data[20], data[21]]).unsigned_abs();
+            let h = i32::from_le_bytes([data[22], data[23], data[24], data[25]]).unsigned_abs();
+            (w, h)
+        } else if dib_size == 12 {
+            let w = u16::from_le_bytes([data[18], data[19]]) as u32;
+            let h = u16::from_le_bytes([data[20], data[21]]) as u32;
+            (w, h)
+        } else {
+            (0, 0)
+        };
+        if w > 0 && h > 0 {
+            return Some((w as f32, h as f32));
+        }
+        return None;
+    }
+
+    // WebP: RIFF....WEBP + VP8 / VP8L / VP8X
+    if data.len() >= 25 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        match &data[12..16] {
+            b"VP8 " if data.len() >= 30 && data[23..26] == [0x9d, 0x01, 0x2a] => {
+                let w = (u16::from_le_bytes([data[26], data[27]]) & 0x3fff) as u32;
+                let h = (u16::from_le_bytes([data[28], data[29]]) & 0x3fff) as u32;
+                if w > 0 && h > 0 {
+                    return Some((w as f32, h as f32));
+                }
+            }
+            b"VP8L" if data[20] == 0x2f => {
+                let bits = u32::from_le_bytes([data[21], data[22], data[23], data[24]]);
+                let w = (bits & 0x3fff) + 1;
+                let h = ((bits >> 14) & 0x3fff) + 1;
+                return Some((w as f32, h as f32));
+            }
+            b"VP8X" if data.len() >= 30 => {
+                let w =
+                    1 + (data[24] as u32 | ((data[25] as u32) << 8) | ((data[26] as u32) << 16));
+                let h =
+                    1 + (data[27] as u32 | ((data[28] as u32) << 8) | ((data[29] as u32) << 16));
+                return Some((w as f32, h as f32));
+            }
+            _ => {}
+        }
+        return None;
+    }
+
+    // JPEG: SOI (FF D8) + SOF0..SOF15 markers (excluding DHT C4, JPG C8, DAC CC)
+    if data.len() >= 4 && data[0] == 0xFF && data[1] == 0xD8 {
+        let mut i = 2usize;
+        while i + 1 < data.len() {
+            while i < data.len() && data[i] != 0xFF {
+                i += 1;
+            }
+            while i < data.len() && data[i] == 0xFF {
+                i += 1;
+            }
+            if i >= data.len() {
+                break;
+            }
+            let marker = data[i];
+            i += 1;
+
+            // Standalone markers with no payload length
+            if matches!(marker, 0x00 | 0x01 | 0xD0..=0xD9) {
+                if marker == 0xD9 {
+                    break;
+                }
+                continue;
+            }
+
+            if i + 1 >= data.len() {
+                break;
+            }
+            let seg_len = u16::from_be_bytes([data[i], data[i + 1]]) as usize;
+            if seg_len < 2 || i + seg_len > data.len() {
+                break;
+            }
+
+            if matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+                if seg_len >= 7 && i + 6 < data.len() {
+                    let h = u16::from_be_bytes([data[i + 3], data[i + 4]]) as u32;
+                    let w = u16::from_be_bytes([data[i + 5], data[i + 6]]) as u32;
+                    if w > 0 && h > 0 {
+                        return Some((w as f32, h as f32));
+                    }
+                }
+                return None;
+            }
+
+            i += seg_len;
+        }
+    }
+
+    None
+}
+
+/// Read intrinsic pixel dimensions of an image file from up to 64 KB of header bytes.
+pub fn read_image_dimensions(path: &Path) -> Option<(f32, f32)> {
+    let file = File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(4096);
+    file.take(65536).read_to_end(&mut buf).ok()?;
+    read_image_dimensions_from_bytes(&buf)
+}
+
+/// Compute rendered `(width, height)` in logical pixels for an image given its spec,
+/// optional intrinsic natural dimensions, and available column width.
+pub fn compute_image_display_size(
+    spec: &StyledImageSpec,
+    natural_dims: Option<(f32, f32)>,
+    col_width: f32,
+) -> (f32, f32) {
+    let max_w = col_width.max(120.0);
+    let ratio = natural_dims
+        .and_then(|(nw, nh)| (nw > 1.0 && nh > 1.0).then_some(nw / nh))
+        .unwrap_or(16.0 / 10.0);
+
+    match (spec.width, spec.height) {
+        (Some(raw_w), Some(raw_h)) => {
+            let w = raw_w.clamp(48.0, max_w);
+            let scale = (w / raw_w.max(1.0)).min(1.0);
+            let h = (raw_h * scale).clamp(36.0, 900.0);
+            (w, h)
+        }
+        (Some(raw_w), None) => {
+            let w = raw_w.clamp(48.0, max_w);
+            let h = (w / ratio).clamp(36.0, 900.0);
+            (w, h)
+        }
+        (None, Some(raw_h)) => {
+            let mut h = raw_h.clamp(36.0, 900.0);
+            let w = (h * ratio).clamp(48.0, max_w);
+            if w / ratio < h {
+                h = (w / ratio).clamp(36.0, 900.0);
+            }
+            (w, h)
+        }
+        (None, None) => {
+            if let Some((nat_w, _)) = natural_dims {
+                let auto_max_w = if spec.is_floated() {
+                    (max_w * 0.44).clamp(150.0, max_w)
+                } else {
+                    max_w
+                };
+                let mut w = nat_w.min(auto_max_w).clamp(48.0, max_w);
+                let mut h = w / ratio;
+                let max_auto_h = 460.0;
+                if h > max_auto_h {
+                    h = max_auto_h;
+                    w = (h * ratio).clamp(48.0, max_w);
+                }
+                if h < 36.0 {
+                    h = 36.0;
+                }
+                (w, h)
+            } else if spec.is_floated() {
+                let w = (max_w * 0.42).clamp(160.0, 320.0);
+                (w, (w / 1.5).clamp(96.0, 260.0))
+            } else {
+                let w = max_w.clamp(220.0, 480.0);
+                (w, (w / 1.6).clamp(120.0, 280.0))
+            }
+        }
+    }
+}
+
+type WrapLinkCallback = Arc<dyn Fn(&SharedString, &mut Window, &mut App) + Send + Sync>;
+
 #[derive(Debug, Clone)]
 struct StyledImageData {
     path: PathBuf,
     spec: StyledImageSpec,
+    natural_dims: Option<(f32, f32)>,
+    wrap_markdown: Option<String>,
 }
 
-#[derive(Default)]
-pub struct StyledImagePlugin;
+#[derive(Clone, Default)]
+pub struct StyledImagePlugin {
+    on_link_click: Option<WrapLinkCallback>,
+}
+
+impl StyledImagePlugin {
+    pub fn with_link_handler(
+        handler: impl Fn(&SharedString, &mut Window, &mut App) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            on_link_click: Some(Arc::new(handler)),
+        }
+    }
+}
 
 impl MarkdownPlugin for StyledImagePlugin {
     fn is_block(&self) -> bool {
@@ -146,24 +415,59 @@ impl MarkdownPlugin for StyledImagePlugin {
     fn parse(
         &self,
         node: &markdown_ast::Node,
-        _cx: &MarkdownParseContext<'_>,
+        cx: &MarkdownParseContext<'_>,
     ) -> Option<MarkdownNode> {
         let markdown_ast::Node::Paragraph(paragraph) = node else {
             return None;
         };
-        let [markdown_ast::Node::Image(image)] = paragraph.children.as_slice() else {
+        let Some(markdown_ast::Node::Image(image)) = paragraph.children.first() else {
             return None;
         };
         let decoded = decode_uri_payload(&image.url, VKARMA_IMG_SCHEME)?;
         let path = PathBuf::from(decoded);
         let spec = parse_image_spec(&image.alt);
+
+        let wrap_markdown = if paragraph.children.len() > 1 {
+            if !spec.is_floated() {
+                return None;
+            }
+            let start = paragraph.children[1].position()?.start.offset;
+            let end = paragraph.position.as_ref()?.end.offset;
+            let rest = cx.source().get(start..end)?.trim();
+            if rest.is_empty() {
+                None
+            } else {
+                Some(rest.to_string())
+            }
+        } else {
+            None
+        };
+
+        let natural_dims = path.is_file().then(|| read_image_dimensions(&path)).flatten();
+
         let caption_or_name = spec.caption.clone().unwrap_or_else(|| {
             path.file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("image")
                 .to_string()
         });
-        Some(MarkdownNode::new(self.name(), StyledImageData { path, spec }).text(caption_or_name))
+        let text = match &wrap_markdown {
+            Some(rest) if !rest.is_empty() => format!("{caption_or_name} {rest}"),
+            _ => caption_or_name,
+        };
+
+        Some(
+            MarkdownNode::new(
+                self.name(),
+                StyledImageData {
+                    path,
+                    spec,
+                    natural_dims,
+                    wrap_markdown,
+                },
+            )
+            .text(text),
+        )
     }
 
     fn render(&self, node: &MarkdownNode, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
@@ -177,63 +481,107 @@ impl MarkdownPlugin for StyledImagePlugin {
             ImageAlign::Right => div().flex().justify_end(),
         };
 
-        if !data.path.is_file() {
-            return justify
-                .w_full()
-                .my_2()
+        let radius = if data.spec.rounded { px(8.) } else { px(0.) };
+        let is_floated_row = data.spec.is_floated() && data.wrap_markdown.is_some();
+
+        let frame: gpui_kit::AnyElement = if !data.path.is_file() {
+            div()
+                .px_3()
+                .py_2()
+                .rounded(px(6.))
+                .bg(hex_color(kd::BG_PANEL))
+                .border_1()
+                .border_color(hex_color(kd::RED))
+                .text_xs()
+                .text_color(hex_color(kd::RED))
+                .when(is_floated_row, |this| this.max_w(px(320.)).flex_shrink_0())
+                .child(format!("Missing image: {}", data.path.display()))
+                .into_any_element()
+        } else {
+            let (disp_w, disp_h) = if is_floated_row {
+                let (w, h) = compute_image_display_size(&data.spec, data.natural_dims, 460.0);
+                (Some(w), Some(h))
+            } else {
+                match (data.spec.width, data.spec.height) {
+                    (Some(_), None) if data.natural_dims.is_some() => {
+                        let (w, h) =
+                            compute_image_display_size(&data.spec, data.natural_dims, 1600.0);
+                        (Some(w), Some(h))
+                    }
+                    _ => (
+                        data.spec.width.map(|w| w.clamp(24., 1600.)),
+                        data.spec.height.map(|h| h.clamp(24., 1200.)),
+                    ),
+                }
+            };
+
+            let img_el = img(data.path.clone())
+                .object_fit(ObjectFit::Contain)
+                .max_w(relative(1.))
+                .when_some(disp_w, |this, w| this.w(px(w.clamp(24., 1600.))))
+                .when_some(disp_h, |this, h| this.h(px(h.clamp(24., 1200.))))
+                .rounded(radius);
+
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .max_w(relative(1.))
+                .when(is_floated_row, |this| this.flex_shrink_0())
                 .child(
                     div()
-                        .px_3()
-                        .py_2()
-                        .rounded(px(6.))
-                        .bg(hex_color(kd::BG_PANEL))
-                        .border_1()
-                        .border_color(hex_color(kd::RED))
-                        .text_xs()
-                        .text_color(hex_color(kd::RED))
-                        .child(format!("Missing image: {}", data.path.display())),
+                        .overflow_hidden()
+                        .rounded(radius)
+                        .when(data.spec.border, |this| {
+                            this.border_1()
+                                .border_color(hex_color(kd::BORDER))
+                                .bg(hex_alpha(0x0e0c0f80))
+                                .p_1()
+                        })
+                        .child(img_el),
                 )
-                .into_any_element();
+                .when_some(data.spec.caption.clone(), |this, caption| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .italic()
+                            .text_color(hex_color(kd::FG_MUTED))
+                            .when_some(disp_w, |d, w| d.max_w(px(w.clamp(24., 1600.))))
+                            .when(data.spec.align == ImageAlign::Center, |d| d.text_center())
+                            .when(data.spec.align == ImageAlign::Right, |d| d.text_right())
+                            .child(caption),
+                    )
+                })
+                .into_any_element()
+        };
+
+        if let Some(wrap_md) = data.wrap_markdown.as_ref().filter(|_| data.spec.is_floated()) {
+            let mut hasher = DefaultHasher::new();
+            data.path.hash(&mut hasher);
+            wrap_md.hash(&mut hasher);
+            let tv_id: SharedString = format!("md-wrap-{:x}", hasher.finish()).into();
+
+            let link_cb = self.on_link_click.clone();
+            let mut wrap_tv = TextView::markdown(tv_id, wrap_md.clone())
+                .image_source(resolve_inline_image_source)
+                .selectable(true)
+                .w_full()
+                .text_size(px(15.))
+                .line_height(relative(1.65))
+                .text_color(hex_color(kd::FG));
+            if let Some(cb) = link_cb {
+                wrap_tv = wrap_tv.on_link_click(move |url, _, window, cx| {
+                    cb(url, window, cx);
+                });
+            }
+
+            let text_col = div().flex_1().min_w_0().child(wrap_tv);
+            let row = h_flex().w_full().items_start().gap_4().my_2();
+            return match data.spec.align {
+                ImageAlign::Right => row.child(text_col).child(frame).into_any_element(),
+                _ => row.child(frame).child(text_col).into_any_element(),
+            };
         }
-
-        let radius = if data.spec.rounded { px(8.) } else { px(0.) };
-        let img_el = img(data.path.clone())
-            .object_fit(ObjectFit::Contain)
-            .max_w(relative(1.))
-            .when_some(data.spec.width, |this, w| this.w(px(w.clamp(24., 1600.))))
-            .when_some(data.spec.height, |this, h| {
-                this.h(px(h.clamp(24., 1200.)))
-            })
-            .rounded(radius);
-
-        let frame = div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .max_w(relative(1.))
-            .child(
-                div()
-                    .overflow_hidden()
-                    .rounded(radius)
-                    .when(data.spec.border, |this| {
-                        this.border_1()
-                            .border_color(hex_color(kd::BORDER))
-                            .bg(hex_alpha(0x0e0c0f80))
-                            .p_1()
-                    })
-                    .child(img_el),
-            )
-            .when_some(data.spec.caption.clone(), |this, caption| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .italic()
-                        .text_color(hex_color(kd::FG_MUTED))
-                        .when(data.spec.align == ImageAlign::Center, |d| d.text_center())
-                        .when(data.spec.align == ImageAlign::Right, |d| d.text_right())
-                        .child(caption),
-                )
-            });
 
         justify.w_full().my_2().child(frame).into_any_element()
     }
@@ -381,7 +729,25 @@ pub fn preprocess_markdown_with_options(
         out.push_str(&converted);
 
         if idx + 1 < lines.len() {
+            let cur_trim = line.trim();
             let next_raw = lines[idx + 1].trim_end_matches('\r');
+            let next_trim = next_raw.trim();
+
+            if is_standalone_floated_image_line(cur_trim)
+                && next_trim.is_empty()
+                && lines.get(idx + 2).is_some_and(|l| {
+                    let t = l.trim();
+                    !t.is_empty() && !is_block_starter_line(t) && !is_standalone_image_line(t)
+                })
+            {
+                // Join a floated wrap image with the immediately following prose paragraph
+                // (omitting one blank line so CommonMark groups them into one paragraph
+                // that StyledImagePlugin intercepts as a side-by-side float row).
+                out.push('\n');
+                idx += 2;
+                continue;
+            }
+
             if should_insert_hard_break(line, &converted, next_raw) {
                 out.push_str("  ");
             }
@@ -391,6 +757,32 @@ pub fn preprocess_markdown_with_options(
     }
 
     out
+}
+
+fn is_standalone_image_line(trimmed: &str) -> bool {
+    trimmed
+        .strip_prefix("![[")
+        .and_then(|s| s.strip_suffix("]]"))
+        .is_some_and(|inner| !inner.is_empty() && !inner.contains("[["))
+        || (trimmed.starts_with("![")
+            && parse_std_md_image(trimmed).is_some_and(|(consumed, _, _)| consumed == trimmed.len()))
+}
+
+fn is_standalone_floated_image_line(trimmed: &str) -> bool {
+    if let Some(inner) = trimmed.strip_prefix("![[").and_then(|s| s.strip_suffix("]]"))
+        && !inner.is_empty()
+        && !inner.contains("[[")
+        && !inner.contains("]]")
+    {
+        let (target, spec_str) = inner.split_once('|').unwrap_or((inner, ""));
+        return is_image_extension(target.trim()) && parse_image_spec(spec_str).is_floated();
+    }
+    if let Some((consumed, alt, _)) = parse_std_md_image(trimmed)
+        && consumed == trimmed.len()
+    {
+        return parse_image_spec(alt).is_floated();
+    }
+    false
 }
 
 fn should_insert_hard_break(raw_line: &str, converted_line: &str, next_raw: &str) -> bool {
@@ -412,9 +804,7 @@ fn should_insert_hard_break(raw_line: &str, converted_line: &str, next_raw: &str
     }
 
     // Standalone embeds / images on their own line don't need trailing spaces
-    if (cur_trim.starts_with("![[") && cur_trim.ends_with("]]"))
-        || (nxt_trim.starts_with("![[") && nxt_trim.ends_with("]]"))
-    {
+    if is_standalone_image_line(cur_trim) || is_standalone_image_line(nxt_trim) {
         return false;
     }
 
@@ -1382,5 +1772,108 @@ See [[Other Note#Sec|My Link]] and `[[Ignored Code]]`.
             toggled,
             "Link [[Alpha]] here.\n- [ ] First task\n- [ ] Second task with [[Alpha|A]]\n"
         );
+    }
+
+    #[test]
+    fn image_spec_parses_and_formats_float_wrap_roundtrip() {
+        let s = parse_image_spec("320 | left | wrap | border | Hero Shot");
+        assert_eq!(s.width, Some(320.0));
+        assert_eq!(s.height, None);
+        assert_eq!(s.align, ImageAlign::Left);
+        assert!(s.wrap);
+        assert!(s.is_floated());
+        assert!(s.border);
+        assert_eq!(s.caption.as_deref(), Some("Hero Shot"));
+        assert_eq!(format_image_spec(&s), "320|left|wrap|border|Hero Shot");
+        assert_eq!(parse_image_spec(&format_image_spec(&s)), s);
+
+        let rw = parse_image_spec("260|right-wrap|square");
+        assert_eq!(rw.width, Some(260.0));
+        assert_eq!(rw.align, ImageAlign::Right);
+        assert!(rw.wrap);
+        assert!(!rw.rounded);
+        assert_eq!(format_image_spec(&rw), "260|right|wrap|square");
+
+        let center = parse_image_spec("480|center|nowrap");
+        assert_eq!(center.align, ImageAlign::Center);
+        assert!(!center.wrap);
+        assert!(!center.is_floated());
+        assert_eq!(format_image_spec(&center), "480|center");
+    }
+
+    #[test]
+    fn probes_image_header_dimensions_across_formats() {
+        // Minimal PNG header (640x360)
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&[0, 0, 0, 13]);
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&640u32.to_be_bytes());
+        png.extend_from_slice(&360u32.to_be_bytes());
+        assert_eq!(read_image_dimensions_from_bytes(&png), Some((640.0, 360.0)));
+
+        // Minimal GIF89a header (320x240)
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&320u16.to_le_bytes());
+        gif.extend_from_slice(&240u16.to_le_bytes());
+        assert_eq!(read_image_dimensions_from_bytes(&gif), Some((320.0, 240.0)));
+
+        // Minimal BMP header (800x600)
+        let mut bmp = vec![0u8; 26];
+        bmp[0..2].copy_from_slice(b"BM");
+        bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+        bmp[18..22].copy_from_slice(&800i32.to_le_bytes());
+        bmp[22..26].copy_from_slice(&(-600i32).to_le_bytes());
+        assert_eq!(read_image_dimensions_from_bytes(&bmp), Some((800.0, 600.0)));
+
+        // Minimal WebP VP8L header (500x300)
+        let mut webp = vec![0u8; 25];
+        webp[0..4].copy_from_slice(b"RIFF");
+        webp[8..12].copy_from_slice(b"WEBP");
+        webp[12..16].copy_from_slice(b"VP8L");
+        webp[20] = 0x2f;
+        let packed = (500u32 - 1) | ((300u32 - 1) << 14);
+        webp[21..25].copy_from_slice(&packed.to_le_bytes());
+        assert_eq!(read_image_dimensions_from_bytes(&webp), Some((500.0, 300.0)));
+
+        // Minimal JPEG SOF0 header (1280x720)
+        let jpeg = vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00, // APP0 dummy
+            0xFF, 0xC0, 0x00, 0x0B, 0x08, // SOF0 + len + precision
+            0x02, 0xD0, // height = 720
+            0x05, 0x00, // width = 1280
+            0x03, 0x01, 0x11, 0x00,
+        ];
+        assert_eq!(read_image_dimensions_from_bytes(&jpeg), Some((1280.0, 720.0)));
+
+        assert_eq!(read_image_dimensions_from_bytes(b"not an image"), None);
+    }
+
+    #[test]
+    fn preprocess_joins_floated_image_with_following_paragraph_for_read_mode() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("pic.png"), [137u8, 80, 78, 71]).unwrap();
+        let vault = VaultIndex::build(root, false);
+
+        let raw = "\
+![[pic.png|240|left|wrap]]
+
+First prose line
+Second prose line
+
+## Next Heading
+![[pic.png|300|center]]
+
+After center image.
+";
+        let pre = preprocess_obsidian_markdown(raw, &root.join("note.md"), &vault, 0);
+        // Floated image joins across the blank line into the same paragraph
+        assert!(pre.contains("![240|left|wrap](vkarma-img://"));
+        assert!(!pre.contains("pic.png)\n\nFirst prose line"));
+        assert!(pre.contains("pic.png)\nFirst prose line  \nSecond prose line\n"));
+        // Center non-wrapped image keeps blank line separator intact
+        assert!(pre.contains("![300|center](vkarma-img://"));
+        assert!(pre.contains("pic.png)\n\nAfter center image."));
     }
 }

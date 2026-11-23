@@ -823,10 +823,19 @@ impl VKarmaApp {
             }
         });
 
+        let weak_app_for_wrap = cx.weak_entity();
+        let image_plugin = StyledImagePlugin::with_link_handler(move |url, window, cx| {
+            let _ = weak_app_for_wrap.update(cx, |app, cx| {
+                let side = app.active_pane;
+                let tab_id = app.active_tab_ref().map(|t| t.id).unwrap_or(0);
+                app.handle_markdown_link(tab_id, side, url, window, cx);
+            });
+        });
+
         let markdown_extensions = MarkdownExtensions::default()
             .frontmatter()
             .plugin(FrontmatterPlugin::new())
-            .plugin(StyledImagePlugin)
+            .plugin(image_plugin)
             .plugin(SceneBreakPlugin)
             .parser_revision(1);
 

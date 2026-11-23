@@ -4,7 +4,10 @@ use crate::live_md::{
     parse_table_alignments, project_line, project_table_cells, table_cell_at_local_byte,
     utf8_to_utf16_offset, utf16_to_utf8_offset,
 };
-use crate::markdown::{ImageAlign, parse_image_spec};
+use crate::markdown::{
+    ImageAlign, StyledImageSpec, compute_image_display_size, parse_image_spec,
+    read_image_dimensions,
+};
 use crate::theme::{accent_alpha, hex_alpha, hex_color, kd};
 use crate::vault::VaultIndex;
 use gpui_kit::component::ActiveTheme as _;
@@ -17,7 +20,7 @@ use gpui_kit::{
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render,
     ScrollEvent, SharedString, Size, StrikethroughStyle, Style, Styled, StyledImage as _,
     TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine, div, fill, img, point,
-    px, quad, relative, size,
+    prelude::FluentBuilder as _, px, quad, relative, size,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -162,6 +165,44 @@ struct CachedTableRow {
     is_visual_last: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizeHandleCorner {
+    BottomRight,
+    BottomLeft,
+    TopRight,
+    TopLeft,
+    RightEdge,
+    LeftEdge,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveImageResize {
+    line_ix: usize,
+    corner: ResizeHandleCorner,
+    start_mouse: Point<Pixels>,
+    start_width: f32,
+    aspect_ratio: f32,
+    preview_width: f32,
+    preview_height: f32,
+    align: ImageAlign,
+    spec: StyledImageSpec,
+    max_width: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FloatExclusion {
+    y_end: f32,
+    side: ImageAlign,
+    width: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LineFloatLayout {
+    left_inset: f32,
+    right_inset: f32,
+    clear_top_spacer: f32,
+}
+
 struct CachedLine {
     doc_version: u64,
     cursor_key: Option<(usize, usize)>,
@@ -169,6 +210,10 @@ struct CachedLine {
     raw_len: usize,
     table_active: bool,
     delim_expanded: bool,
+    extra_left_inset: f32,
+    extra_right_inset: f32,
+    clear_top_spacer: f32,
+    img_dims_key: Option<(u32, u32)>,
     ctx: LineBlockContext,
     projected: ProjectedLine,
     shaped: Option<WrappedLine>,
@@ -412,14 +457,6 @@ fn line_text_indent_x(ctx: &LineBlockContext, prefix_visual: &PrefixVisual) -> f
         LineBlockContext::CodeFence { .. } | LineBlockContext::Frontmatter { .. } => 14.0,
         _ => 0.0,
     }
-}
-
-fn image_embed_dimensions(alt: &str, col_width: f32) -> (f32, f32, ImageAlign) {
-    let spec = parse_image_spec(alt);
-    let max_w = (col_width - 16.0).max(120.0);
-    let w = spec.width.unwrap_or(520.0).min(max_w).max(64.0);
-    let h = spec.height.unwrap_or((w * 0.56).min(340.0)).clamp(64.0, 620.0);
-    (w, h, spec.align)
 }
 
 fn resolve_image_file(target: &str, doc_path: &Path, vault: &VaultIndex) -> Option<PathBuf> {
@@ -678,6 +715,8 @@ fn shape_cached_line(
     table_layout: Option<&TableBlockLayout>,
     table_active: bool,
     delim_expanded: bool,
+    float_layout: LineFloatLayout,
+    resolved_img: Option<(f32, f32, bool)>,
     prose_font: &Font,
     mono_font: &Font,
     window: &Window,
@@ -711,6 +750,10 @@ fn shape_cached_line(
                     raw_len: raw_line.len(),
                     table_active,
                     delim_expanded,
+                    extra_left_inset: 0.0,
+                    extra_right_inset: 0.0,
+                    clear_top_spacer: 0.0,
+                    img_dims_key: None,
                     ctx: dl.ctx.clone(),
                     projected: empty_proj,
                     shaped: None,
@@ -757,6 +800,10 @@ fn shape_cached_line(
                 raw_len: raw_line.len(),
                 table_active,
                 delim_expanded,
+                extra_left_inset: 0.0,
+                extra_right_inset: 0.0,
+                clear_top_spacer: 0.0,
+                img_dims_key: None,
                 ctx: dl.ctx.clone(),
                 projected,
                 shaped,
@@ -815,7 +862,12 @@ fn shape_cached_line(
 
             let is_visual_last =
                 *is_last || (*is_header && *table_end_line == *table_start_line + 1 && !delim_expanded);
-            let frame_top_margin = if *is_first { 6.0 } else { 0.0 };
+            let clear_top = if *is_first {
+                float_layout.clear_top_spacer
+            } else {
+                0.0
+            };
+            let frame_top_margin = (if *is_first { 6.0 } else { 0.0 }) + clear_top;
             let frame_bottom_margin = if is_visual_last {
                 if table_active {
                     TABLE_TOOLBAR_RESERVE
@@ -838,6 +890,10 @@ fn shape_cached_line(
                 raw_len: raw_line.len(),
                 table_active,
                 delim_expanded,
+                extra_left_inset: 0.0,
+                extra_right_inset: 0.0,
+                clear_top_spacer: clear_top,
+                img_dims_key: None,
                 ctx: dl.ctx.clone(),
                 projected: ProjectedLine {
                     display_text: String::new(),
@@ -869,7 +925,7 @@ fn shape_cached_line(
 
     let projected = project_line(raw_line, &dl.ctx, cursor_local);
     let (font_size_f, lh_f, base_pt, base_pb) = line_typography(&dl.ctx);
-    let indent_x = line_text_indent_x(&dl.ctx, &projected.prefix_visual);
+    let indent_x = float_layout.left_inset + line_text_indent_x(&dl.ctx, &projected.prefix_visual);
     let right_pad = if matches!(
         dl.ctx,
         LineBlockContext::CodeFence { .. }
@@ -880,7 +936,7 @@ fn shape_cached_line(
     } else {
         4.0
     };
-    let avail_text_w = (col_width - indent_x - right_pad).max(120.0);
+    let avail_text_w = (col_width - indent_x - float_layout.right_inset - right_pad).max(120.0);
 
     let shaped = if projected.display_text.is_empty() {
         None
@@ -898,18 +954,37 @@ fn shape_cached_line(
         .as_ref()
         .map_or(1, |wl| wl.wrap_boundaries.len() + 1) as f32;
 
-    let total_height = match &dl.ctx {
+    let (total_height, img_dims_key) = match &dl.ctx {
         LineBlockContext::ImageEmbed { alt, .. } => {
+            let (img_w, img_h, is_floated) = resolved_img.unwrap_or_else(|| {
+                let s = parse_image_spec(alt);
+                let max_w = if s.is_floated() {
+                    (col_width - 140.0).max(150.0)
+                } else {
+                    (col_width - 16.0).max(120.0)
+                };
+                let (w, h) = compute_image_display_size(&s, None, max_w);
+                (w, h, s.is_floated())
+            });
             let text_h = if projected.display_text.is_empty() {
                 0.0
             } else {
                 wrap_rows * lh_f + 4.0
             };
-            let (_, img_h, _) = image_embed_dimensions(alt, col_width);
-            text_h + img_h + 14.0
+            let total = if is_floated {
+                float_layout.clear_top_spacer + text_h + 4.0
+            } else {
+                float_layout.clear_top_spacer + text_h + img_h + 14.0
+            };
+            (total, Some((img_w.round() as u32, img_h.round() as u32)))
         }
-        LineBlockContext::Blank | LineBlockContext::SceneBreak => lh_f,
-        _ => base_pt + wrap_rows * lh_f + base_pb,
+        LineBlockContext::Blank | LineBlockContext::SceneBreak => {
+            (float_layout.clear_top_spacer + lh_f, None)
+        }
+        _ => (
+            float_layout.clear_top_spacer + base_pt + wrap_rows * lh_f + base_pb,
+            None,
+        ),
     };
 
     CachedLine {
@@ -919,6 +994,10 @@ fn shape_cached_line(
         raw_len: raw_line.len(),
         table_active,
         delim_expanded,
+        extra_left_inset: float_layout.left_inset,
+        extra_right_inset: float_layout.right_inset,
+        clear_top_spacer: float_layout.clear_top_spacer,
+        img_dims_key,
         ctx: dl.ctx.clone(),
         projected,
         shaped,
@@ -927,7 +1006,7 @@ fn shape_cached_line(
         total_height,
         y_top: 0.0,
         text_x_rel: indent_x,
-        text_y_rel: base_pt,
+        text_y_rel: float_layout.clear_top_spacer + base_pt,
         checkbox_rect: None,
     }
 }
@@ -952,6 +1031,10 @@ pub struct LiveMarkdownEditor {
     scrollbar: LiveEditorScrollbarHandle,
     height_table: LineHeightTable,
     layout_cache: HashMap<usize, Rc<CachedLine>>,
+    image_dims_cache: HashMap<PathBuf, Option<(f32, f32)>>,
+    selected_image_line: Option<usize>,
+    active_image_resize: Option<ActiveImageResize>,
+    max_float_y_end: f32,
     last_col_geo: Option<(f32, f32, f32)>,
     preferred_x: Option<f32>,
     dragging: bool,
@@ -990,6 +1073,10 @@ impl LiveMarkdownEditor {
             scrollbar,
             height_table,
             layout_cache: HashMap::new(),
+            image_dims_cache: HashMap::new(),
+            selected_image_line: None,
+            active_image_resize: None,
+            max_float_y_end: 0.0,
             last_col_geo: None,
             preferred_x: None,
             dragging: false,
@@ -1028,6 +1115,12 @@ impl LiveMarkdownEditor {
     ) {
         self.doc.reset_text(raw, line_0based, col_chars);
         self.layout_cache.clear();
+        if self.image_dims_cache.len() > 128 {
+            self.image_dims_cache.clear();
+        }
+        self.selected_image_line = None;
+        self.active_image_resize = None;
+        self.max_float_y_end = 0.0;
         let col_w = self.last_col_geo.map_or(760.0, |g| g.1);
         self.height_table = LineHeightTable::from_lines(&self.doc.lines, &self.doc.text, col_w);
         self.preferred_x = None;
@@ -1037,6 +1130,7 @@ impl LiveMarkdownEditor {
     }
 
     pub fn insert_text_at_caret(&mut self, s: &str, cx: &mut Context<Self>) {
+        self.selected_image_line = None;
         self.doc.insert_text(s);
         self.sync_height_table_after_edit();
         self.preferred_x = None;
@@ -1052,6 +1146,7 @@ impl LiveMarkdownEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.selected_image_line = None;
         let b = self.doc.byte_from_line_col(line_0based, 0);
         self.doc.set_cursor(b, false);
         self.preferred_x = None;
@@ -1068,10 +1163,271 @@ impl LiveMarkdownEditor {
         cx.notify();
     }
 
+    fn validate_selected_image(&mut self) {
+        if let Some(ix) = self.selected_image_line {
+            let valid = self
+                .doc
+                .lines
+                .get(ix)
+                .is_some_and(|dl| matches!(dl.ctx, LineBlockContext::ImageEmbed { .. }));
+            if !valid {
+                self.selected_image_line = None;
+            }
+        }
+    }
+
     fn sync_height_table_after_edit(&mut self) {
         let col_w = self.last_col_geo.map_or(760.0, |g| g.1);
         self.height_table
             .sync_lines(&self.doc.lines, &self.doc.text, col_w);
+        self.validate_selected_image();
+    }
+
+    fn natural_image_dims(&mut self, target: &str) -> Option<(f32, f32)> {
+        let path = resolve_image_file(target, &self.doc_path, &self.vault)?;
+        if let Some(&cached) = self.image_dims_cache.get(&path) {
+            return cached;
+        }
+        let dims = read_image_dimensions(&path);
+        self.image_dims_cache.insert(path, dims);
+        dims
+    }
+
+    fn resolve_image_box(
+        &mut self,
+        ix: usize,
+        target: &str,
+        alt: &str,
+        col_width: f32,
+    ) -> (f32, f32, StyledImageSpec) {
+        if let Some(active) = &self.active_image_resize
+            && active.line_ix == ix
+        {
+            return (
+                active.preview_width,
+                active.preview_height,
+                active.spec.clone(),
+            );
+        }
+        let spec = parse_image_spec(alt);
+        let max_w = if spec.is_floated() {
+            (col_width - 140.0).max(150.0)
+        } else {
+            (col_width - 16.0).max(120.0)
+        };
+        let nat = self.natural_image_dims(target);
+        let (w, h) = compute_image_display_size(&spec, nat, max_w);
+        (w, h, spec)
+    }
+
+    fn update_image_spec_action(
+        &mut self,
+        line_ix: usize,
+        spec: StyledImageSpec,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.doc.update_image_embed_spec(line_ix, &spec) {
+            self.selected_image_line = Some(line_ix);
+            self.layout_cache.clear();
+            self.sync_height_table_after_edit();
+            self.preferred_x = None;
+            self.reset_caret_blink();
+            self.focus_handle.focus(window, cx);
+            cx.emit(LiveEditorEvent::Changed);
+            cx.notify();
+        }
+    }
+
+    fn prepare_layout_for_bounds(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        padding_y: f32,
+        window: &Window,
+        cx: &App,
+    ) -> (ColumnGeometry, f32, Vec<usize>, bool) {
+        let vp_w = f32::from(bounds.size.width);
+        let vp_h = f32::from(bounds.size.height);
+        let geo = compute_column_geometry(vp_w, self.centered, self.zen_mode);
+        self.last_col_geo = Some((geo.col_left_rel, geo.col_width, geo.top_pad));
+
+        let total_lines = self.doc.lines.len();
+        if total_lines == 0 {
+            let st = self.scroll.borrow();
+            return (geo, st.scroll_y, Vec::new(), false);
+        }
+
+        let scroll_y = {
+            let mut st = self.scroll.borrow_mut();
+            st.viewport_bounds = bounds;
+            st.scroll_y
+        };
+
+        let rel_start_y = (scroll_y - geo.top_pad - padding_y).max(0.0);
+        let rel_end_y = (scroll_y + vp_h - geo.top_pad + padding_y).max(0.0);
+        let first_li = self.height_table.line_for_y(rel_start_y);
+        let last_li = self
+            .height_table
+            .line_for_y(rel_end_y)
+            .min(total_lines - 1);
+        let scan_start = first_li.saturating_sub(64);
+
+        let (prose_font, mono_font) = self.resolved_fonts(window, cx);
+        let mut cur_y = self.height_table.y_for_line(scan_start);
+        let mut active_floats: Vec<FloatExclusion> = Vec::new();
+        let mut max_float_y_end = 0.0f32;
+        let mut table_layouts: HashMap<usize, TableBlockLayout> = HashMap::new();
+        let mut visible_indices = Vec::with_capacity(last_li.saturating_sub(first_li) + 1);
+        let mut any_image_visible = false;
+
+        for ix in scan_start..=last_li {
+            active_floats.retain(|f| f.y_end > cur_y + 1.0);
+
+            let dl = self.doc.lines[ix].clone();
+            let clears_float = matches!(
+                &dl.ctx,
+                LineBlockContext::Heading { level: 1 | 2, .. }
+                    | LineBlockContext::Table { .. }
+                    | LineBlockContext::CodeFence { .. }
+                    | LineBlockContext::Frontmatter { .. }
+                    | LineBlockContext::MdxBlock { .. }
+                    | LineBlockContext::ImageEmbed { .. }
+            );
+
+            let float_layout = if clears_float {
+                if !active_floats.is_empty() {
+                    let max_end = active_floats
+                        .iter()
+                        .map(|f| f.y_end)
+                        .fold(cur_y, f32::max);
+                    let spacer = (max_end - cur_y + 8.0).max(0.0);
+                    active_floats.clear();
+                    LineFloatLayout {
+                        left_inset: 0.0,
+                        right_inset: 0.0,
+                        clear_top_spacer: spacer,
+                    }
+                } else {
+                    LineFloatLayout::default()
+                }
+            } else {
+                let mut left_inset = 0.0f32;
+                let mut right_inset = 0.0f32;
+                for f in &active_floats {
+                    match f.side {
+                        ImageAlign::Left => left_inset = left_inset.max(f.width),
+                        ImageAlign::Right => right_inset = right_inset.max(f.width),
+                        ImageAlign::Center => {}
+                    }
+                }
+                let max_insets = (geo.col_width - 140.0).max(0.0);
+                if left_inset + right_inset > max_insets && left_inset + right_inset > 0.0 {
+                    let scale = max_insets / (left_inset + right_inset);
+                    left_inset *= scale;
+                    right_inset *= scale;
+                }
+                LineFloatLayout {
+                    left_inset,
+                    right_inset,
+                    clear_top_spacer: 0.0,
+                }
+            };
+
+            let resolved_img_spec = if let LineBlockContext::ImageEmbed { target, alt } = &dl.ctx {
+                if ix >= first_li {
+                    any_image_visible = true;
+                }
+                Some(self.resolve_image_box(ix, target, alt, geo.col_width))
+            } else {
+                None
+            };
+            let resolved_img = resolved_img_spec
+                .as_ref()
+                .map(|(w, h, s)| (*w, *h, s.is_floated()));
+            let expected_img_key = resolved_img
+                .map(|(w, h, _)| (w.round() as u32, h.round() as u32));
+
+            let raw_line = &self.doc.text[dl.byte_start..dl.byte_end];
+            let cursor_local = cursor_range_for_line(&self.doc, &dl, true);
+            let cursor_key = cursor_local.as_ref().map(|r| (r.start, r.end));
+            let (table_span, table_active, delim_expanded) =
+                table_state_for_line(&self.doc, &dl.ctx);
+
+            let hit = self.layout_cache.get(&ix).is_some_and(|c| {
+                c.doc_version == self.doc.version
+                    && c.cursor_key == cursor_key
+                    && (c.wrap_width - geo.col_width).abs() < 0.5
+                    && c.raw_len == raw_line.len()
+                    && c.table_active == table_active
+                    && c.delim_expanded == delim_expanded
+                    && (c.extra_left_inset - float_layout.left_inset).abs() < 0.5
+                    && (c.extra_right_inset - float_layout.right_inset).abs() < 0.5
+                    && (c.clear_top_spacer - float_layout.clear_top_spacer).abs() < 0.5
+                    && c.img_dims_key == expected_img_key
+            });
+
+            let total_h = if hit {
+                let c = &self.layout_cache[&ix];
+                let h = c.total_height;
+                self.height_table.set_height(ix, h);
+                h
+            } else {
+                let tbl_ref = table_span.map(|(s, e)| {
+                    &*table_layouts
+                        .entry(s)
+                        .or_insert_with(|| compute_table_layout(&self.doc, s, e, geo.col_width))
+                });
+                let cached = shape_cached_line(
+                    &dl,
+                    raw_line,
+                    cursor_local,
+                    geo.col_width,
+                    self.doc.version,
+                    tbl_ref,
+                    table_active,
+                    delim_expanded,
+                    float_layout,
+                    resolved_img,
+                    &prose_font,
+                    &mono_font,
+                    window,
+                );
+                let h = cached.total_height;
+                self.height_table.set_height(ix, h);
+                self.layout_cache.insert(ix, Rc::new(cached));
+                h
+            };
+
+            if let Some((img_w, img_h, ref spec)) = resolved_img_spec
+                && spec.is_floated()
+            {
+                let text_h = (total_h - float_layout.clear_top_spacer - 4.0).max(0.0);
+                let img_y_start = cur_y + float_layout.clear_top_spacer + text_h + 6.0;
+                let img_y_end = img_y_start + img_h;
+                max_float_y_end = max_float_y_end.max(img_y_end);
+                active_floats.push(FloatExclusion {
+                    y_end: img_y_end,
+                    side: spec.align,
+                    width: img_w + 18.0,
+                });
+                any_image_visible = true;
+            }
+
+            cur_y += total_h;
+            if ix >= first_li {
+                visible_indices.push(ix);
+            }
+        }
+
+        self.max_float_y_end = max_float_y_end;
+        let content_total_h = self.height_table.total_height().max(max_float_y_end + 12.0);
+        {
+            let mut st = self.scroll.borrow_mut();
+            st.total_height = geo.top_pad + content_total_h + (vp_h * 0.45).max(160.0);
+            LiveEditorScrollbarHandle::clamp_scroll(&mut st);
+        }
+        let settled_scroll_y = self.scroll.borrow().scroll_y;
+        (geo, settled_scroll_y, visible_indices, any_image_visible)
     }
 
     fn reset_caret_blink(&mut self) {
@@ -1162,6 +1518,21 @@ impl LiveMarkdownEditor {
                 && c.delim_expanded == delim_expanded
         });
         if !hit {
+            let prev_float = self
+                .layout_cache
+                .get(&li)
+                .map(|c| LineFloatLayout {
+                    left_inset: c.extra_left_inset,
+                    right_inset: c.extra_right_inset,
+                    clear_top_spacer: c.clear_top_spacer,
+                })
+                .unwrap_or_default();
+            let resolved_img = if let LineBlockContext::ImageEmbed { target, alt } = &dl.ctx {
+                let (w, h, s) = self.resolve_image_box(li, target, alt, col_w);
+                Some((w, h, s.is_floated()))
+            } else {
+                None
+            };
             let tbl = table_span.map(|(s, e)| compute_table_layout(&self.doc, s, e, col_w));
             let (prose, mono) = self.resolved_fonts(window, cx);
             let raw_line = &self.doc.text[dl.byte_start..dl.byte_end];
@@ -1174,6 +1545,8 @@ impl LiveMarkdownEditor {
                 tbl.as_ref(),
                 table_active,
                 delim_expanded,
+                prev_float,
+                resolved_img,
                 &prose,
                 &mono,
                 window,
@@ -1388,6 +1761,12 @@ impl LiveMarkdownEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .selected_image_line
+            .is_some_and(|img_li| self.doc.line_index_for_byte(self.doc.head) != img_li)
+        {
+            self.selected_image_line = None;
+        }
         if self.doc.lines.is_empty() {
             return;
         }
@@ -1654,6 +2033,20 @@ impl LiveMarkdownEditor {
             "backspace" if !alt => {
                 cx.stop_propagation();
                 self.preferred_x = None;
+                if let Some(img_li) = self.selected_image_line
+                    && self.doc.line_index_for_byte(self.doc.head) != img_li
+                {
+                    if self.doc.delete_line(img_li) {
+                        self.selected_image_line = None;
+                        self.layout_cache.clear();
+                        self.sync_height_table_after_edit();
+                        self.ensure_caret_visible();
+                        self.reset_caret_blink();
+                        cx.emit(LiveEditorEvent::Changed);
+                        cx.notify();
+                    }
+                    return;
+                }
                 self.doc.backspace(ctrl);
                 self.sync_height_table_after_edit();
                 self.ensure_caret_visible();
@@ -1664,6 +2057,20 @@ impl LiveMarkdownEditor {
             "delete" if !alt => {
                 cx.stop_propagation();
                 self.preferred_x = None;
+                if let Some(img_li) = self.selected_image_line
+                    && self.doc.line_index_for_byte(self.doc.head) != img_li
+                {
+                    if self.doc.delete_line(img_li) {
+                        self.selected_image_line = None;
+                        self.layout_cache.clear();
+                        self.sync_height_table_after_edit();
+                        self.ensure_caret_visible();
+                        self.reset_caret_blink();
+                        cx.emit(LiveEditorEvent::Changed);
+                        cx.notify();
+                    }
+                    return;
+                }
                 self.doc.delete(ctrl);
                 self.sync_height_table_after_edit();
                 self.ensure_caret_visible();
@@ -1674,6 +2081,24 @@ impl LiveMarkdownEditor {
             "enter" if !alt => {
                 cx.stop_propagation();
                 self.preferred_x = None;
+                if let Some(img_li) = self.selected_image_line
+                    && self.doc.line_index_for_byte(self.doc.head) != img_li
+                {
+                    self.selected_image_line = None;
+                    if img_li + 1 < self.doc.lines.len() {
+                        let next_start = self.doc.lines[img_li + 1].byte_start;
+                        self.doc.set_cursor(next_start, false);
+                    } else if let Some(dl) = self.doc.lines.get(img_li) {
+                        let end = dl.byte_end;
+                        self.doc.replace_range(end..end, "\n", EditKind::Atomic);
+                        self.sync_height_table_after_edit();
+                        cx.emit(LiveEditorEvent::Changed);
+                    }
+                    self.ensure_caret_visible();
+                    self.reset_caret_blink();
+                    cx.notify();
+                    return;
+                }
                 if ctrl {
                     let li = self.doc.line_index_for_byte(self.doc.head);
                     if self.doc.toggle_task_on_line(li) {
@@ -1712,11 +2137,25 @@ impl LiveMarkdownEditor {
                     cx.notify();
                 }
             }
-            "escape" if self.doc.has_selection() => {
-                cx.stop_propagation();
-                self.doc.set_cursor(self.doc.head, false);
-                self.reset_caret_blink();
-                cx.notify();
+            "escape" => {
+                if self.active_image_resize.take().is_some() {
+                    cx.stop_propagation();
+                    self.dragging = false;
+                    cx.notify();
+                    return;
+                }
+                if self.selected_image_line.take().is_some() {
+                    cx.stop_propagation();
+                    self.reset_caret_blink();
+                    cx.notify();
+                    return;
+                }
+                if self.doc.has_selection() {
+                    cx.stop_propagation();
+                    self.doc.set_cursor(self.doc.head, false);
+                    self.reset_caret_blink();
+                    cx.notify();
+                }
             }
             "a" if ctrl && !alt && !shift => {
                 cx.stop_propagation();
@@ -1888,6 +2327,12 @@ impl EntityInputHandler for LiveMarkdownEditor {
         if text.is_empty() && range_utf16.is_none() && !self.doc.has_selection() {
             return;
         }
+        if self
+            .selected_image_line
+            .is_some_and(|img_li| self.doc.line_index_for_byte(self.doc.head) != img_li)
+        {
+            self.selected_image_line = None;
+        }
         self.doc.marked_range = None;
         if let Some(r16) = range_utf16 {
             let s = utf16_to_utf8_offset(&self.doc.text, r16.start);
@@ -2009,6 +2454,161 @@ impl LiveMarkdownEditor {
             cx.notify();
         }
     }
+
+    fn commit_active_image_resize(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(resize) = self.active_image_resize.take() else {
+            return false;
+        };
+        let mut new_spec = resize.spec;
+        let target_w = resize.preview_width.round().max(48.0);
+        if (target_w - resize.start_width.round()).abs() >= 1.0 || new_spec.width.is_none() {
+            new_spec.width = Some(target_w);
+            new_spec.height = None;
+            if self.doc.update_image_embed_spec(resize.line_ix, &new_spec) {
+                self.layout_cache.clear();
+                self.sync_height_table_after_edit();
+                cx.emit(LiveEditorEvent::Changed);
+            }
+        }
+        self.selected_image_line = Some(resize.line_ix);
+        true
+    }
+}
+
+fn image_tool_pill(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    active: bool,
+    on_click: impl Fn(&mut LiveMarkdownEditor, &mut Window, &mut Context<LiveMarkdownEditor>) + 'static,
+    ed: Entity<LiveMarkdownEditor>,
+) -> AnyElement {
+    let text_col = if active {
+        hex_color(kd::ACCENT)
+    } else {
+        hex_color(kd::FG_SUBTLE)
+    };
+    let bg_col = if active {
+        accent_alpha(0x28)
+    } else {
+        gpui_kit::transparent_black()
+    };
+    div()
+        .id(id.into())
+        .h(px(20.))
+        .px_1p5()
+        .rounded(px(4.))
+        .bg(bg_col)
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .text_size(px(11.))
+        .font_weight(if active {
+            FontWeight::SEMIBOLD
+        } else {
+            FontWeight::MEDIUM
+        })
+        .text_color(text_col)
+        .hover(move |s| {
+            s.bg(if active {
+                accent_alpha(0x36)
+            } else {
+                hex_color(kd::BG_PANEL)
+            })
+            .text_color(hex_color(kd::FG))
+        })
+        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+            cx.stop_propagation();
+            ed.update(cx, |this, cx| {
+                on_click(this, window, cx);
+            });
+        })
+        .child(label.into())
+        .into_any_element()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn image_resize_handle(
+    ix: usize,
+    corner: ResizeHandleCorner,
+    img_w: f32,
+    img_h: f32,
+    align: ImageAlign,
+    spec: StyledImageSpec,
+    max_width: f32,
+    ed: Entity<LiveMarkdownEditor>,
+) -> AnyElement {
+    let is_edge = matches!(
+        corner,
+        ResizeHandleCorner::LeftEdge | ResizeHandleCorner::RightEdge
+    );
+    let id: SharedString = format!("live-img-handle-{ix}-{corner:?}").into();
+    let mut handle = div().id(id).absolute();
+    handle = match corner {
+        ResizeHandleCorner::LeftEdge | ResizeHandleCorner::RightEdge => handle.cursor_ew_resize(),
+        ResizeHandleCorner::TopLeft | ResizeHandleCorner::BottomRight => {
+            handle.cursor_nwse_resize()
+        }
+        ResizeHandleCorner::TopRight | ResizeHandleCorner::BottomLeft => {
+            handle.cursor_nesw_resize()
+        }
+    };
+
+    if is_edge {
+        let pill_h = 30.0_f32.min((img_h - 30.0).max(10.0));
+        let top_off = ((img_h - pill_h) * 0.5).max(14.0);
+        handle = handle
+            .w(px(5.))
+            .h(px(pill_h))
+            .top(px(top_off))
+            .rounded(px(2.5))
+            .bg(hex_color(kd::ACCENT))
+            .border_1()
+            .border_color(hex_color(kd::BG_MAIN))
+            .shadow_sm();
+        handle = match corner {
+            ResizeHandleCorner::LeftEdge => handle.left(px(5.)),
+            _ => handle.right(px(5.)),
+        };
+    } else {
+        handle = handle
+            .w(px(11.))
+            .h(px(11.))
+            .rounded(px(5.5))
+            .bg(hex_color(kd::BG_MAIN))
+            .border_2()
+            .border_color(hex_color(kd::ACCENT))
+            .shadow_sm();
+        handle = match corner {
+            ResizeHandleCorner::TopLeft => handle.top(px(4.)).left(px(4.)),
+            ResizeHandleCorner::TopRight => handle.top(px(4.)).right(px(4.)),
+            ResizeHandleCorner::BottomLeft => handle.bottom(px(4.)).left(px(4.)),
+            _ => handle.bottom(px(4.)).right(px(4.)),
+        };
+    }
+
+    handle
+        .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+            cx.stop_propagation();
+            ed.update(cx, |this, cx| {
+                this.active_image_resize = Some(ActiveImageResize {
+                    line_ix: ix,
+                    corner,
+                    start_mouse: ev.position,
+                    start_width: img_w,
+                    aspect_ratio: (img_w / img_h.max(1.0)).clamp(0.15, 6.5),
+                    preview_width: img_w,
+                    preview_height: img_h,
+                    align,
+                    spec: spec.clone(),
+                    max_width,
+                });
+                this.selected_image_line = Some(ix);
+                this.dragging = false;
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            });
+        })
+        .into_any_element()
 }
 
 fn table_tool_pill(
@@ -2055,19 +2655,19 @@ fn table_tool_pill(
 }
 
 impl Render for LiveMarkdownEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let scroll_state = self.scroll.borrow();
         let vp_bounds = scroll_state.viewport_bounds;
         let vp_w = f32::from(vp_bounds.size.width);
         let vp_h = f32::from(vp_bounds.size.height);
-        let scroll_y = scroll_state.scroll_y;
         drop(scroll_state);
 
         // Build visible ImageEmbed overlays & active-table micro-toolbar on the same frame.
         let mut image_overlays: Vec<AnyElement> = Vec::new();
         let mut table_toolbar: Option<AnyElement> = None;
         if vp_w > 20.0 && vp_h > 20.0 && !self.doc.lines.is_empty() {
-            let col_geo = compute_column_geometry(vp_w, self.centered, self.zen_mode);
+            let (col_geo, scroll_y, _, _) =
+                self.prepare_layout_for_bounds(vp_bounds, 360.0, window, cx);
             let rel_start_y = (scroll_y - col_geo.top_pad - 360.0).max(0.0);
             let rel_end_y = (scroll_y + vp_h - col_geo.top_pad + 360.0).max(0.0);
             let first_li = self.height_table.line_for_y(rel_start_y);
@@ -2075,72 +2675,361 @@ impl Render for LiveMarkdownEditor {
                 .height_table
                 .line_for_y(rel_end_y)
                 .min(self.doc.lines.len() - 1);
+            let overlay_start = first_li.saturating_sub(48);
+            let ed_handle = cx.entity();
 
-            for ix in first_li..=last_li {
-                let dl = &self.doc.lines[ix];
-                if let LineBlockContext::ImageEmbed { target, alt } = &dl.ctx {
-                    let y_line = self.height_table.y_for_line(ix);
-                    let cursor_present = cursor_range_for_line(&self.doc, dl, true).is_some();
-                    let text_h = if cursor_present { 24.0 } else { 0.0 };
-                    let img_top = col_geo.top_pad + y_line - scroll_y + text_h + 6.0;
-                    let (img_w, img_h, align) = image_embed_dimensions(alt, col_geo.col_width);
-                    let img_left = match align {
-                        ImageAlign::Left => col_geo.col_left_rel,
-                        ImageAlign::Center => {
-                            col_geo.col_left_rel + ((col_geo.col_width - img_w) * 0.5).max(0.0)
+            for ix in overlay_start..=last_li {
+                let Some((target, alt, line_start_byte, cursor_present)) =
+                    self.doc.lines.get(ix).and_then(|dl| {
+                        if let LineBlockContext::ImageEmbed { target, alt } = &dl.ctx {
+                            let cur = cursor_range_for_line(&self.doc, dl, true).is_some();
+                            Some((target.clone(), alt.clone(), dl.byte_start, cur))
+                        } else {
+                            None
                         }
-                        ImageAlign::Right => {
-                            col_geo.col_left_rel + (col_geo.col_width - img_w).max(0.0)
-                        }
+                    })
+                else {
+                    continue;
+                };
+
+                let y_line = self.height_table.y_for_line(ix);
+                let (clear_top_spacer, text_h) = if let Some(cached) = self.layout_cache.get(&ix) {
+                    let th = if cursor_present && !cached.projected.display_text.is_empty() {
+                        let rows = cached
+                            .shaped
+                            .as_ref()
+                            .map_or(1, |wl| wl.wrap_boundaries.len() + 1) as f32;
+                        rows * cached.line_height + 4.0
+                    } else {
+                        0.0
                     };
-                    let line_start_byte = dl.byte_start;
-                    let resolved = resolve_image_file(target, &self.doc_path, &self.vault);
-                    let target_name = target.clone();
-                    let ov = div()
-                        .id(SharedString::from(format!("live-img-{ix}")))
-                        .absolute()
-                        .top(px(img_top))
-                        .left(px(img_left))
-                        .w(px(img_w))
-                        .h(px(img_h))
-                        .rounded(px(8.))
-                        .overflow_hidden()
-                        .cursor_pointer()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
+                    (cached.clear_top_spacer, th)
+                } else {
+                    (0.0, if cursor_present { 24.0 } else { 0.0 })
+                };
+
+                let (img_w, img_h, spec) =
+                    self.resolve_image_box(ix, &target, &alt, col_geo.col_width);
+                let img_top = col_geo.top_pad + y_line + clear_top_spacer - scroll_y + text_h + 6.0;
+                if img_top + img_h < -40.0 || img_top > vp_h + 40.0 {
+                    continue;
+                }
+
+                let img_left = match spec.align {
+                    ImageAlign::Left => col_geo.col_left_rel,
+                    ImageAlign::Center => {
+                        col_geo.col_left_rel + ((col_geo.col_width - img_w) * 0.5).max(0.0)
+                    }
+                    ImageAlign::Right => {
+                        col_geo.col_left_rel + (col_geo.col_width - img_w).max(0.0)
+                    }
+                };
+
+                let is_resizing = self
+                    .active_image_resize
+                    .as_ref()
+                    .is_some_and(|r| r.line_ix == ix);
+                let is_selected = self.selected_image_line == Some(ix) || is_resizing;
+                let max_drag_w = if spec.is_floated() {
+                    (col_geo.col_width - 140.0).max(150.0)
+                } else {
+                    (col_geo.col_width - 16.0).max(120.0)
+                };
+                let radius = if spec.rounded { px(8.) } else { px(0.) };
+
+                let resolved = resolve_image_file(&target, &self.doc_path, &self.vault);
+                let target_name = target.clone();
+                let mut img_frame = div()
+                    .size_full()
+                    .rounded(radius)
+                    .overflow_hidden()
+                    .when(spec.border && !is_selected, |d| {
+                        d.border_1()
+                            .border_color(hex_color(kd::BORDER))
+                            .bg(hex_alpha(0x0e0c0f80))
+                            .p_1()
+                    })
+                    .child(if let Some(path) = resolved {
+                        img(path)
+                            .size_full()
+                            .object_fit(ObjectFit::Contain)
+                            .rounded(radius)
+                            .into_any_element()
+                    } else {
+                        div()
+                            .size_full()
+                            .rounded(radius)
+                            .bg(hex_color(kd::BG_SIDEBAR))
+                            .border_1()
+                            .border_color(hex_color(kd::BORDER_SUBTLE))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .text_color(hex_color(kd::FG_MUTED))
+                            .child(format!("Image not found: {target_name}"))
+                            .into_any_element()
+                    });
+
+                if is_selected {
+                    img_frame = img_frame
+                        .border_2()
+                        .border_color(hex_color(kd::ACCENT));
+                }
+
+                let mut ov = div()
+                    .id(SharedString::from(format!("live-img-{ix}")))
+                    .absolute()
+                    .top(px(img_top))
+                    .left(px(img_left))
+                    .w(px(img_w))
+                    .h(px(img_h))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.dragging = false;
+                            this.selected_image_line = Some(ix);
+                            if ev.click_count >= 2 {
                                 this.doc.set_cursor(line_start_byte, false);
                                 this.preferred_x = None;
-                                this.focus_handle.focus(window, cx);
-                                this.reset_caret_blink();
-                                cx.notify();
-                            }),
-                        )
-                        .child(if let Some(path) = resolved {
-                            img(path)
-                                .w(px(img_w))
-                                .h(px(img_h))
-                                .object_fit(ObjectFit::Contain)
-                                .rounded(px(8.))
-                                .into_any_element()
+                            }
+                            this.focus_handle.focus(window, cx);
+                            this.reset_caret_blink();
+                            cx.notify();
+                        }),
+                    )
+                    .child(img_frame);
+
+                if !is_resizing && let Some(caption) = spec.caption.clone() {
+                    ov = ov.child(
+                        div()
+                            .absolute()
+                            .bottom(px(6.))
+                            .left(px(8.))
+                            .max_w(px((img_w - 16.0).max(40.0)))
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded(px(4.))
+                            .bg(hex_alpha(0x0c0b0eb8))
+                            .text_size(px(11.))
+                            .italic()
+                            .text_color(hex_color(kd::FG_SUBTLE))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(caption),
+                    );
+                }
+
+                if is_selected {
+                    for corner in [
+                        ResizeHandleCorner::TopLeft,
+                        ResizeHandleCorner::TopRight,
+                        ResizeHandleCorner::BottomLeft,
+                        ResizeHandleCorner::BottomRight,
+                    ] {
+                        ov = ov.child(image_resize_handle(
+                            ix,
+                            corner,
+                            img_w,
+                            img_h,
+                            spec.align,
+                            spec.clone(),
+                            max_drag_w,
+                            ed_handle.clone(),
+                        ));
+                    }
+                    if img_h >= 68.0 {
+                        for corner in [ResizeHandleCorner::LeftEdge, ResizeHandleCorner::RightEdge] {
+                            ov = ov.child(image_resize_handle(
+                                ix,
+                                corner,
+                                img_w,
+                                img_h,
+                                spec.align,
+                                spec.clone(),
+                                max_drag_w,
+                                ed_handle.clone(),
+                            ));
+                        }
+                    }
+                }
+
+                if is_resizing {
+                    ov = ov.child(
+                        div()
+                            .absolute()
+                            .bottom(px(10.))
+                            .left(px(0.))
+                            .w(px(img_w))
+                            .flex()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded(px(4.))
+                                    .bg(hex_alpha(0x0c0b0ed8))
+                                    .border_1()
+                                    .border_color(hex_color(kd::ACCENT))
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(hex_color(kd::FG))
+                                    .child(format!(
+                                        "{} × {} px",
+                                        img_w.round() as u32,
+                                        img_h.round() as u32
+                                    )),
+                            ),
+                    );
+                }
+
+                image_overlays.push(ov.into_any_element());
+
+                if is_selected && !is_resizing {
+                    let toolbar_w = 242.0_f32;
+                    let tb_left = (img_left + (img_w - toolbar_w) * 0.5)
+                        .clamp(8.0, (vp_w - toolbar_w - 8.0).max(8.0));
+                    let tb_top = if img_top >= 36.0 {
+                        img_top - 32.0
+                    } else {
+                        img_top + 8.0
+                    };
+
+                    let spec_l = {
+                        let mut s = spec.clone();
+                        s.align = ImageAlign::Left;
+                        s
+                    };
+                    let spec_c = {
+                        let mut s = spec.clone();
+                        s.align = ImageAlign::Center;
+                        s.wrap = false;
+                        s
+                    };
+                    let spec_r = {
+                        let mut s = spec.clone();
+                        s.align = ImageAlign::Right;
+                        s
+                    };
+                    let spec_wrap = {
+                        let mut s = spec.clone();
+                        if s.align == ImageAlign::Center {
+                            s.align = ImageAlign::Left;
+                            s.wrap = true;
                         } else {
-                            div()
-                                .size_full()
-                                .rounded(px(8.))
-                                .bg(hex_color(kd::BG_SIDEBAR))
-                                .border_1()
-                                .border_color(hex_color(kd::BORDER_SUBTLE))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_xs()
-                                .text_color(hex_color(kd::FG_MUTED))
-                                .child(format!("Image not found: {target_name}"))
-                                .into_any_element()
+                            s.wrap = !s.wrap;
+                        }
+                        s
+                    };
+                    let spec_border = {
+                        let mut s = spec.clone();
+                        s.border = !s.border;
+                        s
+                    };
+                    let spec_reset = {
+                        let mut s = spec.clone();
+                        s.width = None;
+                        s.height = None;
+                        s
+                    };
+
+                    let tb = div()
+                        .id(SharedString::from(format!("live-img-tb-{ix}")))
+                        .absolute()
+                        .top(px(tb_top))
+                        .left(px(tb_left))
+                        .h(px(26.))
+                        .px_1()
+                        .gap_0p5()
+                        .flex()
+                        .items_center()
+                        .rounded(px(6.))
+                        .bg(hex_color(kd::BG_SIDEBAR))
+                        .border_1()
+                        .border_color(hex_color(kd::BORDER))
+                        .shadow_md()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
                         })
-                        .into_any_element();
-                    image_overlays.push(ov);
+                        .children([
+                            image_tool_pill(
+                                SharedString::from(format!("img-align-l-{ix}")),
+                                "L",
+                                spec.align == ImageAlign::Left,
+                                move |ed, win, cx| {
+                                    ed.update_image_spec_action(ix, spec_l.clone(), win, cx);
+                                },
+                                ed_handle.clone(),
+                            ),
+                            image_tool_pill(
+                                SharedString::from(format!("img-align-c-{ix}")),
+                                "C",
+                                spec.align == ImageAlign::Center,
+                                move |ed, win, cx| {
+                                    ed.update_image_spec_action(ix, spec_c.clone(), win, cx);
+                                },
+                                ed_handle.clone(),
+                            ),
+                            image_tool_pill(
+                                SharedString::from(format!("img-align-r-{ix}")),
+                                "R",
+                                spec.align == ImageAlign::Right,
+                                move |ed, win, cx| {
+                                    ed.update_image_spec_action(ix, spec_r.clone(), win, cx);
+                                },
+                                ed_handle.clone(),
+                            ),
+                            div()
+                                .w(px(1.))
+                                .h(px(14.))
+                                .mx_0p5()
+                                .bg(hex_color(kd::BORDER_SUBTLE))
+                                .into_any_element(),
+                            image_tool_pill(
+                                SharedString::from(format!("img-wrap-{ix}")),
+                                "Wrap",
+                                spec.is_floated(),
+                                move |ed, win, cx| {
+                                    ed.update_image_spec_action(ix, spec_wrap.clone(), win, cx);
+                                },
+                                ed_handle.clone(),
+                            ),
+                            image_tool_pill(
+                                SharedString::from(format!("img-frame-{ix}")),
+                                "Frame",
+                                spec.border,
+                                move |ed, win, cx| {
+                                    ed.update_image_spec_action(ix, spec_border.clone(), win, cx);
+                                },
+                                ed_handle.clone(),
+                            ),
+                            image_tool_pill(
+                                SharedString::from(format!("img-reset-{ix}")),
+                                "1:1",
+                                false,
+                                move |ed, win, cx| {
+                                    ed.update_image_spec_action(ix, spec_reset.clone(), win, cx);
+                                },
+                                ed_handle.clone(),
+                            ),
+                            image_tool_pill(
+                                SharedString::from(format!("img-raw-{ix}")),
+                                "</>",
+                                cursor_present,
+                                move |ed, win, cx| {
+                                    ed.doc.set_cursor(line_start_byte, false);
+                                    ed.selected_image_line = Some(ix);
+                                    ed.preferred_x = None;
+                                    ed.focus_handle.focus(win, cx);
+                                    ed.reset_caret_blink();
+                                    cx.notify();
+                                },
+                                ed_handle.clone(),
+                            ),
+                        ]);
+                    image_overlays.push(tb.into_any_element());
                 }
             }
 
@@ -2280,6 +3169,20 @@ impl Render for LiveMarkdownEditor {
             .size_full()
             .bg(hex_color(kd::BG_MAIN))
             .cursor_text()
+            .when_some(
+                self.active_image_resize.as_ref().map(|r| r.corner),
+                |d, corner| match corner {
+                    ResizeHandleCorner::LeftEdge | ResizeHandleCorner::RightEdge => {
+                        d.cursor_ew_resize()
+                    }
+                    ResizeHandleCorner::TopLeft | ResizeHandleCorner::BottomRight => {
+                        d.cursor_nwse_resize()
+                    }
+                    ResizeHandleCorner::TopRight | ResizeHandleCorner::BottomLeft => {
+                        d.cursor_nesw_resize()
+                    }
+                },
+            )
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 this.handle_key_down(ev, window, cx);
@@ -2290,7 +3193,10 @@ impl Render for LiveMarkdownEditor {
                     cx.stop_propagation();
                     this.focus_handle.focus(window, cx);
                     this.doc.break_undo_coalescing();
+                    this.selected_image_line = None;
+                    this.active_image_resize = None;
                     let Some(hit) = this.hit_test_byte_at_point(ev.position) else {
+                        cx.notify();
                         return;
                     };
 
@@ -2343,6 +3249,69 @@ impl Render for LiveMarkdownEditor {
                 }),
             )
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
+                if let Some(mut resize) = this.active_image_resize.take() {
+                    if !ev.dragging() {
+                        this.active_image_resize = Some(resize);
+                        if this.commit_active_image_resize(cx) {
+                            cx.notify();
+                        }
+                        return;
+                    }
+                    let dx = f32::from(ev.position.x - resize.start_mouse.x);
+                    let dy = f32::from(ev.position.y - resize.start_mouse.y);
+                    let center_mult = if resize.align == ImageAlign::Center {
+                        2.0
+                    } else {
+                        1.0
+                    };
+                    let delta_w = match resize.corner {
+                        ResizeHandleCorner::RightEdge => dx * center_mult,
+                        ResizeHandleCorner::LeftEdge => -dx * center_mult,
+                        ResizeHandleCorner::BottomRight => {
+                            if dx.abs() >= dy.abs() * 0.85 {
+                                dx * center_mult
+                            } else {
+                                dy * resize.aspect_ratio * center_mult
+                            }
+                        }
+                        ResizeHandleCorner::TopRight => {
+                            if dx.abs() >= dy.abs() * 0.85 {
+                                dx * center_mult
+                            } else {
+                                -dy * resize.aspect_ratio * center_mult
+                            }
+                        }
+                        ResizeHandleCorner::BottomLeft => {
+                            if dx.abs() >= dy.abs() * 0.85 {
+                                -dx * center_mult
+                            } else {
+                                dy * resize.aspect_ratio * center_mult
+                            }
+                        }
+                        ResizeHandleCorner::TopLeft => {
+                            if dx.abs() >= dy.abs() * 0.85 {
+                                -dx * center_mult
+                            } else {
+                                -dy * resize.aspect_ratio * center_mult
+                            }
+                        }
+                    };
+                    let min_w = (48.0_f32)
+                        .max(36.0 * resize.aspect_ratio)
+                        .min(resize.max_width);
+                    let eff_max = resize
+                        .max_width
+                        .min(900.0 * resize.aspect_ratio)
+                        .max(min_w);
+                    let new_w = (resize.start_width + delta_w).clamp(min_w, eff_max);
+                    let new_h = (new_w / resize.aspect_ratio).clamp(36.0, 900.0);
+                    resize.preview_width = new_w;
+                    resize.preview_height = new_h;
+                    this.active_image_resize = Some(resize);
+                    cx.notify();
+                    return;
+                }
+
                 if !this.dragging || !ev.dragging() {
                     if this.dragging {
                         this.dragging = false;
@@ -2359,14 +3328,20 @@ impl Render for LiveMarkdownEditor {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _window, _cx| {
+                cx.listener(|this, _: &MouseUpEvent, _window, cx| {
                     this.dragging = false;
+                    if this.commit_active_image_resize(cx) {
+                        cx.notify();
+                    }
                 }),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _window, _cx| {
+                cx.listener(|this, _: &MouseUpEvent, _window, cx| {
                     this.dragging = false;
+                    if this.commit_active_image_resize(cx) {
+                        cx.notify();
+                    }
                 }),
             )
             .on_scroll(cx.listener(|this, ev: &ScrollEvent, _window, cx| {
@@ -2530,81 +3505,16 @@ impl Element for LiveCanvasElement {
         }
 
         let ed_entity = self.editor.clone();
-        let snap = ed_entity.update(cx, |ed, cx| {
+        let (snap, schedule_overlay_sync) = ed_entity.update(cx, |ed, cx| {
             let focused = ed.focus_handle.is_focused(window);
-            let geo = compute_column_geometry(vp_w, ed.centered, ed.zen_mode);
-            ed.last_col_geo = Some((geo.col_left_rel, geo.col_width, geo.top_pad));
-            let (prose_font, mono_font) = ed.resolved_fonts(window, cx);
-
-            let scroll_y = {
-                let mut st = ed.scroll.borrow_mut();
-                st.viewport_bounds = bounds;
-                st.scroll_y
-            };
-
-            let rel_start_y = (scroll_y - geo.top_pad - 240.0).max(0.0);
-            let rel_end_y = (scroll_y + vp_h - geo.top_pad + 240.0).max(0.0);
-            let total_lines = ed.doc.lines.len();
-            if total_lines == 0 {
-                return None;
+            if ed.doc.lines.is_empty() {
+                return (None, false);
             }
-            let first_li = ed.height_table.line_for_y(rel_start_y);
-            let last_li = ed
-                .height_table
-                .line_for_y(rel_end_y)
-                .min(total_lines - 1);
-
-            let mut table_layouts: HashMap<usize, TableBlockLayout> = HashMap::new();
-            let mut visible_indices = Vec::with_capacity(last_li.saturating_sub(first_li) + 1);
-            for ix in first_li..=last_li {
-                let dl = &ed.doc.lines[ix];
-                let raw_line = &ed.doc.text[dl.byte_start..dl.byte_end];
-                let cursor_local = cursor_range_for_line(&ed.doc, dl, true);
-                let cursor_key = cursor_local.as_ref().map(|r| (r.start, r.end));
-                let (table_span, table_active, delim_expanded) =
-                    table_state_for_line(&ed.doc, &dl.ctx);
-
-                let hit = ed.layout_cache.get(&ix).is_some_and(|c| {
-                    c.doc_version == ed.doc.version
-                        && c.cursor_key == cursor_key
-                        && (c.wrap_width - geo.col_width).abs() < 0.5
-                        && c.raw_len == raw_line.len()
-                        && c.table_active == table_active
-                        && c.delim_expanded == delim_expanded
-                });
-                if !hit {
-                    let tbl_ref = table_span.map(|(s, e)| {
-                        &*table_layouts
-                            .entry(s)
-                            .or_insert_with(|| compute_table_layout(&ed.doc, s, e, geo.col_width))
-                    });
-                    let cached = shape_cached_line(
-                        dl,
-                        raw_line,
-                        cursor_local,
-                        geo.col_width,
-                        ed.doc.version,
-                        tbl_ref,
-                        table_active,
-                        delim_expanded,
-                        &prose_font,
-                        &mono_font,
-                        window,
-                    );
-                    ed.height_table.set_height(ix, cached.total_height);
-                    ed.layout_cache.insert(ix, Rc::new(cached));
-                }
-                visible_indices.push(ix);
-            }
-
-            // Second pass: lock y_top & checkbox hit rects after heights settled.
-            let content_total_h = ed.height_table.total_height();
-            {
-                let mut st = ed.scroll.borrow_mut();
-                st.total_height = geo.top_pad + content_total_h + (vp_h * 0.45).max(160.0);
-                LiveEditorScrollbarHandle::clamp_scroll(&mut st);
-            }
-            let scroll_y = ed.scroll.borrow().scroll_y;
+            let had_empty_bounds = ed.scroll.borrow().viewport_bounds.size.width <= px(20.);
+            let (geo, scroll_y, visible_indices, any_img) =
+                ed.prepare_layout_for_bounds(bounds, 240.0, window, cx);
+            let first_li = visible_indices.first().copied().unwrap_or(0);
+            let last_li = visible_indices.last().copied().unwrap_or(0);
 
             let mut paint_rows = Vec::with_capacity(visible_indices.len());
             for &ix in &visible_indices {
@@ -2618,6 +3528,7 @@ impl Element for LiveCanvasElement {
                         {
                             let cb_x = f32::from(bounds.origin.x)
                                 + geo.col_left_rel
+                                + c.extra_left_inset
                                 + list_indent_px_from_cols(indent_cols)
                                 + 2.0;
                             let cb_y = screen_top + c.text_y_rel + (c.line_height - 14.0) * 0.5;
@@ -2635,7 +3546,7 @@ impl Element for LiveCanvasElement {
 
             // Prune distant layout cache entries when huge docs scroll around.
             if ed.layout_cache.len() > 240 {
-                let keep_min = first_li.saturating_sub(60);
+                let keep_min = first_li.saturating_sub(64);
                 let keep_max = last_li + 60;
                 ed.layout_cache
                     .retain(|&ix, _| ix >= keep_min && ix <= keep_max);
@@ -2657,10 +3568,11 @@ impl Element for LiveCanvasElement {
                 raw_offset_to_visual_point(c, local_head)
             });
 
-            let mut prose_bold_font = prose_font.clone();
+            let (prose_font, mono_font) = ed.resolved_fonts(window, cx);
+            let mut prose_bold_font = prose_font;
             prose_bold_font.weight = FontWeight::SEMIBOLD;
 
-            Some(PaintSnapshot {
+            let snap = PaintSnapshot {
                 bounds,
                 focus_handle: ed.focus_handle.clone(),
                 col_left_rel: geo.col_left_rel,
@@ -2676,8 +3588,16 @@ impl Element for LiveCanvasElement {
                 marked_range: ed.doc.marked_range.clone(),
                 mono_font,
                 prose_bold_font,
-            })
+            };
+            (Some(snap), had_empty_bounds && any_img)
         });
+
+        if schedule_overlay_sync {
+            let ed_next = self.editor.clone();
+            window.on_next_frame(move |_, cx| {
+                let _ = ed_next.update(cx, |_, cx| cx.notify());
+            });
+        }
 
         snap
     }
@@ -2964,6 +3884,13 @@ impl Element for LiveCanvasElement {
                     continue;
                 }
 
+                let clear_y = px(c.clear_top_spacer);
+                let block_left = col_left + px(c.extra_left_inset);
+                let block_w =
+                    px((snap.col_width - c.extra_left_inset - c.extra_right_inset).max(120.0));
+                let content_top = top_y + clear_y;
+                let content_h = (row_h - clear_y).max(px(1.));
+
                 // Expanded table delimiter band or non-table block backgrounds & accents
                 match &c.ctx {
                     LineBlockContext::Table {
@@ -3025,8 +3952,8 @@ impl Element for LiveCanvasElement {
                         is_first, is_last, ..
                     } => {
                         let card_bounds = Bounds {
-                            origin: point(col_left, top_y),
-                            size: size(col_w, row_h + px(0.5)),
+                            origin: point(col_left, content_top),
+                            size: size(col_w, content_h + px(0.5)),
                         };
                         let r_top = if *is_first { px(6.) } else { px(0.) };
                         let r_bot = if *is_last { px(6.) } else { px(0.) };
@@ -3046,8 +3973,8 @@ impl Element for LiveCanvasElement {
                     }
                     LineBlockContext::Frontmatter { .. } => {
                         let card_bounds = Bounds {
-                            origin: point(col_left, top_y),
-                            size: size(col_w, row_h + px(0.5)),
+                            origin: point(col_left, content_top),
+                            size: size(col_w, content_h + px(0.5)),
                         };
                         window.paint_quad(fill(card_bounds, hex_color(kd::BG_SIDEBAR)));
                     }
@@ -3055,8 +3982,8 @@ impl Element for LiveCanvasElement {
                         is_first, is_last, ..
                     } => {
                         let card_bounds = Bounds {
-                            origin: point(col_left, top_y),
-                            size: size(col_w, row_h + px(0.5)),
+                            origin: point(block_left, content_top),
+                            size: size(block_w, content_h + px(0.5)),
                         };
                         let r_top = if *is_first { px(6.) } else { px(0.) };
                         let r_bot = if *is_last { px(6.) } else { px(0.) };
@@ -3074,17 +4001,17 @@ impl Element for LiveCanvasElement {
                             BorderStyle::Solid,
                         ));
                         let bar_bounds = Bounds {
-                            origin: point(col_left, top_y),
-                            size: size(px(3.), row_h + px(0.5)),
+                            origin: point(block_left, content_top),
+                            size: size(px(3.), content_h + px(0.5)),
                         };
                         window.paint_quad(fill(bar_bounds, hex_color(kd::ACCENT)));
                     }
                     LineBlockContext::Blockquote { depth, .. } => {
                         for d in 0..(*depth).min(4) {
-                            let bx = col_left + px(d as f32 * 14.0 + 2.0);
+                            let bx = block_left + px(d as f32 * 14.0 + 2.0);
                             let bar = Bounds {
-                                origin: point(bx, top_y + px(1.)),
-                                size: size(px(3.), row_h),
+                                origin: point(bx, content_top + px(1.)),
+                                size: size(px(3.), content_h),
                             };
                             window.paint_quad(fill(bar, hex_color(kd::ACCENT)));
                         }
@@ -3095,17 +4022,17 @@ impl Element for LiveCanvasElement {
                 // Prefix visuals (bullet, checkbox, divider, code fence lang chip, callout badge)
                 match &c.projected.prefix_visual {
                     PrefixVisual::SceneBreakRule => {
-                        let rule_y = top_y + row_h * 0.5;
+                        let rule_y = content_top + content_h * 0.5;
                         window.paint_quad(fill(
                             Bounds {
-                                origin: point(col_left + px(8.), rule_y),
-                                size: size(col_w - px(16.), px(1.)),
+                                origin: point(block_left + px(8.), rule_y),
+                                size: size(block_w - px(16.), px(1.)),
                             },
                             hex_color(kd::BORDER_SUBTLE),
                         ));
                     }
                     PrefixVisual::Bullet { indent_cols } => {
-                        let dot_x = col_left
+                        let dot_x = block_left
                             + px(list_indent_px_from_cols(*indent_cols) + 7.0);
                         let dot_y = top_y + px(c.text_y_rel + c.line_height * 0.5 - 2.5);
                         window.paint_quad(quad(
@@ -3159,7 +4086,7 @@ impl Element for LiveCanvasElement {
                         is_open: true,
                     } => {
                         let chip_w = (lang_str.len() as f32 * 6.8 + 12.0).max(28.0);
-                        let chip_origin = point(col_left + px(12.), top_y + px(3.));
+                        let chip_origin = point(col_left + px(12.), content_top + px(3.));
                         let chip_bg = Bounds {
                             origin: chip_origin,
                             size: size(px(chip_w), px(15.)),
@@ -3196,7 +4123,7 @@ impl Element for LiveCanvasElement {
                     PrefixVisual::CalloutBadge { kind } => {
                         let pill_w = callout_badge_width(kind);
                         let pill_origin = point(
-                            col_left + px(16.),
+                            block_left + px(16.),
                             top_y + px(c.text_y_rel + (c.line_height - 18.0) * 0.5),
                         );
                         window.paint_quad(quad(
@@ -3253,7 +4180,7 @@ impl Element for LiveCanvasElement {
                         top_y + px(c.text_y_rel),
                         c.line_height,
                         TextAlign::Left,
-                        snap.col_width,
+                        (snap.col_width - c.extra_left_inset - c.extra_right_inset).max(120.0),
                         sel_bg,
                         window,
                     );

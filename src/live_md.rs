@@ -1,3 +1,4 @@
+use crate::markdown::{StyledImageSpec, compute_image_display_size, format_image_spec, parse_image_spec};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
@@ -1665,6 +1666,44 @@ fn parse_image_embed(trimmed: &str) -> Option<(String, String)> {
     None
 }
 
+/// Rewrite a raw Obsidian `![[target|...]]` or standard `![alt](url)` image line
+/// using the updated `StyledImageSpec`, preserving indentation and target path.
+pub fn rewrite_image_embed_line(raw_line: &str, spec: &StyledImageSpec) -> Option<String> {
+    let ws_len = raw_line.len() - raw_line.trim_start().len();
+    let indent = &raw_line[..ws_len];
+    let trimmed = raw_line.trim();
+    let formatted = format_image_spec(spec);
+
+    if let Some(inner) = trimmed.strip_prefix("![[").and_then(|s| s.strip_suffix("]]"))
+        && !inner.is_empty()
+        && !inner.contains("[[")
+        && !inner.contains("]]")
+    {
+        let target = inner
+            .split_once('|')
+            .map(|(t, _)| t.trim())
+            .unwrap_or_else(|| inner.trim());
+        if formatted.is_empty() {
+            return Some(format!("{indent}![[{target}]]"));
+        }
+        return Some(format!("{indent}![[{target}|{formatted}]]"));
+    }
+
+    if let Some(after) = trimmed.strip_prefix("![")
+        && let Some(close_bracket) = after.find("](")
+    {
+        let after_paren = &after[close_bracket + 2..];
+        if let Some(close_paren) = after_paren.rfind(')')
+            && close_paren == after_paren.len() - 1
+        {
+            let url = after_paren[..close_paren].trim();
+            return Some(format!("{indent}![{formatted}]({url})"));
+        }
+    }
+
+    None
+}
+
 fn parse_jsx_tag_name(trimmed: &str) -> Option<&str> {
     let rest = trimmed.strip_prefix('<')?;
     if rest.starts_with('/') || rest.starts_with('!') || rest.starts_with('?') {
@@ -2008,6 +2047,59 @@ impl LiveDocBuffer {
         self.head = new_caret;
         self.lines = classify_document_lines(&self.text, self.is_mdx);
         self.version = self.version.wrapping_add(1);
+    }
+
+    /// Rewrite an image embed line with a new `StyledImageSpec` as an atomic undoable edit,
+    /// keeping selection/cursor on unrelated lines undisturbed.
+    pub fn update_image_embed_spec(&mut self, line_ix: usize, spec: &StyledImageSpec) -> bool {
+        let Some(dl) = self.lines.get(line_ix) else {
+            return false;
+        };
+        let start = dl.byte_start;
+        let end = dl.byte_end;
+        let raw_line = &self.text[start..end];
+        let Some(rewritten) = rewrite_image_embed_line(raw_line, spec) else {
+            return false;
+        };
+        if rewritten == raw_line {
+            return false;
+        }
+
+        let prev_anchor = self.anchor;
+        let prev_head = self.head;
+        let delta = rewritten.len() as isize - (end - start) as isize;
+        let new_line_end = start + rewritten.len();
+
+        self.replace_range(start..end, &rewritten, EditKind::Atomic);
+
+        let remap_pos = |pos: usize| -> usize {
+            if pos <= start {
+                pos
+            } else if pos >= end {
+                ((pos as isize + delta).max(0) as usize).min(self.text.len())
+            } else {
+                new_line_end
+            }
+        };
+        self.anchor = clamp_char_boundary(&self.text, remap_pos(prev_anchor));
+        self.head = clamp_char_boundary(&self.text, remap_pos(prev_head));
+        true
+    }
+
+    /// Delete an entire line (including its line break) as an atomic undoable edit.
+    pub fn delete_line(&mut self, line_ix: usize) -> bool {
+        let Some(dl) = self.lines.get(line_ix) else {
+            return false;
+        };
+        let mut start = dl.byte_start;
+        let mut end = dl.byte_end;
+        if self.text.as_bytes().get(end) == Some(&b'\n') {
+            end += 1;
+        } else if start > 0 && self.text.as_bytes().get(start - 1) == Some(&b'\n') {
+            start -= 1;
+        }
+        self.replace_range(start..end, "", EditKind::Atomic);
+        true
     }
 
     pub fn insert_text(&mut self, s: &str) {
@@ -3185,7 +3277,14 @@ pub fn estimate_line_height(raw_line: &str, ctx: &LineBlockContext, col_width: f
             let rows = ((chars * cw) / usable_w).ceil().max(1.0);
             rows * lh + pad
         }
-        LineBlockContext::ImageEmbed { .. } => 280.0,
+        LineBlockContext::ImageEmbed { alt, .. } => {
+            let spec = parse_image_spec(alt);
+            if spec.is_floated() {
+                4.0
+            } else {
+                compute_image_display_size(&spec, None, (col_width - 16.0).max(120.0)).1 + 14.0
+            }
+        }
         LineBlockContext::SceneBreak => 24.0,
         LineBlockContext::Blank => 24.75,
         LineBlockContext::Table {
@@ -3552,5 +3651,73 @@ mod tests {
         assert!(buf.undo_stack.len() <= 6);
         assert!(buf.undo());
         assert!(buf.redo());
+    }
+
+    #[test]
+    fn rewrites_updates_and_deletes_image_embed_lines_with_cursor_preservation() {
+        let raw = "Intro line\n  ![[attachments/photo.png|300|left]]\nTrailing prose line";
+        let mut buf = LiveDocBuffer::new(raw.to_string(), false);
+        // Place caret on "prose" in line 2 (last line)
+        let trailing_pos = buf.text.find("prose").unwrap();
+        buf.set_cursor(trailing_pos, false);
+
+        let mut spec = parse_image_spec("300|left");
+        spec.width = Some(420.0);
+        spec.align = crate::markdown::ImageAlign::Right;
+        spec.wrap = true;
+        spec.border = true;
+
+        assert!(buf.update_image_embed_spec(1, &spec));
+        assert_eq!(
+            buf.line_str(1),
+            "  ![[attachments/photo.png|420|right|wrap|border]]"
+        );
+        // Caret stays on "prose" in line 2 despite byte length change above
+        assert_eq!(&buf.text[buf.head..buf.head + 5], "prose");
+
+        // No-op update does not add an undo snapshot
+        let ver_before = buf.version;
+        assert!(!buf.update_image_embed_spec(1, &spec));
+        assert_eq!(buf.version, ver_before);
+
+        // Undo restores exact line & cursor
+        assert!(buf.undo());
+        assert_eq!(buf.line_str(1), "  ![[attachments/photo.png|300|left]]");
+        assert_eq!(buf.head, trailing_pos);
+        assert!(buf.redo());
+        assert_eq!(
+            buf.line_str(1),
+            "  ![[attachments/photo.png|420|right|wrap|border]]"
+        );
+
+        // Standard markdown image rewrite
+        let md_rewritten = rewrite_image_embed_line("![old alt|200](assets/a.jpg)", &spec).unwrap();
+        assert_eq!(md_rewritten, "![420|right|wrap|border](assets/a.jpg)");
+
+        // Empty spec removes trailing pipe on obsidian embed
+        let clean = rewrite_image_embed_line("![[photo.png|320|center]]", &StyledImageSpec::default()).unwrap();
+        assert_eq!(clean, "![[photo.png]]");
+
+        // Floated image embeds estimate minimal advance height so prose wraps beside them on frame 1
+        assert_eq!(
+            estimate_line_height(
+                "![[photo.png|240|left|wrap]]",
+                &LineBlockContext::ImageEmbed {
+                    target: "photo.png".into(),
+                    alt: "240|left|wrap".into(),
+                },
+                760.0
+            ),
+            4.0
+        );
+
+        // Delete image line cleanly
+        assert!(buf.delete_line(1));
+        assert_eq!(buf.text, "Intro line\nTrailing prose line");
+        assert!(buf.undo());
+        assert_eq!(
+            buf.line_str(1),
+            "  ![[attachments/photo.png|420|right|wrap|border]]"
+        );
     }
 }
