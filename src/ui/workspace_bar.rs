@@ -50,7 +50,7 @@ impl Render for DraggedWorkspacePreview {
 
 pub fn preset_accent_color(preset: WorkspacePreset) -> Hsla {
     match preset {
-        WorkspacePreset::Notes => hex_color(kd::BLUE),
+        WorkspacePreset::Notes => hex_color(kd::ACCENT),
         WorkspacePreset::Writing => hex_color(kd::ORANGE),
         WorkspacePreset::Code => hex_color(kd::YELLOW),
         WorkspacePreset::Sheets => hex_color(kd::GREEN),
@@ -138,12 +138,12 @@ pub fn render_workspace_bar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> imp
                 } else if drag.from_idx > idx {
                     style
                         .border_l_2()
-                        .border_color(hex_color(kd::BLUE))
+                        .border_color(hex_color(kd::ACCENT))
                         .bg(panel_bg)
                 } else {
                     style
                         .border_r_2()
-                        .border_color(hex_color(kd::BLUE))
+                        .border_color(hex_color(kd::ACCENT))
                         .bg(panel_bg)
                 }
             })
@@ -278,7 +278,7 @@ pub fn render_workspace_bar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> imp
                         .px_1p5()
                         .text_xs()
                         .font_weight(FontWeight::BOLD)
-                        .text_color(hex_color(kd::BLUE))
+                        .text_color(hex_color(kd::ACCENT))
                         .flex_shrink_0()
                         .child("VKarma"),
                 )
@@ -323,7 +323,7 @@ pub fn render_workspace_bar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> imp
                                 .flex_1()
                                 .h_full()
                                 .drag_over::<DraggedWorkspace>(move |style, _, _, _| {
-                                    style.border_l_2().border_color(hex_color(kd::BLUE))
+                                    style.border_l_2().border_color(hex_color(kd::ACCENT))
                                 })
                                 .on_drop(cx.listener(move |this, drag: &DraggedWorkspace, _, cx| {
                                     let last = this.workspaces.len().saturating_sub(1);

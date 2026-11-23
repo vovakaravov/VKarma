@@ -1,6 +1,6 @@
 use super::{PaneSide, TabKind, VKarmaApp};
 use crate::formats::office::{OfficeBlock, OfficeRun};
-use crate::theme::{hex_alpha, hex_color, kd};
+use crate::theme::{accent_alpha, hex_color, kd};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::scroll::ScrollableElement as _;
@@ -124,7 +124,7 @@ pub fn render_office_tab(
     let heading_fg = if light {
         hex_color(0x2d5a7b)
     } else {
-        hex_color(kd::BLUE)
+        hex_color(kd::ACCENT)
     };
     let border_c = if light {
         hex_color(0xd8d3c8)
@@ -312,7 +312,7 @@ pub fn render_office_tab(
                             hex_color(kd::BG_SIDEBAR)
                         }
                     } else if rix % 2 == 1 {
-                        hex_alpha(0x8ba4b00e)
+                        accent_alpha(0x0e)
                     } else {
                         gpui_kit::transparent_black()
                     };

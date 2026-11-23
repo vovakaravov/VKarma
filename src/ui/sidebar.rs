@@ -1,7 +1,7 @@
 use super::{
     NewItemTemplate, PaneSide, SidebarTab, VKarmaApp, file_kind_color, modals,
 };
-use crate::theme::{hex_alpha, hex_color, kd};
+use crate::theme::{accent_alpha, hex_color, kd};
 use crate::vault::{TreeNode, duplicate_file};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
@@ -39,7 +39,7 @@ impl Render for DraggedTreePreview {
             .rounded(px(5.))
             .bg(hex_color(kd::BG_SIDEBAR))
             .border_1()
-            .border_color(hex_color(kd::BLUE))
+            .border_color(hex_color(kd::ACCENT))
             .opacity(0.92)
             .child(
                 Icon::new(if self.is_dir {
@@ -51,7 +51,7 @@ impl Render for DraggedTreePreview {
                 .text_color(if self.is_dir {
                     hex_color(kd::YELLOW)
                 } else {
-                    hex_color(kd::BLUE)
+                    hex_color(kd::ACCENT)
                 }),
             )
             .child(
@@ -281,9 +281,9 @@ pub fn render_sidebar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> impl Into
                         .drag_over::<DraggedTreeEntry>(move |style, drag, _, _| {
                             if can_drop_onto_dir(&drag.path, &root_check) {
                                 style
-                                    .bg(hex_alpha(0x8ba4b014))
+                                    .bg(accent_alpha(0x14))
                                     .border_1()
-                                    .border_color(hex_color(kd::BLUE))
+                                    .border_color(hex_color(kd::ACCENT))
                             } else {
                                 style
                             }
@@ -328,7 +328,7 @@ pub fn render_sidebar(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> impl Into
                                             .min_w_0()
                                             .text_xs()
                                             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                            .text_color(hex_color(kd::BLUE))
+                                            .text_color(hex_color(kd::ACCENT))
                                             .truncate()
                                             .child(rel),
                                     )
@@ -494,10 +494,10 @@ fn collect_tree_rows(
                 .items_center()
                 .gap_1p5()
                 .cursor_pointer()
-                .when(is_selected, |s| s.bg(hex_alpha(0x8ba4b024)))
+                .when(is_selected, |s| s.bg(accent_alpha(0x24)))
                 .hover(move |s| {
                     if is_selected {
-                        s.bg(hex_alpha(0x8ba4b035))
+                        s.bg(accent_alpha(0x35))
                     } else {
                         s.bg(hex_color(kd::BG_PANEL))
                     }
@@ -518,9 +518,9 @@ fn collect_tree_rows(
                 .drag_over::<DraggedTreeEntry>(move |style, drag, _, _| {
                     if can_drop_onto_dir(&drag.path, &dir_for_hover) {
                         style
-                            .bg(hex_alpha(0x8ba4b038))
+                            .bg(accent_alpha(0x38))
                             .border_1()
-                            .border_color(hex_color(kd::BLUE))
+                            .border_color(hex_color(kd::ACCENT))
                     } else {
                         style
                     }
@@ -819,11 +819,11 @@ fn collect_tree_rows(
                 .justify_between()
                 .gap_1p5()
                 .cursor_pointer()
-                .when(is_active, |s| s.bg(hex_alpha(0x8ba4b029)))
-                .when(!is_active && is_selected, |s| s.bg(hex_alpha(0x8ba4b01e)))
+                .when(is_active, |s| s.bg(accent_alpha(0x29)))
+                .when(!is_active && is_selected, |s| s.bg(accent_alpha(0x1e)))
                 .hover(|s| {
                     if is_active {
-                        s.bg(hex_alpha(0x8ba4b035))
+                        s.bg(accent_alpha(0x35))
                     } else {
                         s.bg(hex_color(kd::BG_PANEL))
                     }
@@ -846,7 +846,7 @@ fn collect_tree_rows(
                     let drop_dir = pdir;
                     el.drag_over::<DraggedTreeEntry>(move |style, drag, _, _| {
                         if can_drop_onto_dir(&drag.path, &check_dir) {
-                            style.bg(hex_alpha(0x8ba4b024))
+                            style.bg(accent_alpha(0x24))
                         } else {
                             style
                         }

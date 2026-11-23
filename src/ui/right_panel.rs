@@ -99,7 +99,7 @@ pub fn render_right_panel(app: &VKarmaApp, cx: &mut Context<VKarmaApp>) -> impl 
                                         div()
                                             .text_xs()
                                             .text_color(if h.level == 1 {
-                                                hex_color(kd::BLUE)
+                                                hex_color(kd::ACCENT)
                                             } else {
                                                 hex_color(kd::FG)
                                             })

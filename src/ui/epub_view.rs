@@ -109,7 +109,7 @@ impl Render for EpubView {
                 hex_color(kd::BG_MAIN),
                 hex_color(kd::FG),
                 hex_color(kd::FG_MUTED),
-                hex_color(kd::BLUE),
+                hex_color(kd::ACCENT),
                 hex_color(kd::BORDER_SUBTLE),
             ),
             EpubTheme::Sepia => (

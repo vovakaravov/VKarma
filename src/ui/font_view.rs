@@ -1,7 +1,7 @@
 use super::{TabKind, VKarmaApp};
 use crate::formats::archive::format_bytes;
 use crate::formats::font::FontInfo;
-use crate::theme::{hex_alpha, hex_color, kd};
+use crate::theme::{accent_alpha, hex_color, kd};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -144,7 +144,7 @@ impl Render for FontView {
                                             .child(
                                                 div()
                                                     .text_size(px(10.5))
-                                                    .text_color(hex_color(kd::BLUE))
+                                                    .text_color(hex_color(kd::ACCENT))
                                                     .child(format!("{sz:.0} px")),
                                             )
                                             .child(
@@ -203,7 +203,7 @@ impl Render for FontView {
                         .rounded(px(7.))
                         .bg(hex_color(kd::BG_SIDEBAR))
                         .border_1()
-                        .border_color(hex_color(kd::BLUE))
+                        .border_color(hex_color(kd::ACCENT))
                         .justify_between()
                         .items_center()
                         .gap_3()
@@ -297,13 +297,13 @@ impl Render for FontView {
                                             .p_1()
                                             .rounded(px(6.))
                                             .bg(if is_sel {
-                                                hex_alpha(0x8ba4b028)
+                                                accent_alpha(0x28)
                                             } else {
                                                 hex_color(kd::BG_SIDEBAR)
                                             })
                                             .border_1()
                                             .border_color(if is_sel {
-                                                hex_color(kd::BLUE)
+                                                hex_color(kd::ACCENT)
                                             } else {
                                                 hex_color(kd::BORDER_SUBTLE)
                                             })
@@ -402,7 +402,7 @@ impl Render for FontView {
                                                     .flex_shrink_0()
                                                     .text_xs()
                                                     .font_weight(FontWeight::BOLD)
-                                                    .text_color(hex_color(kd::BLUE))
+                                                    .text_color(hex_color(kd::ACCENT))
                                                     .child(k),
                                             )
                                             .child(

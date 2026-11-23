@@ -3,32 +3,36 @@ use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{App, Hsla, px, rgb, rgba};
 use std::sync::Arc;
 
-/// Exact KDE Plasma Kanagawa Dragon palette (`KanagawaDragon.colors`).
+/// Amethyst Obsidian dark palette tailored to VKarma's amethyst & gold nib icon.
 pub mod kd {
-    pub const BG_DEEP: u32 = 0x0d0c0c;
-    pub const BG_MAIN: u32 = 0x181616;
-    pub const BG_SIDEBAR: u32 = 0x1d1c19;
-    pub const BG_PANEL: u32 = 0x282727;
-    pub const BG_BTN: u32 = 0x393836;
-    pub const BG_BTN_HOVER: u32 = 0x464441;
-    pub const BG_BTN_ACTIVE: u32 = 0x31302e;
+    pub const BG_DEEP: u32 = 0x0e0b14;
+    pub const BG_MAIN: u32 = 0x15111e;
+    pub const BG_SIDEBAR: u32 = 0x1b1626;
+    pub const BG_PANEL: u32 = 0x241d33;
+    pub const BG_BTN: u32 = 0x312845;
+    pub const BG_BTN_HOVER: u32 = 0x3e3357;
+    pub const BG_BTN_ACTIVE: u32 = 0x282039;
 
-    pub const BORDER: u32 = 0x393836;
-    pub const BORDER_SUBTLE: u32 = 0x2a2826;
+    pub const BORDER: u32 = 0x3a3052;
+    pub const BORDER_SUBTLE: u32 = 0x272038;
 
-    pub const FG: u32 = 0xdcd7ba;
-    pub const FG_MUTED: u32 = 0x727169;
-    pub const FG_SUBTLE: u32 = 0x9e9b93;
+    pub const FG: u32 = 0xe4dff0;
+    pub const FG_MUTED: u32 = 0x776e8c;
+    pub const FG_SUBTLE: u32 = 0xa49bb8;
 
-    pub const BLUE: u32 = 0x8ba4b0;
-    pub const LINK: u32 = 0x8fa1b2;
-    pub const GREEN: u32 = 0x87a987;
-    pub const YELLOW: u32 = 0xc4b28a;
-    pub const RED: u32 = 0xc4746e;
-    pub const VIOLET: u32 = 0x8992a7;
-    pub const ORANGE: u32 = 0xb6927b;
-    pub const AQUA: u32 = 0x8ea4a2;
-    pub const PINK: u32 = 0xa292a3;
+    pub const ACCENT: u32 = 0x9d7ce0;
+    pub const ACCENT_HOVER: u32 = 0xb093eb;
+    pub const ACCENT_ACTIVE: u32 = 0x8563cc;
+
+    pub const BLUE: u32 = 0x7ca6d8;
+    pub const LINK: u32 = 0xb194ed;
+    pub const GREEN: u32 = 0x83b88c;
+    pub const YELLOW: u32 = 0xe0be6f;
+    pub const RED: u32 = 0xd6747e;
+    pub const VIOLET: u32 = 0xb698f0;
+    pub const ORANGE: u32 = 0xd49677;
+    pub const AQUA: u32 = 0x7fb5b0;
+    pub const PINK: u32 = 0xc98ab8;
 }
 
 #[inline]
@@ -41,77 +45,82 @@ pub fn hex_alpha(hex_rgba: u32) -> Hsla {
     rgba(hex_rgba).into()
 }
 
+#[inline]
+pub fn accent_alpha(alpha: u8) -> Hsla {
+    rgba((kd::ACCENT << 8) | (alpha as u32)).into()
+}
+
 const KANAGAWA_DRAGON_HIGHLIGHT_JSON: &str = r##"{
-  "name": "Kanagawa Dragon",
+  "name": "VKarma Amethyst",
   "appearance": "dark",
   "style": {
-    "editor.foreground": "#dcd7ba",
-    "editor.background": "#181616",
-    "editor.active_line.background": "#22201e",
-    "editor.line_number": "#727169",
-    "editor.active_line_number": "#c4b28a",
-    "editor.invisible": "#72716966",
-    "editor.gutter.background": "#181616",
-    "error": "#c4746e",
-    "error.background": "#3b2322",
-    "error.border": "#c4746e",
-    "warning": "#c4b28a",
-    "warning.background": "#363022",
-    "warning.border": "#c4b28a",
-    "info": "#8ba4b0",
-    "info.background": "#242c30",
-    "info.border": "#8ba4b0",
-    "success": "#87a987",
-    "success.background": "#222d24",
-    "success.border": "#87a987",
-    "hint": "#8992a7",
-    "hint.background": "#24262e",
-    "hint.border": "#8992a7",
-    "created": "#87a987",
-    "modified": "#c4b28a",
-    "deleted": "#c4746e",
+    "editor.foreground": "#e4dff0",
+    "editor.background": "#15111e",
+    "editor.active_line.background": "#201a2e",
+    "editor.line_number": "#776e8c",
+    "editor.active_line_number": "#e0be6f",
+    "editor.invisible": "#776e8c66",
+    "editor.gutter.background": "#15111e",
+    "error": "#d6747e",
+    "error.background": "#3b222c",
+    "error.border": "#d6747e",
+    "warning": "#e0be6f",
+    "warning.background": "#352e24",
+    "warning.border": "#e0be6f",
+    "info": "#7ca6d8",
+    "info.background": "#22293b",
+    "info.border": "#7ca6d8",
+    "success": "#83b88c",
+    "success.background": "#212e28",
+    "success.border": "#83b88c",
+    "hint": "#b698f0",
+    "hint.background": "#28213b",
+    "hint.border": "#b698f0",
+    "created": "#83b88c",
+    "modified": "#e0be6f",
+    "deleted": "#d6747e",
     "syntax": {
-      "attribute": { "color": "#b6927b" },
-      "boolean": { "color": "#b6927b", "font_weight": 600 },
-      "comment": { "color": "#727169", "font_style": "italic" },
-      "comment.doc": { "color": "#8992a7", "font_style": "italic" },
-      "constant": { "color": "#b6927b" },
-      "constructor": { "color": "#8ea4a2" },
-      "embedded": { "color": "#dcd7ba" },
-      "emphasis": { "color": "#c4b28a", "font_style": "italic" },
-      "emphasis.strong": { "color": "#dcd7ba", "font_weight": 700 },
-      "enum": { "color": "#c4b28a" },
-      "function": { "color": "#8ba4b0" },
-      "hint": { "color": "#8992a7" },
-      "keyword": { "color": "#8992a7" },
-      "label": { "color": "#a292a3" },
-      "link_text": { "color": "#8fa1b2" },
-      "link_uri": { "color": "#8ea4a2", "font_style": "italic" },
-      "number": { "color": "#a292a3" },
-      "operator": { "color": "#c4746e" },
-      "predictive": { "color": "#727169" },
-      "preproc": { "color": "#c4746e" },
-      "primary": { "color": "#dcd7ba" },
-      "property": { "color": "#c4b28a" },
-      "punctuation": { "color": "#9e9b93" },
-      "punctuation.bracket": { "color": "#9e9b93" },
-      "punctuation.delimiter": { "color": "#9e9b93" },
-      "punctuation.list_marker": { "color": "#c4746e", "font_weight": 600 },
-      "punctuation.special": { "color": "#c4746e" },
-      "string": { "color": "#87a987" },
-      "string.escape": { "color": "#8ea4a2" },
-      "string.regex": { "color": "#c4b28a" },
-      "string.special": { "color": "#b6927b" },
-      "string.special.symbol": { "color": "#b6927b" },
-      "tag": { "color": "#8ea4a2" },
-      "tag.doctype": { "color": "#8992a7" },
-      "text.code.span": { "color": "#87a987" },
-      "text.literal": { "color": "#87a987" },
-      "title": { "color": "#8ba4b0", "font_weight": 700 },
-      "type": { "color": "#c4b28a" },
-      "variable": { "color": "#dcd7ba" },
-      "variable.special": { "color": "#b6927b" },
-      "variant": { "color": "#a292a3" }
+      "attribute": { "color": "#d49677" },
+      "boolean": { "color": "#d49677", "font_weight": 600 },
+      "comment": { "color": "#776e8c", "font_style": "italic" },
+      "comment.doc": { "color": "#a49bb8", "font_style": "italic" },
+      "constant": { "color": "#d49677" },
+      "constructor": { "color": "#7fb5b0" },
+      "embedded": { "color": "#e4dff0" },
+      "emphasis": { "color": "#e0be6f", "font_style": "italic" },
+      "emphasis.strong": { "color": "#e4dff0", "font_weight": 700 },
+      "enum": { "color": "#e0be6f" },
+      "function": { "color": "#7ca6d8" },
+      "hint": { "color": "#b698f0" },
+      "keyword": { "color": "#b698f0" },
+      "label": { "color": "#c98ab8" },
+      "link_text": { "color": "#b194ed" },
+      "link_uri": { "color": "#7fb5b0", "font_style": "italic" },
+      "number": { "color": "#c98ab8" },
+      "operator": { "color": "#d6747e" },
+      "predictive": { "color": "#776e8c" },
+      "preproc": { "color": "#d6747e" },
+      "primary": { "color": "#e4dff0" },
+      "property": { "color": "#e0be6f" },
+      "punctuation": { "color": "#a49bb8" },
+      "punctuation.bracket": { "color": "#a49bb8" },
+      "punctuation.delimiter": { "color": "#a49bb8" },
+      "punctuation.list_marker": { "color": "#d6747e", "font_weight": 600 },
+      "punctuation.special": { "color": "#d6747e" },
+      "string": { "color": "#83b88c" },
+      "string.escape": { "color": "#7fb5b0" },
+      "string.regex": { "color": "#e0be6f" },
+      "string.special": { "color": "#d49677" },
+      "string.special.symbol": { "color": "#d49677" },
+      "tag": { "color": "#7fb5b0" },
+      "tag.doctype": { "color": "#b698f0" },
+      "text.code.span": { "color": "#83b88c" },
+      "text.literal": { "color": "#83b88c" },
+      "title": { "color": "#b093eb", "font_weight": 700 },
+      "type": { "color": "#e0be6f" },
+      "variable": { "color": "#e4dff0" },
+      "variable.special": { "color": "#d49677" },
+      "variant": { "color": "#c98ab8" }
     }
   }
 }"##;
@@ -203,13 +212,13 @@ pub fn register_custom_languages() {
     LanguageRegistry::singleton().register("typst", &config);
 }
 
-/// Applies the user's KDE Plasma Kanagawa Dragon theme globally to GPUI Component.
+/// Applies the Amethyst Obsidian dark theme globally to GPUI Component.
 pub fn apply_kanagawa_dragon_theme(cx: &mut App) {
     Theme::change(ThemeMode::Dark, None, cx);
 
     let highlight_theme: Arc<HighlightTheme> = Arc::new(
         serde_json::from_str(KANAGAWA_DRAGON_HIGHLIGHT_JSON)
-            .expect("Kanagawa Dragon highlight JSON must parse"),
+            .expect("VKarma highlight JSON must parse"),
     );
 
     Theme::update(cx, |theme| {
@@ -228,7 +237,7 @@ pub fn apply_kanagawa_dragon_theme(cx: &mut App) {
         c.muted_foreground = hex_color(kd::FG_MUTED);
         c.accent = hex_color(kd::BG_PANEL);
         c.accent_foreground = hex_color(kd::FG);
-        c.overlay = hex_alpha(0x0d0c0ccc);
+        c.overlay = hex_alpha(0x0e0b14cc);
 
         c.popover = hex_color(kd::BG_PANEL);
         c.popover_foreground = hex_color(kd::FG);
@@ -245,15 +254,15 @@ pub fn apply_kanagawa_dragon_theme(cx: &mut App) {
         c.button_secondary_active = hex_color(kd::BG_BTN_ACTIVE);
         c.button_secondary_foreground = hex_color(kd::FG);
 
-        c.primary = hex_color(kd::BLUE);
-        c.primary_hover = hex_color(0x9fb8c4);
-        c.primary_active = hex_color(0x7a929e);
-        c.primary_foreground = hex_color(kd::BG_MAIN);
+        c.primary = hex_color(kd::ACCENT);
+        c.primary_hover = hex_color(kd::ACCENT_HOVER);
+        c.primary_active = hex_color(kd::ACCENT_ACTIVE);
+        c.primary_foreground = hex_color(kd::BG_DEEP);
 
-        c.button_primary = hex_color(kd::BLUE);
-        c.button_primary_hover = hex_color(0x9fb8c4);
-        c.button_primary_active = hex_color(0x7a929e);
-        c.button_primary_foreground = hex_color(kd::BG_MAIN);
+        c.button_primary = hex_color(kd::ACCENT);
+        c.button_primary_hover = hex_color(kd::ACCENT_HOVER);
+        c.button_primary_active = hex_color(kd::ACCENT_ACTIVE);
+        c.button_primary_foreground = hex_color(kd::BG_DEEP);
 
         c.secondary = hex_color(kd::BG_BTN);
         c.secondary_hover = hex_color(kd::BG_BTN_HOVER);
@@ -261,42 +270,42 @@ pub fn apply_kanagawa_dragon_theme(cx: &mut App) {
         c.secondary_foreground = hex_color(kd::FG);
 
         c.danger = hex_color(kd::RED);
-        c.danger_hover = hex_color(0xd4847e);
-        c.danger_active = hex_color(0xb0635e);
-        c.danger_foreground = hex_color(kd::BG_MAIN);
+        c.danger_hover = hex_color(0xe28a93);
+        c.danger_active = hex_color(0xbe5e68);
+        c.danger_foreground = hex_color(kd::BG_DEEP);
 
         c.button_danger = hex_color(kd::RED);
-        c.button_danger_hover = hex_color(0xd4847e);
-        c.button_danger_active = hex_color(0xb0635e);
-        c.button_danger_foreground = hex_color(kd::BG_MAIN);
+        c.button_danger_hover = hex_color(0xe28a93);
+        c.button_danger_active = hex_color(0xbe5e68);
+        c.button_danger_foreground = hex_color(kd::BG_DEEP);
 
         c.success = hex_color(kd::GREEN);
-        c.success_hover = hex_color(0x97ba97);
-        c.success_active = hex_color(0x759675);
-        c.success_foreground = hex_color(kd::BG_MAIN);
+        c.success_hover = hex_color(0x98c9a0);
+        c.success_active = hex_color(0x6da176);
+        c.success_foreground = hex_color(kd::BG_DEEP);
 
         c.button_success = hex_color(kd::GREEN);
-        c.button_success_hover = hex_color(0x97ba97);
-        c.button_success_active = hex_color(0x759675);
-        c.button_success_foreground = hex_color(kd::BG_MAIN);
+        c.button_success_hover = hex_color(0x98c9a0);
+        c.button_success_active = hex_color(0x6da176);
+        c.button_success_foreground = hex_color(kd::BG_DEEP);
 
         c.info = hex_color(kd::BLUE);
-        c.info_hover = hex_color(0x9fb8c4);
-        c.info_active = hex_color(0x7a929e);
-        c.info_foreground = hex_color(kd::BG_MAIN);
+        c.info_hover = hex_color(0x94b9e3);
+        c.info_active = hex_color(0x6791c2);
+        c.info_foreground = hex_color(kd::BG_DEEP);
 
         c.warning = hex_color(kd::YELLOW);
-        c.warning_hover = hex_color(0xd2c19a);
-        c.warning_active = hex_color(0xb2a07a);
-        c.warning_foreground = hex_color(kd::BG_MAIN);
+        c.warning_hover = hex_color(0xeacc85);
+        c.warning_active = hex_color(0xc7a558);
+        c.warning_foreground = hex_color(kd::BG_DEEP);
 
         c.sidebar = hex_color(kd::BG_SIDEBAR);
         c.sidebar_border = hex_color(kd::BORDER_SUBTLE);
         c.sidebar_foreground = hex_color(kd::FG);
         c.sidebar_accent = hex_color(kd::BG_PANEL);
         c.sidebar_accent_foreground = hex_color(kd::FG);
-        c.sidebar_primary = hex_color(kd::BLUE);
-        c.sidebar_primary_foreground = hex_color(kd::BG_MAIN);
+        c.sidebar_primary = hex_color(kd::ACCENT);
+        c.sidebar_primary_foreground = hex_color(kd::BG_DEEP);
 
         c.title_bar = hex_color(kd::BG_DEEP);
         c.title_bar_border = hex_color(kd::BORDER_SUBTLE);
@@ -304,20 +313,20 @@ pub fn apply_kanagawa_dragon_theme(cx: &mut App) {
         c.status_bar_border = hex_color(kd::BORDER_SUBTLE);
 
         c.input = hex_color(kd::BORDER);
-        c.ring = hex_color(kd::BLUE);
-        c.caret = hex_color(kd::BLUE);
-        c.selection = hex_alpha(0x8ba4b040);
+        c.ring = hex_color(kd::ACCENT);
+        c.caret = hex_color(kd::ACCENT);
+        c.selection = accent_alpha(0x45);
 
         c.link = hex_color(kd::LINK);
-        c.link_hover = hex_color(0xa9bac9);
-        c.link_active = hex_color(kd::BLUE);
+        c.link_hover = hex_color(0xc7b0f5);
+        c.link_active = hex_color(kd::ACCENT);
 
         c.list = hex_color(kd::BG_SIDEBAR);
         c.list_even = hex_color(kd::BG_SIDEBAR);
         c.list_head = hex_color(kd::BG_PANEL);
         c.list_hover = hex_color(kd::BG_PANEL);
-        c.list_active = hex_alpha(0x8ba4b02e);
-        c.list_active_border = hex_color(kd::BLUE);
+        c.list_active = accent_alpha(0x2e);
+        c.list_active_border = hex_color(kd::ACCENT);
         c.list_highlight_foreground = hex_color(kd::YELLOW);
 
         c.tab_bar = hex_color(kd::BG_DEEP);
@@ -333,14 +342,14 @@ pub fn apply_kanagawa_dragon_theme(cx: &mut App) {
         c.table_head_foreground = hex_color(kd::YELLOW);
         c.table_foot = hex_color(kd::BG_PANEL);
         c.table_foot_foreground = hex_color(kd::FG_MUTED);
-        c.table_hover = hex_color(0x232120);
-        c.table_active = hex_alpha(0x8ba4b026);
-        c.table_active_border = hex_color(kd::BLUE);
+        c.table_hover = hex_color(0x201a2d);
+        c.table_active = accent_alpha(0x26);
+        c.table_active_border = hex_color(kd::ACCENT);
         c.table_row_border = hex_color(kd::BORDER_SUBTLE);
 
         c.scrollbar = hex_alpha(0x00000000);
-        c.scrollbar_thumb = hex_alpha(0x72716966);
-        c.scrollbar_thumb_hover = hex_alpha(0x9e9b93aa);
+        c.scrollbar_thumb = hex_alpha(0x776e8c66);
+        c.scrollbar_thumb_hover = hex_alpha(0xa49bb8aa);
 
         c.red = hex_color(kd::RED);
         c.green = hex_color(kd::GREEN);
@@ -359,7 +368,7 @@ mod tests {
     fn kanagawa_highlight_theme_parses_cleanly() {
         let parsed: HighlightTheme = serde_json::from_str(KANAGAWA_DRAGON_HIGHLIGHT_JSON)
             .expect("HighlightTheme JSON should deserialize cleanly");
-        assert_eq!(parsed.name, "Kanagawa Dragon");
+        assert_eq!(parsed.name, "VKarma Amethyst");
         assert!(parsed.style.syntax.keyword.is_some());
         assert!(parsed.style.syntax.title.is_some());
     }

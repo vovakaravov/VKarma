@@ -3,7 +3,7 @@ use crate::formats::data_tree::{
     DataValueKind, collect_container_paths, extract_table, flatten_tree, is_structured_lang,
     parse_structured_data,
 };
-use crate::theme::{hex_alpha, hex_color, kd};
+use crate::theme::{accent_alpha, hex_color, kd};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, Input};
@@ -271,7 +271,7 @@ pub fn render_code_tab(
                                 div()
                                     .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(hex_color(kd::BLUE))
+                                    .text_color(hex_color(kd::ACCENT))
                                     .child(row.key),
                             )
                             .child(
@@ -388,14 +388,14 @@ pub fn render_code_tab(
                                     .border_color(hex_color(kd::BORDER_SUBTLE))
                                     .text_xs()
                                     .font_weight(FontWeight::BOLD)
-                                    .text_color(hex_color(kd::BLUE))
+                                    .text_color(hex_color(kd::ACCENT))
                                     .truncate()
                                     .child(col.clone())
                             }));
 
                         let data_rows = rows.into_iter().enumerate().map(|(rix, cells)| {
                             let bg = if rix % 2 == 1 {
-                                hex_alpha(0x8ba4b00c)
+                                accent_alpha(0x0c)
                             } else {
                                 gpui_kit::transparent_black()
                             };

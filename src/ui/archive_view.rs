@@ -2,7 +2,7 @@ use super::{TabKind, VKarmaApp};
 use crate::formats::archive::{
     ArchiveIndex, ArchivePreview, extract_all_safe, format_bytes, read_entry_preview,
 };
-use crate::theme::{hex_alpha, hex_color, kd};
+use crate::theme::{accent_alpha, hex_color, kd};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -162,7 +162,7 @@ impl Render for ArchiveView {
                     .gap_2()
                     .cursor_pointer()
                     .bg(if is_sel {
-                        hex_alpha(0x8ba4b026)
+                        accent_alpha(0x26)
                     } else {
                         gpui_kit::transparent_black()
                     })
@@ -357,7 +357,7 @@ impl Render for ArchiveView {
                                 .bg(hex_color(kd::BG_DEEP))
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(hex_color(kd::BLUE))
+                                .text_color(hex_color(kd::ACCENT))
                                 .child(entry_name),
                         )
                     })

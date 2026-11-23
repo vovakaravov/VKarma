@@ -538,7 +538,7 @@ impl NewItemTemplate {
 
 pub fn file_kind_color(kind: FileKind) -> Hsla {
     match kind {
-        FileKind::Markdown => hex_color(kd::BLUE),
+        FileKind::Markdown => hex_color(kd::ACCENT),
         FileKind::Mdx => hex_color(kd::ORANGE),
         FileKind::Canvas => hex_color(kd::VIOLET),
         FileKind::Kanban => hex_color(kd::AQUA),
@@ -567,7 +567,7 @@ pub fn tab_badge_and_color(tab: &DocumentTab) -> (&'static str, Hsla) {
             if *is_mdx {
                 ("MDX", hex_color(kd::ORANGE))
             } else {
-                ("MD", hex_color(kd::BLUE))
+                ("MD", hex_color(kd::ACCENT))
             }
         }
         TabKind::Canvas { .. } => ("CNV", hex_color(kd::VIOLET)),
@@ -3491,7 +3491,7 @@ impl Render for VKarmaApp {
                                 .gap_2()
                                 .hover(|s| {
                                     s.bg(hex_color(kd::BG_PANEL))
-                                        .border_color(hex_color(kd::BLUE))
+                                        .border_color(hex_color(kd::ACCENT))
                                 })
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.exit_zen_mode(window, cx);

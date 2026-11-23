@@ -1,6 +1,6 @@
 use super::{FountainViewMode, PaneSide, TabKind, VKarmaApp};
 use crate::fountain::{FountainDocument, FountainElement};
-use crate::theme::{hex_alpha, hex_color, kd};
+use crate::theme::{accent_alpha, hex_alpha, hex_color, kd};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::Editor;
@@ -295,12 +295,12 @@ fn script_palette(paper_light: bool) -> ScriptPalette {
         }
     } else {
         ScriptPalette {
-            sheet_bg: hex_color(0x1c1a19),
+            sheet_bg: hex_color(0x1a1524),
             sheet_border: hex_color(kd::BORDER_SUBTLE),
             ink: hex_color(kd::FG),
             muted: hex_color(kd::FG_MUTED),
-            heading_fg: hex_color(kd::BLUE),
-            heading_bg: hex_alpha(0x8ba4b01c),
+            heading_fg: hex_color(kd::ACCENT),
+            heading_bg: accent_alpha(0x1c),
             char_fg: hex_color(kd::YELLOW),
             paren_fg: hex_color(kd::FG_SUBTLE),
             trans_fg: hex_color(kd::ORANGE),

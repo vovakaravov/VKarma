@@ -4,7 +4,7 @@ use crate::live_md::{
     utf8_to_utf16_offset, utf16_to_utf8_offset,
 };
 use crate::markdown::{ImageAlign, parse_image_spec};
-use crate::theme::{hex_alpha, hex_color, kd};
+use crate::theme::{accent_alpha, hex_alpha, hex_color, kd};
 use crate::vault::VaultIndex;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarHandle};
@@ -301,15 +301,15 @@ fn build_text_runs(
             } else if st.wikilink {
                 hex_color(kd::AQUA)
             } else if st.link {
-                hex_color(kd::BLUE)
+                hex_color(kd::ACCENT)
             } else if st.callout_title {
-                hex_color(kd::BLUE)
+                hex_color(kd::ACCENT)
             } else if st.bullet_marker {
                 hex_color(kd::ORANGE)
             } else if st.checked_task || st.strikethrough {
                 hex_color(kd::FG_MUTED)
             } else if st.heading_level == 1 {
-                hex_color(kd::BLUE)
+                hex_color(kd::ACCENT)
             } else if st.heading_level == 2 {
                 hex_color(kd::AQUA)
             } else if st.heading_level == 3 {
@@ -325,7 +325,7 @@ fn build_text_runs(
             let background_color = if st.highlight {
                 Some(hex_alpha(0xc4b28a44))
             } else if st.code && !st.syntax_muted {
-                Some(hex_alpha(0x282727e0))
+                Some(hex_alpha(0x241d33e0))
             } else {
                 None
             };
@@ -1811,7 +1811,7 @@ impl Element for LiveCanvasElement {
                                 bottom_right: r_bot,
                                 bottom_left: r_bot,
                             },
-                            hex_alpha(0x8ba4b018),
+                            accent_alpha(0x18),
                             gpui_kit::Edges::default(),
                             gpui_kit::transparent_black(),
                             BorderStyle::Solid,
@@ -1820,7 +1820,7 @@ impl Element for LiveCanvasElement {
                             origin: point(col_left, top_y),
                             size: size(px(3.), row_h + px(0.5)),
                         };
-                        window.paint_quad(fill(bar_bounds, hex_color(kd::BLUE)));
+                        window.paint_quad(fill(bar_bounds, hex_color(kd::ACCENT)));
                     }
                     LineBlockContext::Blockquote { depth, .. } => {
                         for d in 0..(*depth).min(4) {
@@ -1829,7 +1829,7 @@ impl Element for LiveCanvasElement {
                                 origin: point(bx, top_y + px(1.)),
                                 size: size(px(3.), row_h),
                             };
-                            window.paint_quad(fill(bar, hex_color(kd::BLUE)));
+                            window.paint_quad(fill(bar, hex_color(kd::ACCENT)));
                         }
                     }
                     _ => {}
@@ -1948,7 +1948,7 @@ impl Element for LiveCanvasElement {
                                 size: size(px(pill_w), px(18.)),
                             },
                             px(4.),
-                            hex_alpha(0x8ba4b02e),
+                            accent_alpha(0x2e),
                             gpui_kit::Edges::default(),
                             gpui_kit::transparent_black(),
                             BorderStyle::Solid,
@@ -1957,7 +1957,7 @@ impl Element for LiveCanvasElement {
                         let run = TextRun {
                             len: upper.len(),
                             font: snap.prose_bold_font.clone(),
-                            color: hex_color(kd::BLUE),
+                            color: hex_color(kd::ACCENT),
                             background_color: None,
                             underline: None,
                             strikethrough: None,
@@ -2079,7 +2079,7 @@ impl Element for LiveCanvasElement {
                         origin: point(caret_x, caret_y),
                         size: size(px(2.), px((lh - 2.0).max(12.0))),
                     },
-                    hex_color(kd::BLUE),
+                    hex_color(kd::ACCENT),
                 ));
             }
         });

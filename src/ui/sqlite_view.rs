@@ -3,7 +3,7 @@ use crate::formats::sqlite::{
     SqliteColumnInfo, SqliteMetadata, SqliteQueryResult, export_result_csv, load_metadata,
     load_table_page, run_sqlite_json,
 };
-use crate::theme::{hex_alpha, hex_color, kd};
+use crate::theme::{accent_alpha, hex_color, kd};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -200,7 +200,7 @@ impl Render for SqliteView {
                 .gap_2()
                 .cursor_pointer()
                 .bg(if is_sel {
-                    hex_alpha(0x8ba4b026)
+                    accent_alpha(0x26)
                 } else {
                     gpui_kit::transparent_black()
                 })
@@ -224,7 +224,7 @@ impl Render for SqliteView {
                                 .text_color(if is_view {
                                     hex_color(kd::VIOLET)
                                 } else {
-                                    hex_color(kd::BLUE)
+                                    hex_color(kd::ACCENT)
                                 })
                                 .child(if is_view { "V" } else { "T" }),
                         )
@@ -299,7 +299,7 @@ impl Render for SqliteView {
                                         .border_color(hex_color(kd::BORDER_SUBTLE))
                                         .text_xs()
                                         .font_weight(FontWeight::BOLD)
-                                        .text_color(hex_color(kd::BLUE))
+                                        .text_color(hex_color(kd::ACCENT))
                                         .child(div().w(px(180.)).child("Column"))
                                         .child(div().w(px(120.)).child("Type"))
                                         .child(div().w(px(60.)).child("Key"))
@@ -311,7 +311,7 @@ impl Render for SqliteView {
                                         .py_1p5()
                                         .gap_3()
                                         .bg(if ix % 2 == 1 {
-                                            hex_alpha(0x8ba4b00c)
+                                            accent_alpha(0x0c)
                                         } else {
                                             gpui_kit::transparent_black()
                                         })
@@ -403,7 +403,7 @@ impl Render for SqliteView {
                             .border_color(hex_color(kd::BORDER_SUBTLE))
                             .text_xs()
                             .font_weight(FontWeight::BOLD)
-                            .text_color(hex_color(kd::BLUE))
+                            .text_color(hex_color(kd::ACCENT))
                             .truncate()
                             .child(c.clone())
                     }));
@@ -412,7 +412,7 @@ impl Render for SqliteView {
                     let row_num = self.page * PAGE_SIZE + rix + 1;
                     h_flex()
                         .bg(if rix % 2 == 1 {
-                            hex_alpha(0x8ba4b00c)
+                            accent_alpha(0x0c)
                         } else {
                             gpui_kit::transparent_black()
                         })
@@ -627,7 +627,7 @@ impl Render for SqliteView {
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(hex_color(kd::BLUE))
+                                        .text_color(hex_color(kd::ACCENT))
                                         .child("Copied:"),
                                 )
                                 .child(

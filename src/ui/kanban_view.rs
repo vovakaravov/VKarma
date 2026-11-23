@@ -1,6 +1,6 @@
 use super::{PaneSide, TabKind, VKarmaApp};
 use crate::formats::kanban::KanbanBoard;
-use crate::theme::{hex_alpha, hex_color, kd};
+use crate::theme::{accent_alpha, hex_alpha, hex_color, kd};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
@@ -37,7 +37,7 @@ impl Render for DraggedKanbanPreview {
             .rounded(px(6.))
             .bg(hex_color(kd::BG_PANEL))
             .border_1()
-            .border_color(hex_color(kd::BLUE))
+            .border_color(hex_color(kd::ACCENT))
             .text_xs()
             .text_color(hex_color(kd::FG))
             .max_w(px(240.))
@@ -346,7 +346,7 @@ impl Render for KanbanView {
                         },
                     )
                     .drag_over::<DraggedKanbanCard>(|style, _, _, _| {
-                        style.border_t_2().border_color(hex_color(kd::BLUE))
+                        style.border_t_2().border_color(hex_color(kd::ACCENT))
                     })
                     .on_drop(cx.listener(move |this, drag: &DraggedKanbanCard, _, cx| {
                         cx.stop_propagation();
@@ -510,7 +510,7 @@ impl Render for KanbanView {
                 .border_1()
                 .border_color(hex_color(kd::BORDER_SUBTLE))
                 .drag_over::<DraggedKanbanCard>(|style, _, _, _| {
-                    style.border_color(hex_color(kd::BLUE)).bg(hex_alpha(0x8ba4b018))
+                    style.border_color(hex_color(kd::ACCENT)).bg(accent_alpha(0x18))
                 })
                 .on_drop(cx.listener(move |this, drag: &DraggedKanbanCard, _, cx| {
                     cx.stop_propagation();
@@ -562,7 +562,7 @@ impl Render for KanbanView {
                                     div()
                                         .text_xs()
                                         .font_weight(FontWeight::BOLD)
-                                        .text_color(hex_color(kd::BLUE))
+                                        .text_color(hex_color(kd::ACCENT))
                                         .truncate()
                                         .child(col_title),
                                 )
@@ -670,7 +670,7 @@ impl Render for KanbanView {
                                 .rounded(px(9.))
                                 .bg(hex_color(kd::BG_SIDEBAR))
                                 .border_1()
-                                .border_color(hex_color(kd::BLUE))
+                                .border_color(hex_color(kd::ACCENT))
                                 .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
                                     if ev.keystroke.key == "escape" {
                                         cx.stop_propagation();

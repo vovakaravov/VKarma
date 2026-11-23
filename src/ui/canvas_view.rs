@@ -1,6 +1,6 @@
 use super::{PaneSide, TabKind, VKarmaApp};
 use crate::formats::canvas::{CanvasDoc, CanvasNode, canvas_color_u32, edge_endpoints};
-use crate::theme::{hex_alpha, hex_color, kd};
+use crate::theme::{accent_alpha, hex_alpha, hex_color, kd};
 use crate::vault::{VaultIndex, is_image_extension};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
@@ -405,7 +405,7 @@ impl CanvasView {
         let border_color = if is_connect_src {
             hex_color(kd::ORANGE)
         } else if is_selected {
-            hex_color(kd::BLUE)
+            hex_color(kd::ACCENT)
         } else if let Some(c) = accent {
             hex_color(c)
         } else {
@@ -416,7 +416,7 @@ impl CanvasView {
             if let Some(c) = accent {
                 hex_alpha((c << 8) | 0x18)
             } else {
-                hex_alpha(0x8ba4b014)
+                accent_alpha(0x14)
             }
         } else if let Some(c) = accent {
             hex_alpha((c << 8) | 0x1a)
@@ -500,7 +500,7 @@ impl CanvasView {
                                         .min_w_0()
                                         .text_xs()
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(hex_color(kd::BLUE))
+                                        .text_color(hex_color(kd::ACCENT))
                                         .truncate()
                                         .child(rel.clone()),
                                 )
@@ -703,7 +703,7 @@ impl CanvasView {
                                 .w(px(6.))
                                 .h(px(6.))
                                 .rounded(px(2.))
-                                .bg(hex_alpha(0x8ba4b066)),
+                                .bg(accent_alpha(0x66)),
                         ),
                 )
             })
@@ -804,7 +804,7 @@ impl Render for CanvasView {
                 let step = (36.0 * zoom).clamp(14.0, 72.0);
                 let start_gx = pan_x.rem_euclid(step);
                 let start_gy = pan_y.rem_euclid(step);
-                let dot_color = hex_alpha(0x8ba4b026);
+                let dot_color = accent_alpha(0x26);
                 let mut gx = start_gx;
                 while gx < w {
                     let mut gy = start_gy;
@@ -832,7 +832,7 @@ impl Render for CanvasView {
                     let p3 = to_screen(p3_w);
 
                     let color = if is_sel {
-                        hex_color(kd::BLUE)
+                        hex_color(kd::ACCENT)
                     } else if let Some(c) = col_opt {
                         hex_color(c)
                     } else {
@@ -1126,7 +1126,7 @@ pub fn render_canvas_tab(
         ("2", 0xb6927b),
         ("3", 0xc4b28a),
         ("4", 0x87a987),
-        ("5", 0x8ba4b0),
+        ("5", 0x7ca6d8),
         ("6", 0xa292a3),
     ];
 

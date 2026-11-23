@@ -47,7 +47,7 @@ pub fn render_pane(
             .cursor_pointer()
             .border_t_2()
             .border_color(if is_selected && is_active_pane {
-                hex_color(kd::BLUE)
+                hex_color(kd::ACCENT)
             } else {
                 gpui_kit::transparent_black()
             })
@@ -266,7 +266,7 @@ fn render_empty_pane(
                             div()
                                 .text_lg()
                                 .font_weight(gpui_kit::FontWeight::BOLD)
-                                .text_color(hex_color(kd::BLUE))
+                                .text_color(hex_color(kd::ACCENT))
                                 .child("VKarma"),
                         )
                         .child(

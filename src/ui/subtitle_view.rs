@@ -2,7 +2,7 @@ use super::{PaneSide, TabKind, VKarmaApp};
 use crate::formats::subtitle::{
     SubtitleDoc, SubtitleFormat, format_duration_short, format_timestamp_ms, parse_timestamp_ms,
 };
-use crate::theme::{hex_alpha, hex_color, kd};
+use crate::theme::{accent_alpha, hex_alpha, hex_color, kd};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
@@ -274,13 +274,13 @@ impl Render for SubtitleView {
                     .py_2()
                     .rounded(px(6.))
                     .bg(if is_sel {
-                        hex_alpha(0x8ba4b024)
+                        accent_alpha(0x24)
                     } else {
                         hex_color(kd::BG_SIDEBAR)
                     })
                     .border_1()
                     .border_color(if is_sel {
-                        hex_color(kd::BLUE)
+                        hex_color(kd::ACCENT)
                     } else if overlap {
                         hex_color(kd::RED)
                     } else {

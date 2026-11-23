@@ -218,7 +218,7 @@ impl MarkdownPlugin for StyledImagePlugin {
                     .when(data.spec.border, |this| {
                         this.border_1()
                             .border_color(hex_color(kd::BORDER))
-                            .bg(hex_alpha(0x0d0c0c80))
+                            .bg(hex_alpha(0x0e0b1480))
                             .p_1()
                     })
                     .child(img_el),

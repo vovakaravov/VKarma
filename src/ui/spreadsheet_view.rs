@@ -1,6 +1,6 @@
 use super::{PaneSide, TabKind, VKarmaApp, modals};
 use crate::spreadsheet::{CellKind, cell_ref, col_label};
-use crate::theme::{hex_alpha, hex_color, kd};
+use crate::theme::{accent_alpha, hex_alpha, hex_color, kd};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::Input;
@@ -278,7 +278,7 @@ pub fn render_spreadsheet_tab(
                 .justify_center()
                 .text_xs()
                 .font_weight(gpui_kit::FontWeight::BOLD)
-                .text_color(hex_color(kd::BLUE))
+                .text_color(hex_color(kd::ACCENT))
                 .child(active_cell_ref),
         )
         .child(
@@ -354,11 +354,11 @@ pub fn render_spreadsheet_tab(
                 .justify_center()
                 .border_r_1()
                 .border_color(hex_color(kd::BORDER_SUBTLE))
-                .when(is_col_active, |d| d.bg(hex_alpha(0x8ba4b026)))
+                .when(is_col_active, |d| d.bg(accent_alpha(0x26)))
                 .text_xs()
                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                 .text_color(if is_col_active {
-                    hex_color(kd::BLUE)
+                    hex_color(kd::ACCENT)
                 } else {
                     hex_color(kd::YELLOW)
                 })
@@ -390,7 +390,7 @@ pub fn render_spreadsheet_tab(
                                 .items_center()
                                 .justify_center()
                                 .bg(if is_row_active {
-                                    hex_alpha(0x8ba4b026)
+                                    accent_alpha(0x26)
                                 } else {
                                     hex_color(kd::BG_SIDEBAR)
                                 })
@@ -398,7 +398,7 @@ pub fn render_spreadsheet_tab(
                                 .border_color(hex_color(kd::BORDER))
                                 .text_xs()
                                 .text_color(if is_row_active {
-                                    hex_color(kd::BLUE)
+                                    hex_color(kd::ACCENT)
                                 } else {
                                     hex_color(kd::FG_MUTED)
                                 })
@@ -430,17 +430,17 @@ pub fn render_spreadsheet_tab(
                                 .when(align_right, |d| d.justify_end())
                                 .border_r_1()
                                 .border_color(if is_active_cell {
-                                    hex_color(kd::BLUE)
+                                    hex_color(kd::ACCENT)
                                 } else {
                                     hex_color(kd::BORDER_SUBTLE)
                                 })
                                 .when(is_active_cell, |d| {
-                                    d.bg(hex_alpha(0x8ba4b024))
+                                    d.bg(accent_alpha(0x24))
                                         .border_2()
-                                        .border_color(hex_color(kd::BLUE))
+                                        .border_color(hex_color(kd::ACCENT))
                                 })
                                 .when(!is_active_cell, |d| {
-                                    d.hover(|s| s.bg(hex_alpha(0x28272799)))
+                                    d.hover(|s| s.bg(hex_alpha(0x241d3399)))
                                 })
                                 .cursor_pointer()
                                 .on_mouse_down(

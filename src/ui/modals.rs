@@ -1,7 +1,7 @@
 use super::{NewItemTemplate, PaneSide, QuickSwitcherState, TabKind, VKarmaApp, file_kind_color};
 use crate::config::WorkspacePreset;
 use crate::spreadsheet::SpreadsheetDoc;
-use crate::theme::{hex_alpha, hex_color, kd};
+use crate::theme::{accent_alpha, hex_alpha, hex_color, kd};
 use crate::vault::{create_new_file, create_new_folder, delete_entry};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
@@ -30,7 +30,7 @@ pub fn render_quick_switcher_overlay(
         .id("quick-switcher-backdrop")
         .absolute()
         .inset_0()
-        .bg(hex_alpha(0x0d0c0ca8))
+        .bg(hex_alpha(0x0e0b14a8))
         .flex()
         .justify_center()
         .items_start()
@@ -50,7 +50,7 @@ pub fn render_quick_switcher_overlay(
                 .rounded(px(10.))
                 .bg(hex_color(kd::BG_SIDEBAR))
                 .border_1()
-                .border_color(hex_color(kd::BLUE))
+                .border_color(hex_color(kd::ACCENT))
                 .shadow_lg()
                 .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
                     cx.stop_propagation();
@@ -93,7 +93,7 @@ pub fn render_quick_switcher_overlay(
                                 .prefix(
                                     gpui_kit::component::Icon::new(IconName::Search)
                                         .small()
-                                        .text_color(hex_color(kd::BLUE)),
+                                        .text_color(hex_color(kd::ACCENT)),
                                 ),
                         ),
                 )
@@ -132,7 +132,7 @@ pub fn render_quick_switcher_overlay(
                                         .justify_between()
                                         .gap_2()
                                         .cursor_pointer()
-                                        .when(is_sel, |s| s.bg(hex_alpha(0x8ba4b02e)))
+                                        .when(is_sel, |s| s.bg(accent_alpha(0x2e)))
                                         .hover(|s| s.bg(hex_color(kd::BG_PANEL)))
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.quick_switcher = None;

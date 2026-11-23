@@ -1,7 +1,7 @@
 use super::{TabKind, VKarmaApp};
 use crate::formats::archive::format_bytes;
 use crate::formats::audio::{AudioAnalysis, AudioPlayer, analyze_audio, format_time_mmss};
-use crate::theme::{hex_alpha, hex_color, kd};
+use crate::theme::{accent_alpha, hex_color, kd};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -322,9 +322,9 @@ impl Render for AudioView {
                     let bx = ox + (ix as f32) * slot_w + (slot_w - bar_w) * 0.5;
                     let by = mid_y - bh * 0.5;
                     let col = if frac <= progress {
-                        hex_color(kd::BLUE)
+                        hex_color(kd::ACCENT)
                     } else {
-                        hex_alpha(0x8ba4b044)
+                        accent_alpha(0x44)
                     };
                     window.paint_quad(fill(
                         Bounds {
@@ -601,7 +601,7 @@ impl Render for AudioView {
                                         div()
                                             .text_xs()
                                             .font_weight(FontWeight::BOLD)
-                                            .text_color(hex_color(kd::BLUE))
+                                            .text_color(hex_color(kd::ACCENT))
                                             .child(format!(
                                                 "Timestamped Notes ({})",
                                                 self.notes.len()
