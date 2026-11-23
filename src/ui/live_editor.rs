@@ -2167,7 +2167,11 @@ impl Render for LiveMarkdownEditor {
                     table_end_line
                 };
                 let y_last = self.height_table.y_for_line(visual_last_li);
-                let frame_h_last = if let Some(cached) = self.layout_cache.get(&visual_last_li) {
+                let frame_h_last = if let Some(cached) = self
+                    .layout_cache
+                    .get(&visual_last_li)
+                    .filter(|c| c.doc_version == self.doc.version)
+                {
                     let bot_margin = if let Some(tr) = &cached.table_row {
                         tr.frame_bottom_margin
                     } else if visual_last_li == delim_li && cached.total_height > 0.5 {
