@@ -1,7 +1,7 @@
 mod config;
 mod formats;
 mod fountain;
-mod live_md;
+use vkarma_core::live_md;
 mod markdown;
 mod pdf_engine;
 mod spreadsheet;

@@ -1,0 +1,14 @@
+[package]
+name = "vkarma-core"
+version = "0.1.0"
+edition = "2024"
+description = "Shared live Markdown buffer/projection engine, image spec parser, and atomic file helpers for VKarma desktop & Android"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+
+[dev-dependencies]
+tempfile = "3"
+
+[workspace]

@@ -1,6 +1,6 @@
 extern crate gpui_mobile;
 
-pub mod live_md;
+pub use vkarma_core::live_md;
 pub mod theme;
 pub mod ui;
 pub mod vault;

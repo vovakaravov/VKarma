@@ -7259,8 +7259,16 @@ dependencies = [
  "toml 0.8.23",
  "tree-sitter",
  "ttf-parser",
+ "vkarma-core",
  "walkdir",
  "zip",
+]
+
+[[package]]
+name = "vkarma-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]

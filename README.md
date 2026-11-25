@@ -120,11 +120,11 @@ EOF
 
 ---
 
-## Android Companion (`mobile/`)
+## Shared Core & Android Companion (`core/`, `mobile/`)
 
-The native **VKarma Mobile** Android companion app lives under `mobile/` (`vkarma-mobile`), providing a local/Syncthing-friendly Markdown vault browser and live token-concealing Markdown editor powered by `gpui-mobile`.
+Both the Linux desktop app and the Android companion app (`mobile/`, `vkarma-mobile`) share [`core/`](core/Cargo.toml) (`vkarma-core`) for the live Markdown buffer/projection engine, image spec & header-dimension probing, formatting actions, and atomic file writes.
 
-Requires `cargo-ndk`, the Android SDK/NDK, and `adb`:
+The Android app provides a local/Syncthing-friendly Markdown vault browser and live token-concealing Markdown editor powered by `gpui-mobile` (requires `cargo-ndk`, the Android SDK/NDK, and `adb`):
 
 ```bash
 cd mobile && ./deploy.sh

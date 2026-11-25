@@ -1037,25 +1037,7 @@ pub fn extract_headings(content: &str, is_typst: bool) -> Vec<OutlineHeading> {
     out
 }
 
-pub fn atomic_write_string(path: &Path, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create parent dir {}", parent.display()))?;
-    }
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file");
-    let tmp = path.with_file_name(format!(".{file_name}.vkarma-tmp"));
-    fs::write(&tmp, content).with_context(|| format!("write temp file {}", tmp.display()))?;
-    if fs::rename(&tmp, path).is_err() {
-        let _ = fs::remove_file(&tmp);
-        fs::write(path, content).with_context(|| format!("write file {}", path.display()))?;
-    }
-    Ok(())
-}
+pub use vkarma_core::fs_util::atomic_write_string;
 
 pub fn normalize_new_file_name(raw_name: &str) -> String {
     let trimmed = raw_name.trim().trim_start_matches(['/', '\\']);

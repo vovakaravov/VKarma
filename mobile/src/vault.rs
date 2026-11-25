@@ -103,18 +103,7 @@ pub struct WikilinkRef {
     pub display: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MarkdownFormatAction {
-    Heading,
-    Bold,
-    Italic,
-    Checkbox,
-    Bullet,
-    Quote,
-    Code,
-    Wikilink,
-    HorizontalRule,
-}
+pub use vkarma_core::live_md::MarkdownFormatAction;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -1345,28 +1334,7 @@ pub fn find_line_matches(content: &str, query: &str, limit: usize) -> Vec<(usize
         .collect()
 }
 
-pub fn atomic_write_string(path: &Path, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create parent dir {}", parent.display()))?;
-    }
-    let fname = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("note.md");
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = parent.join(format!(".{fname}.vkarma-tmp-{}", std::process::id()));
-
-    if fs::write(&tmp, content.as_bytes()).is_ok() {
-        if fs::rename(&tmp, path).is_ok() {
-            return Ok(());
-        }
-        let _ = fs::remove_file(&tmp);
-    }
-
-    fs::write(path, content.as_bytes())
-        .with_context(|| format!("Failed to write {}", path.display()))
-}
+pub use vkarma_core::fs_util::atomic_write_string;
 
 pub fn sanitize_note_filename(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());

@@ -1,6 +1,21 @@
-use crate::markdown::{StyledImageSpec, compute_image_display_size, format_image_spec, parse_image_spec};
+pub use crate::image_spec::{
+    ImageAlign, StyledImageSpec, compute_image_display_size, format_image_spec, parse_image_spec,
+};
 use std::ops::Range;
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkdownFormatAction {
+    Heading,
+    Bold,
+    Italic,
+    Checkbox,
+    Bullet,
+    Quote,
+    Code,
+    Wikilink,
+    HorizontalRule,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TableAlign {
@@ -2548,6 +2563,111 @@ impl LiveDocBuffer {
         true
     }
 
+    pub fn apply_mobile_format(&mut self, action: MarkdownFormatAction) -> bool {
+        match action {
+            MarkdownFormatAction::Bold => {
+                self.toggle_wrap("**");
+                true
+            }
+            MarkdownFormatAction::Italic => {
+                self.toggle_wrap("*");
+                true
+            }
+            MarkdownFormatAction::Code => {
+                self.toggle_wrap("`");
+                true
+            }
+            MarkdownFormatAction::Heading => self.cycle_heading_prefix(),
+            MarkdownFormatAction::Checkbox => self.toggle_line_prefix("- [ ] "),
+            MarkdownFormatAction::Bullet => self.toggle_line_prefix("- "),
+            MarkdownFormatAction::Quote => self.toggle_line_prefix("> "),
+            MarkdownFormatAction::Wikilink => {
+                let sel = self.selection_range();
+                if self.has_selection() {
+                    let inner = self.text[sel.clone()].to_string();
+                    let wrapped = format!("[[{inner}]]");
+                    let start = sel.start + 2;
+                    let end = start + inner.len();
+                    self.replace_range(sel, &wrapped, EditKind::Atomic);
+                    self.set_selection(start, end);
+                } else {
+                    let caret = self.head + 2;
+                    self.replace_range(self.head..self.head, "[[]]", EditKind::Atomic);
+                    self.set_cursor(caret, false);
+                }
+                true
+            }
+            MarkdownFormatAction::HorizontalRule => {
+                self.insert_text("\n---\n");
+                true
+            }
+        }
+    }
+
+    fn cycle_heading_prefix(&mut self) -> bool {
+        let li = self.line_index_for_byte(self.head);
+        let Some(dl) = self.lines.get(li).cloned() else {
+            return false;
+        };
+        let raw_line = &self.text[dl.byte_start..dl.byte_end];
+        let trimmed = raw_line.trim_start();
+        let ws_len = raw_line.len() - trimmed.len();
+        let existing_hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
+        let has_heading = existing_hashes > 0 && trimmed[existing_hashes..].starts_with(' ');
+
+        let caret_local = self.head.saturating_sub(dl.byte_start);
+        if has_heading {
+            let prefix_end = dl.byte_start + ws_len + existing_hashes + 1;
+            if existing_hashes < 3 {
+                // Promote # -> ## or ## -> ###
+                self.replace_range(
+                    dl.byte_start + ws_len..dl.byte_start + ws_len,
+                    "#",
+                    EditKind::Atomic,
+                );
+                let new_head = (dl.byte_start + caret_local + 1).min(self.text.len());
+                self.set_cursor(clamp_char_boundary(&self.text, new_head), false);
+            } else {
+                // Cycle off after ###
+                let del_len = prefix_end - (dl.byte_start + ws_len);
+                self.replace_range(dl.byte_start + ws_len..prefix_end, "", EditKind::Atomic);
+                let new_local = caret_local.saturating_sub(del_len);
+                let new_head = (dl.byte_start + new_local).min(self.text.len());
+                self.set_cursor(clamp_char_boundary(&self.text, new_head), false);
+            }
+        } else {
+            let add_at = dl.byte_start + ws_len;
+            self.replace_range(add_at..add_at, "## ", EditKind::Atomic);
+            let new_head = (dl.byte_start + caret_local + 3).min(self.text.len());
+            self.set_cursor(clamp_char_boundary(&self.text, new_head), false);
+        }
+        true
+    }
+
+    fn toggle_line_prefix(&mut self, prefix: &str) -> bool {
+        let li = self.line_index_for_byte(self.head);
+        let Some(dl) = self.lines.get(li).cloned() else {
+            return false;
+        };
+        let raw_line = &self.text[dl.byte_start..dl.byte_end];
+        let ws_len = raw_line.len() - raw_line.trim_start().len();
+        let after_ws = &raw_line[ws_len..];
+        let caret_local = self.head.saturating_sub(dl.byte_start);
+        let start = dl.byte_start + ws_len;
+
+        if after_ws.starts_with(prefix) {
+            self.replace_range(start..start + prefix.len(), "", EditKind::Atomic);
+            let new_local = caret_local.saturating_sub(prefix.len());
+            let new_head = (dl.byte_start + new_local).min(self.text.len());
+            self.set_cursor(clamp_char_boundary(&self.text, new_head), false);
+        } else {
+            self.replace_range(start..start, prefix, EditKind::Atomic);
+            let new_head = (dl.byte_start + caret_local + prefix.len()).min(self.text.len());
+            self.set_cursor(clamp_char_boundary(&self.text, new_head), false);
+        }
+        true
+    }
+
     pub fn table_column_count(&self, start_li: usize, end_li: usize) -> usize {
         let mut cols = 1usize;
         let end = end_li.min(self.lines.len().saturating_sub(1));
@@ -3731,7 +3851,7 @@ mod tests {
 
         let mut spec = parse_image_spec("300|left");
         spec.width = Some(420.0);
-        spec.align = crate::markdown::ImageAlign::Right;
+        spec.align = ImageAlign::Right;
         spec.wrap = true;
         spec.border = true;
 
@@ -3841,5 +3961,35 @@ mod tests {
         assert_eq!(multi.version, ver);
         assert!(multi.undo());
         assert_eq!(multi.text, "  Alpha\n  Beta");
+    }
+
+    #[test]
+    fn mobile_format_toolbar_actions_transform_lines_and_caret() {
+        let mut buf = LiveDocBuffer::new("Hello world".to_string(), false);
+        buf.set_cursor(5, false);
+
+        assert!(buf.apply_mobile_format(MarkdownFormatAction::Heading));
+        assert_eq!(buf.text, "## Hello world");
+        assert!(buf.apply_mobile_format(MarkdownFormatAction::Heading));
+        assert_eq!(buf.text, "### Hello world");
+        assert!(buf.apply_mobile_format(MarkdownFormatAction::Heading));
+        assert_eq!(buf.text, "Hello world");
+
+        buf.set_selection(0, 5);
+        assert!(buf.apply_mobile_format(MarkdownFormatAction::Bold));
+        assert_eq!(buf.text, "**Hello** world");
+        assert!(buf.apply_mobile_format(MarkdownFormatAction::Bold));
+        assert_eq!(buf.text, "Hello world");
+
+        buf.set_cursor(11, false);
+        assert!(buf.apply_mobile_format(MarkdownFormatAction::Checkbox));
+        assert_eq!(buf.text, "- [ ] Hello world");
+        assert!(buf.apply_mobile_format(MarkdownFormatAction::Checkbox));
+        assert_eq!(buf.text, "Hello world");
+
+        buf.set_cursor(buf.text.len(), false);
+        assert!(buf.apply_mobile_format(MarkdownFormatAction::Wikilink));
+        assert_eq!(buf.text, "Hello world[[]]");
+        assert_eq!(buf.head, "Hello world[[".len());
     }
 }
