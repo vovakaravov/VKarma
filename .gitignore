@@ -1,6 +1,19 @@
 /target
+**/target/
 **/*.rs.bk
 .DS_Store
 *.swp
 .idea/
 .vscode/
+
+# Android / Gradle build outputs & machine-local SDK config (mobile/)
+mobile/android/.gradle/
+mobile/android/build/
+mobile/android/app/build/
+mobile/android/local.properties
+mobile/android/app/src/main/jniLibs/
+*.apk
+*.aab
+*.so
+*.keystore
+*.jks

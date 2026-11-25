@@ -120,6 +120,18 @@ EOF
 
 ---
 
+## Android Companion (`mobile/`)
+
+The native **VKarma Mobile** Android companion app lives under `mobile/` (`vkarma-mobile`), providing a local/Syncthing-friendly Markdown vault browser and live token-concealing Markdown editor powered by `gpui-mobile`.
+
+Requires `cargo-ndk`, the Android SDK/NDK, and `adb`:
+
+```bash
+cd mobile && ./deploy.sh
+```
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

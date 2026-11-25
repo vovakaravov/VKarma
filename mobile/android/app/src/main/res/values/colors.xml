@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- VKarma Kanagawa Dragon surface color (#181619) -->
+    <color name="gpui_surface">#FF181619</color>
+    <color name="vkarma_accent">#FF957FB8</color>
+</resources>
