@@ -1,11 +1,14 @@
+use super::find_bar::{
+    EditorFindBar, FIND_INPUT_W, find_count_badge, floating_find_card, wrap_editor_with_find,
+};
 use super::{PaneSide, TabKind, VKarmaApp};
 use crate::formats::canvas::{CanvasDoc, CanvasNode, canvas_color_u32, edge_endpoints};
 use crate::theme::{accent_alpha, hex_alpha, hex_color, kd};
 use crate::vault::{VaultIndex, is_image_extension};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
-use gpui_kit::component::input::{Editor, EditorState, InputEvent};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, CursorStyle, Entity, EventEmitter,
     FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
@@ -66,10 +69,18 @@ pub struct CanvasView {
     connect_from: Option<String>,
     source_mode: bool,
     source_editor: Entity<EditorState>,
+    source_find_bar: Entity<EditorFindBar>,
     _source_sub: Subscription,
     editing_node: Option<NodeEditState>,
     drag: Option<CanvasDrag>,
     initial_fit_pending: bool,
+    find_open: bool,
+    find_input: Entity<InputState>,
+    _find_sub: Option<Subscription>,
+    find_query: String,
+    find_matches: Vec<String>,
+    find_active: usize,
+    find_needs_focus: bool,
 }
 
 impl EventEmitter<CanvasViewEvent> for CanvasView {}
@@ -91,11 +102,13 @@ impl CanvasView {
     ) -> Self {
         let source_editor = cx.new(|cx| {
             EditorState::new(window, cx)
+                .searchable(false)
                 .language("json")
                 .soft_wrap(false)
                 .line_number(true)
                 .default_value(raw_source)
         });
+        let source_find_bar = cx.new(|cx| EditorFindBar::new(source_editor.clone(), window, cx));
         let source_sub = cx.subscribe(&source_editor, |this, _, event, cx| {
             if matches!(event, InputEvent::Change) && this.source_mode {
                 cx.emit(CanvasViewEvent::Changed);
@@ -117,10 +130,18 @@ impl CanvasView {
             connect_from: None,
             source_mode: false,
             source_editor,
+            source_find_bar,
             _source_sub: source_sub,
             editing_node: None,
             drag: None,
             initial_fit_pending: true,
+            find_open: false,
+            find_input: cx.new(|cx| InputState::new(window, cx).placeholder("Find nodes…")),
+            _find_sub: None,
+            find_query: String::new(),
+            find_matches: Vec::new(),
+            find_active: 0,
+            find_needs_focus: false,
         }
     }
 
@@ -278,6 +299,258 @@ impl CanvasView {
         cx.notify();
     }
 
+    pub fn is_find_open(&self, cx: &App) -> bool {
+        if self.source_mode {
+            self.source_find_bar.read(cx).is_open()
+        } else {
+            self.find_open
+        }
+    }
+
+    fn ensure_find_subscription(&mut self, cx: &mut Context<Self>) {
+        if self._find_sub.is_some() {
+            return;
+        }
+        let sub = cx.subscribe(&self.find_input, |this, state, event, cx| {
+            match event {
+                InputEvent::Change => {
+                    this.find_query = state.read(cx).value().to_string();
+                    this.recompute_find(true);
+                    cx.notify();
+                }
+                InputEvent::PressEnter {
+                    secondary, shift, ..
+                } => {
+                    this.step_find(!(*shift || *secondary));
+                    cx.notify();
+                }
+                _ => {}
+            }
+        });
+        self._find_sub = Some(sub);
+    }
+
+    pub fn open_find(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.source_mode {
+            self.source_find_bar
+                .update(cx, |b, cx| b.open(replace, window, cx));
+            cx.notify();
+            return;
+        }
+        self.ensure_find_subscription(cx);
+        self.find_open = true;
+        self.find_needs_focus = true;
+        let query = self.find_input.read(cx).value().to_string();
+        if query != self.find_query {
+            self.find_query = query;
+        }
+        self.recompute_find(false);
+        self.find_input.update(cx, |s, cx| {
+            let len = s.value().len();
+            s.focus(window, cx);
+            if len > 0 {
+                s.set_selected_range(0..len, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    pub fn close_find(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        if self.source_mode {
+            self.source_find_bar
+                .update(cx, |b, cx| b.close(window, cx));
+            cx.notify();
+            return;
+        }
+        if !self.find_open {
+            return;
+        }
+        self.find_open = false;
+        self.find_needs_focus = false;
+        if let Some(window) = window {
+            self.focus_handle.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn node_matches_query(node: &CanvasNode, q_lower: &str) -> bool {
+        if q_lower.is_empty() {
+            return false;
+        }
+        let contains = |opt: &Option<String>| {
+            opt.as_deref()
+                .is_some_and(|s| s.to_lowercase().contains(q_lower))
+        };
+        contains(&node.text)
+            || contains(&node.label)
+            || contains(&node.file)
+            || contains(&node.url)
+    }
+
+    fn recompute_find(&mut self, jump: bool) {
+        self.find_matches.clear();
+        let q_lower = self.find_query.trim().to_lowercase();
+        if q_lower.is_empty() {
+            self.find_active = 0;
+            return;
+        }
+        for node in &self.doc.nodes {
+            if Self::node_matches_query(node, &q_lower) {
+                self.find_matches.push(node.id.clone());
+            }
+        }
+        if self.find_matches.is_empty() {
+            self.find_active = 0;
+            return;
+        }
+        if jump {
+            self.find_active = 0;
+            self.focus_active_match_node();
+        } else if self.find_active >= self.find_matches.len() {
+            self.find_active = 0;
+        }
+    }
+
+    pub fn step_find(&mut self, forward: bool) {
+        if self.find_matches.is_empty() {
+            return;
+        }
+        let len = self.find_matches.len();
+        self.find_active = if forward {
+            (self.find_active + 1) % len
+        } else {
+            (self.find_active + len - 1) % len
+        };
+        self.focus_active_match_node();
+    }
+
+    fn focus_active_match_node(&mut self) {
+        let Some(nid) = self.find_matches.get(self.find_active).cloned() else {
+            return;
+        };
+        let Some(node) = self.doc.nodes.iter().find(|n| n.id == nid) else {
+            return;
+        };
+        self.selected_node = Some(nid);
+        self.selected_edge = None;
+        let (_, _, vp_w, vp_h) = self.board_geo.get();
+        let vp_w = if vp_w > 40.0 { vp_w } else { 800.0 };
+        let vp_h = if vp_h > 40.0 { vp_h } else { 520.0 };
+        let mid_x = (node.x + node.width * 0.5) as f32;
+        let mid_y = (node.y + node.height * 0.5) as f32;
+        self.pan_x = vp_w * 0.5 - mid_x * self.zoom;
+        self.pan_y = vp_h * 0.5 - mid_y * self.zoom;
+    }
+
+    fn render_find_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.find_needs_focus {
+            self.find_needs_focus = false;
+            self.find_input.focus_handle(cx).focus(window, cx);
+        }
+        let total = self.find_matches.len();
+        let raw_q = self.find_query.clone();
+        let trimmed_non_empty = !raw_q.trim().is_empty();
+        let count_text = if !trimmed_non_empty {
+            String::new()
+        } else if total == 0 {
+            "0 / 0".to_string()
+        } else {
+            format!("{} / {}", self.find_active + 1, total)
+        };
+        let clear_btn = Button::new(SharedString::from(format!(
+            "cnv-find-x-{:?}",
+            cx.entity_id()
+        )))
+        .text()
+        .xsmall()
+        .tab_stop(false)
+        .icon(IconName::Close)
+        .tooltip("Clear")
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.find_input.update(cx, |s, cx| s.set_value("", window, cx));
+            this.find_query.clear();
+            this.recompute_find(false);
+            this.find_input.focus_handle(cx).focus(window, cx);
+            cx.notify();
+        }));
+
+        floating_find_card(SharedString::from(format!("cnv-find-ov-{:?}", cx.entity_id())))
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                if ev.keystroke.key.as_str() == "escape" {
+                    cx.stop_propagation();
+                    this.close_find(Some(window), cx);
+                } else if ev.keystroke.key.as_str() == "f3" {
+                    cx.stop_propagation();
+                    this.step_find(!ev.keystroke.modifiers.shift);
+                    cx.notify();
+                }
+            }))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div().w(px(FIND_INPUT_W)).child(
+                            Input::new(&self.find_input)
+                                .xsmall()
+                                .prefix(
+                                    Icon::new(IconName::Search)
+                                        .xsmall()
+                                        .text_color(hex_color(kd::FG_MUTED)),
+                                )
+                                .when(!raw_q.is_empty(), |i| i.suffix(clear_btn)),
+                        ),
+                    )
+                    .when(!count_text.is_empty(), |row| {
+                        row.child(find_count_badge(count_text, trimmed_non_empty && total == 0))
+                    })
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "cnv-find-prev-{:?}",
+                            cx.entity_id()
+                        )))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::ChevronUp)
+                        .tooltip("Previous Node (Shift+Enter)")
+                        .disabled(total == 0)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.step_find(false);
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "cnv-find-next-{:?}",
+                            cx.entity_id()
+                        )))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::ChevronDown)
+                        .tooltip("Next Node (Enter)")
+                        .disabled(total == 0)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.step_find(true);
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "cnv-find-close-{:?}",
+                            cx.entity_id()
+                        )))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .tooltip("Close (Esc)")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.close_find(Some(window), cx);
+                        })),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn zoom_around(&mut self, screen_x: f32, screen_y: f32, next_zoom: f32) {
         let clamped = next_zoom.clamp(0.2, 2.5);
         let world_x = (screen_x - self.pan_x) / self.zoom;
@@ -298,6 +571,7 @@ impl CanvasView {
         };
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
+                .searchable(false)
                 .soft_wrap(true)
                 .default_value(initial)
         });
@@ -401,9 +675,23 @@ impl CanvasView {
             .as_ref()
             .is_some_and(|e| e.node_id == node.id);
 
+        let active_find_match = self.find_open
+            && !self.find_query.trim().is_empty()
+            && self
+                .find_matches
+                .get(self.find_active)
+                .is_some_and(|id| id == &node.id);
+        let any_find_match = self.find_open
+            && !self.find_query.trim().is_empty()
+            && self.find_matches.iter().any(|id| id == &node.id);
+
         let accent = canvas_color_u32(node.color.as_deref());
         let border_color = if is_connect_src {
             hex_color(kd::ORANGE)
+        } else if active_find_match {
+            hex_color(0xe8a849)
+        } else if any_find_match {
+            hex_color(0xc4b28a)
         } else if is_selected {
             hex_color(kd::ACCENT)
         } else if let Some(c) = accent {
@@ -615,8 +903,8 @@ impl CanvasView {
             .h(px(sh))
             .rounded(px((8.0 * self.zoom).clamp(4.0, 12.0)))
             .bg(bg_color)
-            .when(is_selected || is_connect_src, |s| s.border_2())
-            .when(!is_selected && !is_connect_src, |s| s.border_1())
+            .when(is_selected || is_connect_src || any_find_match, |s| s.border_2())
+            .when(!is_selected && !is_connect_src && !any_find_match, |s| s.border_1())
             .border_color(border_color)
             .p(px((10.0 * self.zoom).clamp(5.0, 14.0)))
             .overflow_hidden()
@@ -719,12 +1007,15 @@ impl Render for CanvasView {
             return div()
                 .size_full()
                 .bg(hex_color(kd::BG_MAIN))
-                .child(
+                .child(wrap_editor_with_find(
                     Editor::new(&self.source_editor)
                         .size_full()
                         .appearance(false)
-                        .bordered(false),
-                )
+                        .bordered(false)
+                        .into_any_element(),
+                    &self.source_find_bar,
+                    cx,
+                ))
                 .into_any_element();
         }
 
@@ -945,7 +1236,7 @@ impl Render for CanvasView {
                     CursorStyle::OpenHand
                 })
             })
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if this.editing_node.is_some() {
                     if ev.keystroke.key == "escape" {
                         cx.stop_propagation();
@@ -959,13 +1250,22 @@ impl Render for CanvasView {
                         cx.stop_propagation();
                         this.delete_selected(cx);
                     }
+                    "f3" if this.find_open => {
+                        cx.stop_propagation();
+                        this.step_find(!ev.keystroke.modifiers.shift);
+                        cx.notify();
+                    }
                     "escape" => {
                         cx.stop_propagation();
-                        this.selected_node = None;
-                        this.selected_edge = None;
-                        this.connect_mode = false;
-                        this.connect_from = None;
-                        cx.notify();
+                        if this.find_open {
+                            this.close_find(Some(window), cx);
+                        } else {
+                            this.selected_node = None;
+                            this.selected_edge = None;
+                            this.connect_mode = false;
+                            this.connect_from = None;
+                            cx.notify();
+                        }
                     }
                     _ => {}
                 }
@@ -1096,6 +1396,9 @@ impl Render for CanvasView {
             }))
             .child(bg_canvas)
             .children(node_elements)
+            .when(self.find_open, |board| {
+                board.child(self.render_find_overlay(window, cx))
+            })
             .into_any_element()
     }
 }
@@ -1120,6 +1423,7 @@ pub fn render_canvas_tab(
     let connect_mode = cv_read.connect_mode;
     let connect_from = cv_read.connect_from.is_some();
     let source_mode = cv_read.source_mode;
+    let find_open = cv_read.is_find_open(cx);
 
     let color_presets: [(&str, u32); 6] = [
         ("1", 0xc4746e),
@@ -1130,6 +1434,7 @@ pub fn render_canvas_tab(
         ("6", 0xa292a3),
     ];
 
+    let v_find = view.clone();
     let v_card = view.clone();
     let v_group = view.clone();
     let v_conn = view.clone();
@@ -1173,6 +1478,20 @@ pub fn render_canvas_tab(
             h_flex()
                 .gap_1()
                 .items_center()
+                .child(
+                    Button::new(SharedString::from(format!("cnv-find-{tab_id}")))
+                        .with_variant(if find_open {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Ghost
+                        })
+                        .xsmall()
+                        .icon(IconName::Search)
+                        .tooltip("Find Nodes (Ctrl+F)")
+                        .on_click(cx.listener(move |_, _, window, cx| {
+                            v_find.update(cx, |v, cx| v.open_find(false, window, cx));
+                        })),
+                )
                 .when(!source_mode, |this| {
                     this.child(
                         Button::new(SharedString::from(format!("cnv-add-card-{tab_id}")))

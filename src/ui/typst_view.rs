@@ -19,6 +19,7 @@ pub fn render_typst_tab(
 ) -> impl IntoElement {
     let TabKind::Typst {
         editor,
+        find_bar,
         view_mode,
         zoom,
         pages,
@@ -35,6 +36,8 @@ pub fn render_typst_tab(
     let rel_path = tab.rel_path.clone();
     let dirty = tab.dirty;
     let view_mode = *view_mode;
+    let find_is_open = find_bar.read(cx).is_open();
+    let fb_btn = find_bar.clone();
     let zoom = *zoom;
     let compile_ms = *compile_ms;
     let compiling = *compiling;
@@ -195,6 +198,27 @@ pub fn render_typst_tab(
                         ),
                 )
                 .child(
+                    Button::new(SharedString::from(format!("typ-find-{tab_id}")))
+                        .with_variant(if find_is_open {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Ghost
+                        })
+                        .xsmall()
+                        .icon(IconName::Search)
+                        .tooltip("Find & Replace (Ctrl+F)")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let Some(t) = this.find_tab_mut(side, tab_id)
+                                && let TabKind::Typst { view_mode, .. } = &mut t.kind
+                                && *view_mode == TypstViewMode::Preview
+                            {
+                                *view_mode = TypstViewMode::Split;
+                            }
+                            fb_btn.update(cx, |b, cx| b.open(false, window, cx));
+                            cx.notify();
+                        })),
+                )
+                .child(
                     Button::new(SharedString::from(format!("typ-pdf-{tab_id}")))
                         .secondary()
                         .xsmall()
@@ -219,12 +243,16 @@ pub fn render_typst_tab(
         );
 
     let zen_mode = app.zen_mode;
-    let editor_el = super::zen_editor_frame(
-        Editor::new(editor)
-            .size_full()
-            .appearance(false)
-            .bordered(false),
-        zen_mode && view_mode == TypstViewMode::Edit,
+    let editor_el = super::find_bar::wrap_editor_with_find(
+        super::zen_editor_frame(
+            Editor::new(editor)
+                .size_full()
+                .appearance(false)
+                .bordered(false),
+            zen_mode && view_mode == TypstViewMode::Edit,
+        ),
+        find_bar,
+        cx,
     );
 
     let preview_el = render_typst_preview(side, tab_id, &pages, last_error, zoom, compiling);

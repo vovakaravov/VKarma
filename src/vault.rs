@@ -1193,6 +1193,124 @@ pub fn create_adaptive_file(dest: &Path) -> Result<()> {
     }
 }
 
+/// Finds all non-overlapping UTF-8 byte ranges in `haystack` matching `query`.
+pub fn find_all_byte_ranges(
+    haystack: &str,
+    query: &str,
+    case_sensitive: bool,
+) -> Vec<std::ops::Range<usize>> {
+    if query.is_empty() || haystack.len() < (if case_sensitive { query.len() } else { 1 }) {
+        return Vec::new();
+    }
+    if case_sensitive {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while let Some(rel) = haystack[pos..].find(query) {
+            let start = pos + rel;
+            let end = start + query.len();
+            out.push(start..end);
+            pos = end;
+        }
+        return out;
+    }
+    if haystack.is_ascii() && query.is_ascii() {
+        let hb = haystack.as_bytes();
+        let qb = query.as_bytes();
+        let qlen = qb.len();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + qlen <= hb.len() {
+            if hb[i..i + qlen].eq_ignore_ascii_case(qb) {
+                out.push(i..i + qlen);
+                i += qlen;
+            } else {
+                i += 1;
+            }
+        }
+        return out;
+    }
+
+    let q_chars: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    if q_chars.is_empty() {
+        return Vec::new();
+    }
+    let mut lowered: Vec<(usize, usize, char)> = Vec::with_capacity(haystack.len());
+    for (byte_start, ch) in haystack.char_indices() {
+        let byte_end = byte_start + ch.len_utf8();
+        for lc in ch.to_lowercase() {
+            lowered.push((byte_start, byte_end, lc));
+        }
+    }
+    let qlen = q_chars.len();
+    let mut out = Vec::new();
+    let mut k = 0;
+    while k + qlen <= lowered.len() {
+        let starts_char = k == 0 || lowered[k].0 != lowered[k - 1].0;
+        let end_k = k + qlen;
+        let ends_char = end_k == lowered.len() || lowered[end_k].0 != lowered[end_k - 1].0;
+        if starts_char
+            && ends_char
+            && lowered[k..end_k]
+                .iter()
+                .zip(q_chars.iter())
+                .all(|(a, b)| a.2 == *b)
+        {
+            out.push(lowered[k].0..lowered[end_k - 1].1);
+            k = end_k;
+        } else {
+            k += 1;
+        }
+    }
+    out
+}
+
+/// Merges base highlight styles with search match ranges into strictly sorted, non-overlapping spans.
+pub fn merge_highlight_ranges<T: Clone>(
+    base: &[(std::ops::Range<usize>, T)],
+    matches: &[std::ops::Range<usize>],
+    active_rel: Option<usize>,
+    make_style: impl Fn(Option<&T>, bool) -> T,
+) -> Vec<(std::ops::Range<usize>, T)> {
+    if matches.is_empty() {
+        return base.to_vec();
+    }
+    let mut pts = Vec::with_capacity((base.len() + matches.len()) * 2);
+    for (r, _) in base {
+        if r.start < r.end {
+            pts.push(r.start);
+            pts.push(r.end);
+        }
+    }
+    for r in matches {
+        if r.start < r.end {
+            pts.push(r.start);
+            pts.push(r.end);
+        }
+    }
+    if pts.len() < 2 {
+        return Vec::new();
+    }
+    pts.sort_unstable();
+    pts.dedup();
+
+    let mut out = Vec::new();
+    for w in pts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let base_style = base
+            .iter()
+            .rev()
+            .find(|(r, _)| r.start <= a && r.end >= b)
+            .map(|(_, s)| s);
+        let match_ix = matches.iter().position(|r| r.start <= a && r.end >= b);
+        match (base_style, match_ix) {
+            (None, None) => continue,
+            (Some(bs), None) => out.push((a..b, bs.clone())),
+            (bs, Some(ix)) => out.push((a..b, make_style(bs, active_rel == Some(ix)))),
+        }
+    }
+    out
+}
+
 pub fn create_new_folder(path: &Path) -> Result<()> {
     if path.exists() {
         anyhow::bail!("Folder already exists: {}", path.display());
@@ -1627,5 +1745,44 @@ mod tests {
 
         // Creating an existing file fails cleanly
         assert!(create_adaptive_file(&cs).is_err());
+    }
+
+    #[test]
+    fn find_all_byte_ranges_and_merge_highlights_handle_unicode_and_overlaps() {
+        assert!(find_all_byte_ranges("abc", "", false).is_empty());
+        assert_eq!(find_all_byte_ranges("Abc abc ABC", "abc", false), vec![0..3, 4..7, 8..11]);
+        assert_eq!(find_all_byte_ranges("Abc abc ABC", "abc", true), vec![4..7]);
+
+        // Unicode (Cyrillic + accented Latin) case-insensitive byte offsets
+        let uni = "Привет мир, привет café CAFÉ";
+        let cyr = find_all_byte_ranges(uni, "привет", false);
+        assert_eq!(cyr.len(), 2);
+        assert_eq!(&uni[cyr[0].clone()], "Привет");
+        assert_eq!(&uni[cyr[1].clone()], "привет");
+
+        let lat = find_all_byte_ranges(uni, "café", false);
+        assert_eq!(lat.len(), 2);
+        assert_eq!(&uni[lat[0].clone()], "café");
+        assert_eq!(&uni[lat[1].clone()], "CAFÉ");
+
+        // Merging overlapping base styles and search highlights yields sorted non-overlapping ranges
+        let base = vec![(0..6, 1u8), (8..15, 2u8)];
+        let matches = vec![(3..10, ), (12..14, )].into_iter().map(|t| t.0).collect::<Vec<_>>();
+        let merged = merge_highlight_ranges(&base, &matches, Some(1), |base_opt, active| {
+            let b = base_opt.copied().unwrap_or(0);
+            if active { 100 + b } else { 10 + b }
+        });
+        assert_eq!(
+            merged,
+            vec![
+                (0..3, 1),
+                (3..6, 11),
+                (6..8, 10),
+                (8..10, 12),
+                (10..12, 2),
+                (12..14, 102),
+                (14..15, 2),
+            ]
+        );
     }
 }

@@ -35,6 +35,19 @@ impl Focusable for ArchiveView {
 }
 
 impl ArchiveView {
+    pub fn focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.filter_input.update(cx, |s, cx| {
+            let len = s.value().len();
+            s.focus(window, cx);
+            if len > 0 {
+                s.set_selected_range(0..len, cx);
+            }
+        });
+        cx.notify();
+    }
+}
+
+impl ArchiveView {
     pub fn new(archive_path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (index, load_err) = match ArchiveIndex::load(&archive_path) {
             Ok(idx) => (idx, None),
@@ -327,7 +340,34 @@ impl Render for ArchiveView {
                             .p_2()
                             .border_b_1()
                             .border_color(hex_color(kd::BORDER_SUBTLE))
-                            .child(Input::new(&self.filter_input).xsmall()),
+                            .child({
+                                let has_q = !self.filter_input.read(cx).value().is_empty();
+                                let clear_btn = Button::new(SharedString::from(format!(
+                                    "arc-flt-x-{:?}",
+                                    cx.entity_id()
+                                )))
+                                .text()
+                                .xsmall()
+                                .tab_stop(false)
+                                .icon(IconName::Close)
+                                .tooltip("Clear")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.filter_input
+                                        .update(cx, |s, cx| s.set_value("", window, cx));
+                                    this.filter_input.focus_handle(cx).focus(window, cx);
+                                    cx.notify();
+                                }));
+                                div().w_full().child(
+                                    Input::new(&self.filter_input)
+                                        .xsmall()
+                                        .prefix(
+                                            Icon::new(IconName::Search)
+                                                .xsmall()
+                                                .text_color(hex_color(kd::FG_MUTED)),
+                                        )
+                                        .when(has_q, |i| i.suffix(clear_btn)),
+                                )
+                            }),
                     )
                     .child(
                         div()

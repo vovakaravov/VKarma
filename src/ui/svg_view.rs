@@ -1,3 +1,4 @@
+use super::find_bar::{EditorFindBar, wrap_editor_with_find};
 use super::{PaneSide, TabKind, VKarmaApp};
 use crate::formats::svg_engine::{SvgRenderResult, render_svg_to_image};
 use crate::theme::{hex_color, kd};
@@ -37,6 +38,7 @@ pub enum SvgBgMode {
 
 pub struct SvgView {
     editor: Entity<EditorState>,
+    find_bar: Entity<EditorFindBar>,
     _ed_sub: Subscription,
     pub view_mode: SvgViewMode,
     pub bg_mode: SvgBgMode,
@@ -68,11 +70,13 @@ impl SvgView {
         };
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
+                .searchable(false)
                 .language("html")
                 .soft_wrap(false)
                 .line_number(true)
                 .default_value(raw)
         });
+        let find_bar = cx.new(|cx| EditorFindBar::new(editor.clone(), window, cx));
         let ed_sub = cx.subscribe(&editor, |this, ed, event, cx| {
             if matches!(event, InputEvent::Change) {
                 let txt = ed.read(cx).value().to_string();
@@ -92,6 +96,7 @@ impl SvgView {
 
         Self {
             editor,
+            find_bar,
             _ed_sub: ed_sub,
             view_mode: SvgViewMode::Split,
             bg_mode: SvgBgMode::Checkerboard,
@@ -101,6 +106,23 @@ impl SvgView {
             last_error,
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    pub fn is_find_open(&self, cx: &App) -> bool {
+        self.view_mode != SvgViewMode::Preview && self.find_bar.read(cx).is_open()
+    }
+
+    pub fn open_find(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view_mode == SvgViewMode::Preview {
+            self.view_mode = SvgViewMode::Split;
+        }
+        self.find_bar.update(cx, |b, cx| b.open(replace, window, cx));
+        cx.notify();
+    }
+
+    pub fn close_find(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        self.find_bar.update(cx, |b, cx| b.close(window, cx));
+        cx.notify();
     }
 
     pub fn relocate_doc(&mut self, new_path: PathBuf) {
@@ -235,10 +257,15 @@ impl Render for SvgView {
             self.zoom,
             SharedString::from(format!("svg-scroll-{:?}", cx.entity_id())),
         );
-        let editor_pane = Editor::new(&self.editor)
-            .size_full()
-            .appearance(false)
-            .bordered(false);
+        let editor_pane = wrap_editor_with_find(
+            Editor::new(&self.editor)
+                .size_full()
+                .appearance(false)
+                .bordered(false)
+                .into_any_element(),
+            &self.find_bar,
+            cx,
+        );
 
         match self.view_mode {
             SvgViewMode::Source => div()
@@ -277,6 +304,7 @@ pub fn render_svg_tab(
     let view_mode = sv.view_mode;
     let bg_mode = sv.bg_mode;
     let summary = sv.summary();
+    let find_open = sv.is_find_open(cx);
 
     let v_prev = view.clone();
     let v_split = view.clone();
@@ -430,6 +458,21 @@ pub fn render_svg_tab(
                                 });
                             })),
                     )
+                })
+                .child({
+                    let v_find = view.clone();
+                    Button::new(SharedString::from(format!("svg-find-{tab_id}")))
+                        .with_variant(if find_open {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Ghost
+                        })
+                        .xsmall()
+                        .icon(IconName::Search)
+                        .tooltip("Find & Replace (Ctrl+F)")
+                        .on_click(cx.listener(move |_, _, window, cx| {
+                            v_find.update(cx, |v, cx| v.open_find(false, window, cx));
+                        }))
                 })
                 .child(
                     Button::new(SharedString::from(format!("svg-png-{tab_id}")))

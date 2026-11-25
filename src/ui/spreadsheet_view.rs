@@ -1,3 +1,4 @@
+use super::find_bar::{FIND_INPUT_W, find_count_badge, floating_find_card};
 use super::{PaneSide, TabKind, VKarmaApp, modals};
 use crate::spreadsheet::{CellKind, cell_ref, col_label};
 use crate::theme::{accent_alpha, hex_alpha, hex_color, kd};
@@ -6,11 +7,12 @@ use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::scroll::{ScrollableElement as _, Scrollbar};
-use gpui_kit::component::{Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    ClipboardItem, Context, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement,
-    SharedString, Styled, Window, div, prelude::FluentBuilder as _, px, uniform_list,
+    ClipboardItem, Context, Focusable as _, InteractiveElement as _, IntoElement, KeyDownEvent,
+    ParentElement, SharedString, Styled, Window, div, prelude::FluentBuilder as _, px, uniform_list,
 };
+use std::collections::HashSet;
 
 const ROW_GUTTER_W: f32 = 52.0;
 const CELL_W: f32 = 116.0;
@@ -31,6 +33,7 @@ pub fn render_spreadsheet_tab(
         formula_input,
         row_scroll,
         grid_focus,
+        find,
         ..
     } = &tab.kind
     else {
@@ -47,6 +50,27 @@ pub fn render_spreadsheet_tab(
     let dirty = tab.dirty;
     let row_scroll_handle = row_scroll.clone();
     let grid_focus_handle = grid_focus.clone();
+    let find_open = find.open;
+    let find_query = find.query.clone();
+    let find_case_sensitive = find.case_sensitive;
+    let find_input = find.input.clone();
+    let find_total = find.matches.len();
+    let find_active = find.active;
+    let find_active_match = find.matches.get(find.active).cloned();
+    let mut find_match_set: HashSet<(i32, i32)> = HashSet::new();
+    let mut active_find_cell: Option<(i32, i32)> = None;
+    if find_open && !find_query.trim().is_empty() {
+        for &(s_ix, r, c) in &find.matches {
+            if s_ix == sheet_idx {
+                find_match_set.insert((r, c));
+            }
+        }
+        if let Some((s_ix, r, c)) = find_active_match
+            && s_ix == sheet_idx
+        {
+            active_find_cell = Some((r, c));
+        }
+    }
     let path_stem = tab
         .path
         .file_stem()
@@ -195,6 +219,20 @@ pub fn render_spreadsheet_tab(
             h_flex()
                 .gap_1()
                 .items_center()
+                .child(
+                    Button::new(SharedString::from(format!("xls-find-{tab_id}")))
+                        .with_variant(if find_open {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Ghost
+                        })
+                        .xsmall()
+                        .icon(IconName::Search)
+                        .tooltip("Find in Workbook (Ctrl+F)")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_spreadsheet_find(side, tab_id, window, cx);
+                        })),
+                )
                 .child(
                     Button::new(SharedString::from(format!("xls-exp-xlsx-{tab_id}")))
                         .ghost()
@@ -407,6 +445,8 @@ pub fn render_spreadsheet_tab(
                         .children(row_cells.iter().enumerate().map(|(c_zero, (val, kind))| {
                             let col_1 = (c_zero + 1) as i32;
                             let is_active_cell = is_row_active && col_1 == cur_col;
+                            let is_active_find = active_find_cell == Some((row_1, col_1));
+                            let is_find_match = find_match_set.contains(&(row_1, col_1));
                             let app_click = app_entity.clone();
                             let disp = val.clone();
 
@@ -431,6 +471,8 @@ pub fn render_spreadsheet_tab(
                                 .border_r_1()
                                 .border_color(if is_active_cell {
                                     hex_color(kd::ACCENT)
+                                } else if is_active_find {
+                                    hex_color(0xe8a849)
                                 } else {
                                     hex_color(kd::BORDER_SUBTLE)
                                 })
@@ -439,7 +481,13 @@ pub fn render_spreadsheet_tab(
                                         .border_2()
                                         .border_color(hex_color(kd::ACCENT))
                                 })
-                                .when(!is_active_cell, |d| {
+                                .when(!is_active_cell && is_active_find, |d| {
+                                    d.bg(hex_alpha(0xe8a84966))
+                                })
+                                .when(!is_active_cell && !is_active_find && is_find_match, |d| {
+                                    d.bg(hex_alpha(0xc4b28a38))
+                                })
+                                .when(!is_active_cell && !is_active_find && !is_find_match, |d| {
                                     d.hover(|s| s.bg(hex_alpha(0x28262b99)))
                                 })
                                 .cursor_pointer()
@@ -506,7 +554,7 @@ pub fn render_spreadsheet_tab(
         .bg(hex_color(kd::BG_SIDEBAR))
         .border_t_1()
         .border_color(hex_color(kd::BORDER_SUBTLE))
-        .children(sheet_names.into_iter().enumerate().map(|(ix, name)| {
+        .children(sheet_names.clone().into_iter().enumerate().map(|(ix, name)| {
             let s_idx = ix as u32;
             let is_cur = s_idx == sheet_idx;
             let app_ren = app_for_sheet_menu.clone();
@@ -615,12 +663,127 @@ pub fn render_spreadsheet_tab(
                 })),
         );
 
+    let find_card = if find_open {
+        let trimmed_non_empty = !find_query.trim().is_empty();
+        let count_text = if !trimmed_non_empty {
+            String::new()
+        } else if find_total == 0 {
+            "0 / 0".to_string()
+        } else if let Some((m_sheet, m_row, m_col)) = find_active_match {
+            let loc = if sheet_names.len() > 1 {
+                let sname = sheet_names
+                    .get(m_sheet as usize)
+                    .map(|s| s.as_str())
+                    .unwrap_or("Sheet");
+                format!("{sname}!{}", cell_ref(m_row, m_col))
+            } else {
+                cell_ref(m_row, m_col)
+            };
+            format!("{} / {} · {loc}", find_active + 1, find_total)
+        } else {
+            format!("{} / {}", find_active + 1, find_total)
+        };
+        let fi_clr = find_input.clone();
+        let clear_btn = Button::new(SharedString::from(format!("xls-find-x-{tab_id}")))
+            .text()
+            .xsmall()
+            .tab_stop(false)
+            .icon(IconName::Close)
+            .tooltip("Clear")
+            .on_click(cx.listener(move |this, _, window, cx| {
+                fi_clr.update(cx, |s, cx| s.set_value("", window, cx));
+                fi_clr.focus_handle(cx).focus(window, cx);
+                this.clear_spreadsheet_find_query(side, tab_id, cx);
+            }));
+
+        Some(
+            floating_find_card(SharedString::from(format!("xls-find-card-{tab_id}")))
+                .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
+                    if ev.keystroke.key.as_str() == "escape" {
+                        cx.stop_propagation();
+                        this.close_spreadsheet_find(side, tab_id, Some(window), cx);
+                    } else if ev.keystroke.key.as_str() == "f3" {
+                        cx.stop_propagation();
+                        this.step_spreadsheet_find(side, tab_id, !ev.keystroke.modifiers.shift, cx);
+                    }
+                }))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            div().w(px(FIND_INPUT_W)).child(
+                                Input::new(&find_input)
+                                    .xsmall()
+                                    .prefix(
+                                        Icon::new(IconName::Search)
+                                            .xsmall()
+                                            .text_color(hex_color(kd::FG_MUTED)),
+                                    )
+                                    .when(!find_query.is_empty(), |i| i.suffix(clear_btn)),
+                            ),
+                        )
+                        .when(!count_text.is_empty(), |row| {
+                            row.child(find_count_badge(count_text, trimmed_non_empty && find_total == 0))
+                        })
+                        .child(
+                            Button::new(SharedString::from(format!("xls-find-case-{tab_id}")))
+                                .with_variant(if find_case_sensitive {
+                                    ButtonVariant::Secondary
+                                } else {
+                                    ButtonVariant::Ghost
+                                })
+                                .xsmall()
+                                .label("Aa")
+                                .tooltip("Match Case")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.toggle_spreadsheet_find_case(side, tab_id, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("xls-find-prev-{tab_id}")))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::ChevronUp)
+                                .tooltip("Previous Match (Shift+Enter)")
+                                .disabled(find_total == 0)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.step_spreadsheet_find(side, tab_id, false, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("xls-find-next-{tab_id}")))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::ChevronDown)
+                                .tooltip("Next Match (Enter)")
+                                .disabled(find_total == 0)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.step_spreadsheet_find(side, tab_id, true, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("xls-find-close-{tab_id}")))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Close)
+                                .tooltip("Close (Esc)")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.close_spreadsheet_find(side, tab_id, Some(window), cx);
+                                })),
+                        ),
+                ),
+        )
+    } else {
+        None
+    };
+
     v_flex()
         .size_full()
         .bg(hex_color(kd::BG_MAIN))
         .child(toolbar)
         .child(formula_bar)
-        .child(grid_shell)
+        .child(grid_shell.when_some(find_card, |s, card| s.child(card)))
         .child(sheet_bar)
         .into_any_element()
 }

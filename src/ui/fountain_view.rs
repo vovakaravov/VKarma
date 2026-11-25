@@ -20,6 +20,7 @@ pub fn render_fountain_tab(
 ) -> impl IntoElement {
     let TabKind::Fountain {
         editor,
+        find_bar,
         view_mode,
         paper_light,
         show_notes,
@@ -34,6 +35,8 @@ pub fn render_fountain_tab(
     let rel_path = tab.rel_path.clone();
     let dirty = tab.dirty;
     let view_mode = *view_mode;
+    let find_is_open = find_bar.read(cx).is_open();
+    let fb_btn = find_bar.clone();
     let paper_light = *paper_light;
     let show_notes = *show_notes;
     let scenes = parsed.scene_count;
@@ -164,6 +167,27 @@ pub fn render_fountain_tab(
                     )
                 })
                 .child(
+                    Button::new(SharedString::from(format!("ftn-find-{tab_id}")))
+                        .with_variant(if find_is_open {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Ghost
+                        })
+                        .xsmall()
+                        .icon(IconName::Search)
+                        .tooltip("Find & Replace (Ctrl+F)")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let Some(t) = this.find_tab_mut(side, tab_id)
+                                && let TabKind::Fountain { view_mode, .. } = &mut t.kind
+                                && *view_mode == FountainViewMode::Script
+                            {
+                                *view_mode = FountainViewMode::Split;
+                            }
+                            fb_btn.update(cx, |b, cx| b.open(false, window, cx));
+                            cx.notify();
+                        })),
+                )
+                .child(
                     Button::new(SharedString::from(format!("ftn-pdf-{tab_id}")))
                         .secondary()
                         .xsmall()
@@ -194,14 +218,18 @@ pub fn render_fountain_tab(
         view_mode
     };
 
-    let edit_el = super::zen_editor_frame(
-        Editor::new(editor)
-            .size_full()
-            .appearance(false)
-            .bordered(false)
-            .text_size(px(13.5))
-            .line_height(relative(1.55)),
-        zen_mode && effective_mode == FountainViewMode::Edit,
+    let edit_el = super::find_bar::wrap_editor_with_find(
+        super::zen_editor_frame(
+            Editor::new(editor)
+                .size_full()
+                .appearance(false)
+                .bordered(false)
+                .text_size(px(13.5))
+                .line_height(relative(1.55)),
+            zen_mode && effective_mode == FountainViewMode::Edit,
+        ),
+        find_bar,
+        cx,
     );
 
     let script_el = render_script_preview(side, tab_id, &doc, paper_light, show_notes, cx);

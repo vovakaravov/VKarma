@@ -1,3 +1,4 @@
+use super::find_bar::{FIND_INPUT_W, find_count_badge, floating_find_card};
 use crate::live_md::{
     DocLine, EditKind, InlineStyle, LineBlockContext, LineHeightTable, LinkTarget, LiveDocBuffer,
     PrefixVisual, ProjectedLine, TableAlign, clamp_char_boundary, list_indent_px_from_cols,
@@ -9,18 +10,23 @@ use crate::markdown::{
     read_image_dimensions,
 };
 use crate::theme::{accent_alpha, hex_alpha, hex_color, kd};
-use crate::vault::VaultIndex;
+use crate::vault::{VaultIndex, find_all_byte_ranges};
+use gpui_kit::assets::IconName;
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarHandle};
+use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, ContentMask, Context,
-    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
-    FocusHandle, Focusable, Font, FontStyle, FontWeight, GlobalElementId, HitboxBehavior,
-    InspectorElementId, InteractiveElement as _, IntoElement, KeyDownEvent, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render,
-    ScrollEvent, SharedString, Size, StrikethroughStyle, Style, Styled, StyledImage as _,
-    TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill,
-    img, point, prelude::FluentBuilder as _, px, quad, relative, size,
+    AnyElement, App, AppContext as _, BorderStyle, Bounds, ClipboardEntry, ClipboardItem,
+    ContentMask, Context, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
+    EventEmitter, FocusHandle, Focusable, Font, FontStyle, FontWeight, GlobalElementId,
+    HitboxBehavior, Hsla, InspectorElementId, InteractiveElement as _, IntoElement, KeyDownEvent,
+    LayoutId, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render, ScrollEvent, SharedString, Size,
+    StatefulInteractiveElement as _, StrikethroughStyle, Style, Styled, StyledImage as _,
+    Subscription, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine,
+    actions, div, fill, img, point, prelude::FluentBuilder as _, px, quad, relative, size,
 };
 
 pub const LIVE_EDITOR_CONTEXT: &str = "VKarmaLiveEditor";
@@ -1015,10 +1021,40 @@ fn shape_cached_line(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HitLinkInfo {
+    table_col: Option<usize>,
+    disp_range: Range<usize>,
+    target: LinkTarget,
+    concealed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HoveredLink {
+    line_ix: usize,
+    table_col: Option<usize>,
+    disp_range: Range<usize>,
+    target: LinkTarget,
+    resolved: bool,
+}
+
+struct LiveSearchState {
+    open: bool,
+    replace_mode: bool,
+    case_sensitive: bool,
+    query: String,
+    query_input: Entity<InputState>,
+    replace_input: Entity<InputState>,
+    matches: Vec<Range<usize>>,
+    active_match: Option<usize>,
+    _query_sub: Subscription,
+    _replace_sub: Subscription,
+}
+
 struct HitTestResult {
     raw_byte: usize,
     line_ix: usize,
-    clicked_link: Option<LinkTarget>,
+    hit_link: Option<HitLinkInfo>,
     clicked_checkbox: bool,
     phantom_table_cell: Option<(usize, usize)>,
 }
@@ -1038,6 +1074,10 @@ pub struct LiveMarkdownEditor {
     image_dims_cache: HashMap<PathBuf, Option<(f32, f32)>>,
     selected_image_line: Option<usize>,
     active_image_resize: Option<ActiveImageResize>,
+    hovered_link: Option<HoveredLink>,
+    hovered_checkbox_line: Option<usize>,
+    last_mouse_pos: Option<Point<Pixels>>,
+    search: Option<LiveSearchState>,
     max_float_y_end: f32,
     last_col_geo: Option<(f32, f32, f32)>,
     preferred_x: Option<f32>,
@@ -1080,6 +1120,10 @@ impl LiveMarkdownEditor {
             image_dims_cache: HashMap::new(),
             selected_image_line: None,
             active_image_resize: None,
+            hovered_link: None,
+            hovered_checkbox_line: None,
+            last_mouse_pos: None,
+            search: None,
             max_float_y_end: 0.0,
             last_col_geo: None,
             preferred_x: None,
@@ -1124,13 +1168,270 @@ impl LiveMarkdownEditor {
         }
         self.selected_image_line = None;
         self.active_image_resize = None;
+        self.invalidate_hover_on_edit();
         self.max_float_y_end = 0.0;
         let col_w = self.last_col_geo.map_or(760.0, |g| g.1);
         self.height_table = LineHeightTable::from_lines(&self.doc.lines, &self.doc.text, col_w);
         self.preferred_x = None;
+        self.refresh_search_matches_cached(Some(self.doc.head));
         self.ensure_caret_visible();
         self.reset_caret_blink();
         cx.notify();
+    }
+
+    pub fn is_search_open(&self) -> bool {
+        self.search.as_ref().is_some_and(|s| s.open)
+    }
+
+    pub fn open_search(&mut self, replace_mode: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.is_none() {
+            let query_input = cx.new(|cx| InputState::new(window, cx).placeholder("Find…"));
+            let replace_input = cx.new(|cx| InputState::new(window, cx).placeholder("Replace…"));
+
+            let q_sub = cx.subscribe_in(&query_input, window, |this, state, event, _window, cx| {
+                match event {
+                    InputEvent::Change => {
+                        let q = state.read(cx).value().to_string();
+                        if let Some(s) = &mut this.search {
+                            s.query = q;
+                        }
+                        let anchor = Some(this.doc.head);
+                        this.refresh_search_matches_cached(anchor);
+                        if let Some(pos) = this
+                            .search
+                            .as_ref()
+                            .and_then(|s| s.active_match.and_then(|ix| s.matches.get(ix)))
+                            .map(|m| m.start)
+                        {
+                            this.scroll_to_byte(pos);
+                        }
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter {
+                        secondary, shift, ..
+                    } => {
+                        this.find_next(*shift || *secondary, cx);
+                    }
+                    _ => {}
+                }
+            });
+
+            let r_sub = cx.subscribe_in(&replace_input, window, |this, _, event, _window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.replace_current(cx);
+                }
+            });
+
+            self.search = Some(LiveSearchState {
+                open: true,
+                replace_mode,
+                case_sensitive: false,
+                query: String::new(),
+                query_input,
+                replace_input,
+                matches: Vec::new(),
+                active_match: None,
+                _query_sub: q_sub,
+                _replace_sub: r_sub,
+            });
+        }
+
+        let prefill = if self.doc.has_selection() {
+            let sel = self.doc.selected_text();
+            (!sel.is_empty() && !sel.contains('\n')).then(|| sel.to_string())
+        } else {
+            None
+        };
+
+        let query_input = if let Some(s) = &mut self.search {
+            s.open = true;
+            if replace_mode {
+                s.replace_mode = true;
+            }
+            if let Some(ref p) = prefill {
+                s.query = p.clone();
+                s.query_input
+                    .update(cx, |inp, cx| inp.set_value(p.clone(), window, cx));
+            } else {
+                s.query = s.query_input.read(cx).value().to_string();
+            }
+            s.query_input.clone()
+        } else {
+            return;
+        };
+
+        self.refresh_search_matches_cached(Some(self.doc.head));
+        if let Some(pos) = self
+            .search
+            .as_ref()
+            .and_then(|s| s.active_match.and_then(|ix| s.matches.get(ix)))
+            .map(|m| m.start)
+        {
+            self.scroll_to_byte(pos);
+        }
+
+        let len = query_input.read(cx).value().len();
+        query_input.update(cx, |inp, cx| {
+            inp.set_selected_range(0..len, cx);
+        });
+        query_input.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    pub fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let active_range = self
+            .search
+            .as_ref()
+            .and_then(|s| s.active_match.and_then(|ix| s.matches.get(ix)).cloned());
+        if let Some(s) = &mut self.search {
+            s.open = false;
+        }
+        if let Some(r) = active_range {
+            let lo = r.start.min(self.doc.text.len());
+            let hi = r.end.min(self.doc.text.len());
+            self.doc.set_selection(lo, hi);
+            self.ensure_caret_visible();
+        }
+        self.focus_handle.focus(window, cx);
+        self.reset_caret_blink();
+        cx.notify();
+    }
+
+    pub fn find_next(&mut self, backwards: bool, cx: &mut Context<Self>) {
+        let Some(s) = &mut self.search else {
+            return;
+        };
+        if s.matches.is_empty() {
+            s.active_match = None;
+            cx.notify();
+            return;
+        }
+        let len = s.matches.len();
+        let next_ix = match s.active_match {
+            None => {
+                if backwards {
+                    len - 1
+                } else {
+                    0
+                }
+            }
+            Some(cur) if cur >= len => 0,
+            Some(cur) => {
+                if backwards {
+                    (cur + len - 1) % len
+                } else {
+                    (cur + 1) % len
+                }
+            }
+        };
+        s.active_match = Some(next_ix);
+        let target_start = s.matches[next_ix].start;
+        self.scroll_to_byte(target_start);
+        cx.notify();
+    }
+
+    pub fn replace_current(&mut self, cx: &mut Context<Self>) {
+        let (target_range, rep) = {
+            let Some(s) = &self.search else {
+                return;
+            };
+            let Some(ix) = s.active_match else {
+                return;
+            };
+            let Some(m) = s.matches.get(ix).cloned() else {
+                return;
+            };
+            (m, s.replace_input.read(cx).value().to_string())
+        };
+        if target_range.end > self.doc.text.len() || target_range.start > target_range.end {
+            return;
+        }
+        self.doc.break_undo_coalescing();
+        self.doc
+            .replace_range(target_range.clone(), &rep, EditKind::Atomic);
+        let anchor = (target_range.start + rep.len()).min(self.doc.text.len());
+        self.sync_height_table_after_edit();
+        self.refresh_search_matches_cached(Some(anchor));
+        if let Some(pos) = self
+            .search
+            .as_ref()
+            .and_then(|s| s.active_match.and_then(|ix| s.matches.get(ix)))
+            .map(|m| m.start)
+        {
+            self.scroll_to_byte(pos);
+        }
+        cx.emit(LiveEditorEvent::Changed);
+        cx.notify();
+    }
+
+    pub fn replace_all(&mut self, cx: &mut Context<Self>) {
+        let (matches, rep) = {
+            let Some(s) = &self.search else {
+                return;
+            };
+            if s.matches.is_empty() {
+                return;
+            }
+            (s.matches.clone(), s.replace_input.read(cx).value().to_string())
+        };
+        self.doc.break_undo_coalescing();
+        for m in matches.into_iter().rev() {
+            if m.end <= self.doc.text.len() && m.start <= m.end {
+                self.doc.replace_range(m, &rep, EditKind::Atomic);
+            }
+        }
+        self.sync_height_table_after_edit();
+        self.refresh_search_matches_cached(Some(self.doc.head));
+        cx.emit(LiveEditorEvent::Changed);
+        cx.notify();
+    }
+
+    fn refresh_search_matches_cached(&mut self, anchor_byte: Option<usize>) {
+        let Some(s) = &mut self.search else {
+            return;
+        };
+        if !s.open && s.matches.is_empty() {
+            return;
+        }
+        s.matches = find_all_byte_ranges(&self.doc.text, &s.query, s.case_sensitive);
+        if s.matches.is_empty() {
+            s.active_match = None;
+            return;
+        }
+        if let Some(anchor) = anchor_byte {
+            let ix = s
+                .matches
+                .iter()
+                .position(|m| m.end >= anchor)
+                .unwrap_or(0);
+            s.active_match = Some(ix);
+        } else if let Some(cur) = s.active_match {
+            s.active_match = Some(cur.min(s.matches.len() - 1));
+        } else {
+            s.active_match = Some(0);
+        }
+    }
+
+    fn scroll_to_byte(&mut self, byte: usize) {
+        let li = self.doc.line_index_for_byte(byte.min(self.doc.text.len()));
+        let y_top = self.height_table.y_for_line(li);
+        let line_h = self
+            .layout_cache
+            .get(&li)
+            .map_or(28.0, |c| c.total_height);
+        let top_pad = if self.zen_mode { 56.0 } else { 20.0 };
+        let abs_top = top_pad + y_top;
+        let abs_bottom = abs_top + line_h;
+
+        let mut st = self.scroll.borrow_mut();
+        let vp_h = f32::from(st.viewport_bounds.size.height);
+        if vp_h <= 20.0 {
+            return;
+        }
+        if abs_top < st.scroll_y + 56.0 || abs_bottom > st.scroll_y + vp_h - 60.0 {
+            st.scroll_y = (abs_top - vp_h * 0.35).max(0.0);
+            LiveEditorScrollbarHandle::clamp_scroll(&mut st);
+        }
     }
 
     pub fn insert_text_at_caret(&mut self, s: &str, cx: &mut Context<Self>) {
@@ -1185,6 +1486,89 @@ impl LiveMarkdownEditor {
         self.height_table
             .sync_lines(&self.doc.lines, &self.doc.text, col_w);
         self.validate_selected_image();
+        self.invalidate_hover_on_edit();
+        self.refresh_search_matches_cached(None);
+    }
+
+    fn invalidate_hover_on_edit(&mut self) {
+        self.hovered_link = None;
+        self.hovered_checkbox_line = None;
+    }
+
+    fn clear_hover(&mut self, cx: &mut Context<Self>) {
+        self.last_mouse_pos = None;
+        let had = self.hovered_link.take().is_some() | self.hovered_checkbox_line.take().is_some();
+        if had {
+            cx.notify();
+        }
+    }
+
+    fn update_hover_at_point(
+        &mut self,
+        pos: Point<Pixels>,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        self.last_mouse_pos = Some(pos);
+        if self.dragging || self.active_image_resize.is_some() {
+            let had = self.hovered_link.take().is_some()
+                | self.hovered_checkbox_line.take().is_some();
+            if had {
+                cx.notify();
+            }
+            return;
+        }
+
+        let Some(hit) = self.hit_test_byte_at_point(pos) else {
+            let had = self.hovered_link.take().is_some()
+                | self.hovered_checkbox_line.take().is_some();
+            if had {
+                cx.notify();
+            }
+            return;
+        };
+
+        let new_cb = if hit.clicked_checkbox {
+            Some(hit.line_ix)
+        } else {
+            None
+        };
+
+        let new_link = if let Some(hl) = hit.hit_link
+            && link_is_interactive(hl.concealed, modifiers)
+        {
+            let same_existing = self.hovered_link.as_ref().filter(|prev| {
+                prev.line_ix == hit.line_ix
+                    && prev.table_col == hl.table_col
+                    && prev.disp_range == hl.disp_range
+                    && prev.target == hl.target
+            });
+            let resolved = if let Some(prev) = same_existing {
+                prev.resolved
+            } else {
+                match &hl.target {
+                    LinkTarget::Wikilink(raw) => {
+                        self.vault.resolve_wikilink(raw, &self.doc_path).is_some()
+                    }
+                    LinkTarget::Url(_) => true,
+                }
+            };
+            Some(HoveredLink {
+                line_ix: hit.line_ix,
+                table_col: hl.table_col,
+                disp_range: hl.disp_range,
+                target: hl.target,
+                resolved,
+            })
+        } else {
+            None
+        };
+
+        if self.hovered_link != new_link || self.hovered_checkbox_line != new_cb {
+            self.hovered_link = new_link;
+            self.hovered_checkbox_line = new_cb;
+            cx.notify();
+        }
     }
 
     fn natural_image_dims(&mut self, target: &str) -> Option<(f32, f32)> {
@@ -1572,6 +1956,8 @@ impl LiveMarkdownEditor {
             let g = compute_column_geometry(f32::from(bounds.size.width), self.centered, self.zen_mode);
             (g.col_left_rel, g.col_width, g.top_pad)
         });
+        let raw_rel_doc_y = f32::from(pos.y - bounds.origin.y) + st.scroll_y - top_pad;
+        let in_doc_vert = raw_rel_doc_y >= 0.0 && raw_rel_doc_y < self.height_table.total_height();
         let rel_doc_y = (doc_y - top_pad).max(0.0);
         let scroll_y = st.scroll_y;
         drop(st);
@@ -1580,7 +1966,7 @@ impl LiveMarkdownEditor {
             return Some(HitTestResult {
                 raw_byte: self.doc.text.len(),
                 line_ix: self.doc.lines.len() - 1,
-                clicked_link: None,
+                hit_link: None,
                 clicked_checkbox: false,
                 phantom_table_cell: None,
             });
@@ -1603,13 +1989,13 @@ impl LiveMarkdownEditor {
             return Some(HitTestResult {
                 raw_byte: dl.byte_start,
                 line_ix: li,
-                clicked_link: None,
+                hit_link: None,
                 clicked_checkbox: false,
                 phantom_table_cell: None,
             });
         };
 
-        // Check checkbox click first.
+        // Check checkbox hit first.
         if let Some(cb_rect) = cached.checkbox_rect {
             let expanded = Bounds {
                 origin: point(cb_rect.origin.x - px(4.), cb_rect.origin.y - px(4.)),
@@ -1619,7 +2005,7 @@ impl LiveMarkdownEditor {
                 return Some(HitTestResult {
                     raw_byte: dl.byte_start,
                     line_ix: li,
-                    clicked_link: None,
+                    hit_link: None,
                     clicked_checkbox: true,
                     phantom_table_cell: None,
                 });
@@ -1631,6 +2017,7 @@ impl LiveMarkdownEditor {
 
         if let Some(tr) = &cached.table_row {
             let rel_x = f32::from(pos.x - col_left);
+            let in_table_x = rel_x >= 0.0 && rel_x <= tr.table_width;
             let col_ix = tr
                 .cells
                 .iter()
@@ -1641,7 +2028,7 @@ impl LiveMarkdownEditor {
                 return Some(HitTestResult {
                     raw_byte: dl.byte_end,
                     line_ix: li,
-                    clicked_link: None,
+                    hit_link: None,
                     clicked_checkbox: false,
                     phantom_table_cell: Some((li, col_ix)),
                 });
@@ -1654,7 +2041,7 @@ impl LiveMarkdownEditor {
                 return Some(HitTestResult {
                     raw_byte: abs_raw,
                     line_ix: li,
-                    clicked_link: None,
+                    hit_link: None,
                     clicked_checkbox: false,
                     phantom_table_cell: None,
                 });
@@ -1665,7 +2052,8 @@ impl LiveMarkdownEditor {
             let cell_text_left = col_left + px(cell.x_rel + TABLE_CELL_PAD_X);
             let cell_inner_w = (cell.width - 2.0 * TABLE_CELL_PAD_X).max(20.0);
             let max_local_y = (num_rows as f32 * cached.line_height - 0.5).max(0.0);
-            let local_y = f32::from(pos.y - cell_text_top).clamp(0.0, max_local_y);
+            let raw_local_y = f32::from(pos.y - cell_text_top);
+            let local_y = raw_local_y.clamp(0.0, max_local_y);
             let wrap_row = ((local_y / cached.line_height).floor() as usize)
                 .min(num_rows.saturating_sub(1));
             let align_dx = row_align_offset_x(
@@ -1675,7 +2063,8 @@ impl LiveMarkdownEditor {
                 cell_inner_w,
                 px(cached.line_height),
             );
-            let local_x = (f32::from(pos.x - cell_text_left) - align_dx).max(0.0);
+            let raw_local_x = f32::from(pos.x - cell_text_left) - align_dx;
+            let local_x = raw_local_x.max(0.0);
             let disp_idx = match wl
                 .closest_index_for_position(point(px(local_x), px(local_y)), px(cached.line_height))
             {
@@ -1683,23 +2072,25 @@ impl LiveMarkdownEditor {
             }
             .min(cell.projected.display_text.len());
 
-            let mut clicked_link = None;
-            if let Ok(exact_i) =
-                wl.index_for_position(point(px(local_x), px(local_y)), px(cached.line_height))
-            {
-                for link in &cell.projected.links {
-                    if link.concealed && exact_i >= link.disp_range.start && exact_i < link.disp_range.end {
-                        clicked_link = Some(link.target.clone());
-                        break;
-                    }
-                }
-            }
+            let hit_link = if in_doc_vert && in_table_x {
+                find_hit_link(
+                    &cell.projected.links,
+                    wl,
+                    raw_local_x,
+                    raw_local_y,
+                    cached.line_height,
+                    num_rows,
+                    Some(col_ix),
+                )
+            } else {
+                None
+            };
             let local_raw = cell.raw_offset + cell.projected.display_to_raw(cell_raw, disp_idx);
             let abs_raw = clamp_char_boundary(&self.doc.text, dl.byte_start + local_raw);
             return Some(HitTestResult {
                 raw_byte: abs_raw,
                 line_ix: li,
-                clicked_link,
+                hit_link,
                 clicked_checkbox: false,
                 phantom_table_cell: None,
             });
@@ -1712,7 +2103,7 @@ impl LiveMarkdownEditor {
             return Some(HitTestResult {
                 raw_byte: dl.byte_start,
                 line_ix: li,
-                clicked_link: None,
+                hit_link: None,
                 clicked_checkbox: false,
                 phantom_table_cell: None,
             });
@@ -1720,8 +2111,10 @@ impl LiveMarkdownEditor {
 
         let num_rows = wl.wrap_boundaries.len() + 1;
         let max_local_y = (num_rows as f32 * cached.line_height - 0.5).max(0.0);
-        let local_x = f32::from(pos.x - text_left).max(0.0);
-        let local_y = f32::from(pos.y - text_top).clamp(0.0, max_local_y);
+        let raw_local_x = f32::from(pos.x - text_left);
+        let raw_local_y = f32::from(pos.y - text_top);
+        let local_x = raw_local_x.max(0.0);
+        let local_y = raw_local_y.clamp(0.0, max_local_y);
         let _ = col_width;
 
         let disp_idx = match wl
@@ -1731,28 +2124,26 @@ impl LiveMarkdownEditor {
         }
         .min(cached.projected.display_text.len());
 
-        // Check link click only if user clicked strictly inside a concealed link glyph span.
-        let mut clicked_link = None;
-        if let Ok(exact_i) =
-            wl.index_for_position(point(px(local_x), px(local_y)), px(cached.line_height))
-        {
-            for link in &cached.projected.links {
-                if link.concealed
-                    && exact_i >= link.disp_range.start
-                    && exact_i < link.disp_range.end
-                {
-                    clicked_link = Some(link.target.clone());
-                    break;
-                }
-            }
-        }
+        let hit_link = if in_doc_vert {
+            find_hit_link(
+                &cached.projected.links,
+                wl,
+                raw_local_x,
+                raw_local_y,
+                cached.line_height,
+                num_rows,
+                None,
+            )
+        } else {
+            None
+        };
 
         let local_raw = cached.projected.display_to_raw(raw_line, disp_idx);
         let abs_raw = clamp_char_boundary(&self.doc.text, dl.byte_start + local_raw);
         Some(HitTestResult {
             raw_byte: abs_raw,
             line_ix: li,
-            clicked_link,
+            hit_link,
             clicked_checkbox: false,
             phantom_table_cell: None,
         })
@@ -1974,6 +2365,9 @@ impl LiveMarkdownEditor {
         let ctrl = ev.keystroke.modifiers.control || ev.keystroke.modifiers.platform;
         let alt = ev.keystroke.modifiers.alt;
         let shift = ev.keystroke.modifiers.shift;
+        if !matches!(key, "control" | "shift" | "alt" | "super" | "meta") {
+            self.invalidate_hover_on_edit();
+        }
 
         match key {
             "left" if !alt => {
@@ -2124,7 +2518,18 @@ impl LiveMarkdownEditor {
                 cx.stop_propagation();
                 self.handle_tab_key(shift, cx);
             }
+            "f3" if !ctrl && !alt => {
+                if self.is_search_open() {
+                    cx.stop_propagation();
+                    self.find_next(shift, cx);
+                }
+            }
             "escape" => {
+                if self.is_search_open() {
+                    cx.stop_propagation();
+                    self.close_search(window, cx);
+                    return;
+                }
                 if self.active_image_resize.take().is_some() {
                     cx.stop_propagation();
                     self.dragging = false;
@@ -2462,6 +2867,7 @@ impl LiveMarkdownEditor {
     }
 
     fn handle_tab_key(&mut self, shift: bool, cx: &mut Context<Self>) {
+        self.invalidate_hover_on_edit();
         if self
             .selected_image_line
             .is_some_and(|img_li| self.doc.line_index_for_byte(self.doc.head) != img_li)
@@ -3171,12 +3577,198 @@ impl Render for LiveMarkdownEditor {
             }
         }
 
+        let active_search_overlay = self.search.as_ref().filter(|s| s.open).map(|s| {
+            let match_count = s.matches.len();
+            let has_query = !s.query.is_empty();
+            let count_label = if !has_query {
+                String::new()
+            } else if match_count == 0 {
+                "0 / 0".to_string()
+            } else {
+                let cur = s.active_match.map_or(1, |i| i + 1);
+                format!("{cur} / {match_count}")
+            };
+            let count_is_zero = has_query && match_count == 0;
+            let replace_mode = s.replace_mode;
+            let case_sensitive = s.case_sensitive;
+            let q_inp = s.query_input.clone();
+            let r_inp = s.replace_input.clone();
+
+            let clear_q_btn = Button::new("live-find-clear")
+                .text()
+                .xsmall()
+                .tab_stop(false)
+                .icon(IconName::Close)
+                .tooltip("Clear")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if let Some(st) = &mut this.search {
+                        st.query.clear();
+                        st.matches.clear();
+                        st.active_match = None;
+                        let inp = st.query_input.clone();
+                        inp.update(cx, |s, cx| s.set_value("", window, cx));
+                        inp.focus_handle(cx).focus(window, cx);
+                    }
+                    cx.notify();
+                }));
+
+            let row1 = h_flex()
+                .gap_1()
+                .items_center()
+                .child(
+                    Button::new("live-find-toggle-rep")
+                        .ghost()
+                        .xsmall()
+                        .icon(if replace_mode {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .tooltip("Toggle Replace (Ctrl+H)")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(st) = &mut this.search {
+                                st.replace_mode = !st.replace_mode;
+                                cx.notify();
+                            }
+                        })),
+                )
+                .child(
+                    div().w(px(FIND_INPUT_W)).child(
+                        Input::new(&q_inp)
+                            .xsmall()
+                            .prefix(
+                                Icon::new(IconName::Search)
+                                    .xsmall()
+                                    .text_color(hex_color(kd::FG_MUTED)),
+                            )
+                            .when(has_query, |i| i.suffix(clear_q_btn)),
+                    ),
+                )
+                .when(!count_label.is_empty(), |row| {
+                    row.child(find_count_badge(count_label, count_is_zero))
+                })
+                .child(
+                    Button::new("live-find-case")
+                        .with_variant(if case_sensitive {
+                            ButtonVariant::Secondary
+                        } else {
+                            ButtonVariant::Ghost
+                        })
+                        .xsmall()
+                        .label("Aa")
+                        .tooltip("Match Case")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(st) = &mut this.search {
+                                st.case_sensitive = !st.case_sensitive;
+                            }
+                            let anchor = Some(this.doc.head);
+                            this.refresh_search_matches_cached(anchor);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("live-find-prev")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::ChevronUp)
+                        .tooltip("Previous Match (Shift+Enter)")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.find_next(true, cx);
+                        })),
+                )
+                .child(
+                    Button::new("live-find-next")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::ChevronDown)
+                        .tooltip("Next Match (Enter)")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.find_next(false, cx);
+                        })),
+                )
+                .child(
+                    Button::new("live-find-close")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .tooltip("Close (Esc)")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.close_search(window, cx);
+                        })),
+                );
+
+            let row2 = if replace_mode {
+                Some(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .pl(px(26.))
+                        .child(div().w(px(FIND_INPUT_W)).child(Input::new(&r_inp).xsmall()))
+                        .child(
+                            Button::new("live-rep-one")
+                                .secondary()
+                                .xsmall()
+                                .label("Replace")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.replace_current(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("live-rep-all")
+                                .ghost()
+                                .xsmall()
+                                .label("All")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.replace_all(cx);
+                                })),
+                        ),
+                )
+            } else {
+                None
+            };
+
+            floating_find_card(format!("live-find-card-{:?}", cx.entity_id()))
+                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                    match ev.keystroke.key.as_str() {
+                        "escape" => {
+                            cx.stop_propagation();
+                            this.close_search(window, cx);
+                        }
+                        "f3" => {
+                            cx.stop_propagation();
+                            this.find_next(ev.keystroke.modifiers.shift, cx);
+                        }
+                        "tab" => {
+                            if let Some(st) = &this.search
+                                && st.replace_mode
+                            {
+                                cx.stop_propagation();
+                                if st.query_input.focus_handle(cx).is_focused(window) {
+                                    st.replace_input.focus_handle(cx).focus(window, cx);
+                                } else {
+                                    st.query_input.focus_handle(cx).focus(window, cx);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }))
+                .child(v_flex().gap_1().child(row1).children(row2))
+                .into_any_element()
+        });
+
         div()
             .id(SharedString::from(format!("live-md-editor-{:?}", cx.entity_id())))
             .relative()
             .size_full()
             .bg(hex_color(kd::BG_MAIN))
             .cursor_text()
+            .when(
+                self.active_image_resize.is_none()
+                    && !self.dragging
+                    && (self.hovered_link.is_some() || self.hovered_checkbox_line.is_some()),
+                |d| d.cursor_pointer(),
+            )
             .when_some(
                 self.active_image_resize.as_ref().map(|r| r.corner),
                 |d, corner| match corner {
@@ -3193,6 +3785,16 @@ impl Render for LiveMarkdownEditor {
             )
             .track_focus(&self.focus_handle)
             .key_context(LIVE_EDITOR_CONTEXT)
+            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                if !*hovered {
+                    this.clear_hover(cx);
+                }
+            }))
+            .on_modifiers_changed(cx.listener(|this, ev: &ModifiersChangedEvent, _window, cx| {
+                if let Some(pos) = this.last_mouse_pos {
+                    this.update_hover_at_point(pos, ev.modifiers, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &LiveEditorTab, _window, cx| {
                 cx.stop_propagation();
                 this.handle_tab_key(false, cx);
@@ -3237,14 +3839,20 @@ impl Render for LiveMarkdownEditor {
                         return;
                     }
 
-                    // Follow wikilink / URL unless Alt is held to edit its text directly.
-                    if ev.click_count == 1 && !ev.modifiers.alt
-                        && let Some(target) = hit.clicked_link
+                    // Follow wikilink / URL immediately when concealed (or Ctrl-clicked while expanded);
+                    // hold Alt to click directly into its text without following.
+                    if ev.click_count == 1
+                        && let Some(hl) = hit.hit_link
+                        && link_is_interactive(hl.concealed, ev.modifiers)
                     {
+                        this.hovered_link = None;
+                        let in_right_split = (hl.concealed && ev.modifiers.control)
+                            || (!hl.concealed && ev.modifiers.control && ev.modifiers.shift);
                         cx.emit(LiveEditorEvent::OpenLink {
-                            target,
-                            in_right_split: ev.modifiers.control,
+                            target: hl.target,
+                            in_right_split,
                         });
+                        cx.notify();
                         return;
                     }
 
@@ -3259,6 +3867,7 @@ impl Render for LiveMarkdownEditor {
                         _ => {
                             this.doc.set_cursor(hit.raw_byte, ev.modifiers.shift);
                             this.dragging = true;
+                            this.invalidate_hover_on_edit();
                         }
                     }
                     this.reset_caret_blink();
@@ -3333,6 +3942,7 @@ impl Render for LiveMarkdownEditor {
                     if this.dragging {
                         this.dragging = false;
                     }
+                    this.update_hover_at_point(ev.position, ev.modifiers, cx);
                     return;
                 }
                 if let Some(hit) = this.hit_test_byte_at_point(ev.position) {
@@ -3372,6 +3982,7 @@ impl Render for LiveMarkdownEditor {
                     drop(st);
                     cx.stop_propagation();
                     if moved {
+                        this.update_hover_at_point(ev.position, ev.modifiers, cx);
                         cx.notify();
                     }
                 }
@@ -3381,6 +3992,7 @@ impl Render for LiveMarkdownEditor {
             })
             .children(image_overlays)
             .children(table_toolbar)
+            .children(active_search_overlay)
             .child(Scrollbar::vertical(&self.scrollbar))
     }
 }
@@ -3396,10 +4008,14 @@ struct PaintSnapshot {
     col_width: f32,
     top_pad: f32,
     scroll_y: f32,
-    paint_rows: Vec<(DocLine, Rc<CachedLine>)>,
+    paint_rows: Vec<(usize, DocLine, Rc<CachedLine>)>,
     caret_cached: Option<Rc<CachedLine>>,
     caret_disp_x_y: Option<(f32, f32, f32)>,
     selection_range: Range<usize>,
+    search_matches: Vec<Range<usize>>,
+    active_search_match: Option<usize>,
+    hovered_link: Option<HoveredLink>,
+    hovered_checkbox_line: Option<usize>,
     caret_visible: bool,
     focused: bool,
     marked_range: Option<Range<usize>>,
@@ -3557,7 +4173,7 @@ impl Element for LiveCanvasElement {
                             None
                         };
                     }
-                    paint_rows.push((ed.doc.lines[ix].clone(), Rc::clone(rc_c)));
+                    paint_rows.push((ix, ed.doc.lines[ix].clone(), Rc::clone(rc_c)));
                 }
             }
 
@@ -3589,6 +4205,12 @@ impl Element for LiveCanvasElement {
             let mut prose_bold_font = prose_font;
             prose_bold_font.weight = FontWeight::SEMIBOLD;
 
+            let (search_matches, active_search_match) = match &ed.search {
+                Some(s) if s.open && !s.matches.is_empty() => {
+                    (s.matches.clone(), s.active_match)
+                }
+                _ => (Vec::new(), None),
+            };
             let snap = PaintSnapshot {
                 bounds,
                 focus_handle: ed.focus_handle.clone(),
@@ -3600,6 +4222,10 @@ impl Element for LiveCanvasElement {
                 caret_cached,
                 caret_disp_x_y,
                 selection_range: ed.doc.selection_range(),
+                search_matches,
+                active_search_match,
+                hovered_link: ed.hovered_link.clone(),
+                hovered_checkbox_line: ed.hovered_checkbox_line,
                 caret_visible: ed.caret_visible,
                 focused,
                 marked_range: ed.doc.marked_range.clone(),
@@ -3645,7 +4271,7 @@ impl Element for LiveCanvasElement {
 
         window.with_content_mask(Some(ContentMask { bounds: snap.bounds }), |window| {
             // Pass 1: Block cards, accent bars, rules, checkboxes, bullets, and selection rects.
-            for (dl, c) in &snap.paint_rows {
+            for (line_ix, dl, c) in &snap.paint_rows {
                 if c.total_height <= 0.5 {
                     continue;
                 }
@@ -3772,7 +4398,7 @@ impl Element for LiveCanvasElement {
                     let le = sel.end.saturating_sub(dl.byte_start).min(raw_len);
                     let inc_nl = sel.end > dl.byte_end;
 
-                    for cell in &tr.cells {
+                    for (cix, cell) in tr.cells.iter().enumerate() {
                         let cell_clip = Bounds {
                             origin: point(col_left + px(cell.x_rel + 1.0), row_top + px(1.0)),
                             size: size(
@@ -3784,6 +4410,10 @@ impl Element for LiveCanvasElement {
                         let cell_text_x = col_left + px(cell.x_rel + TABLE_CELL_PAD_X);
                         let cell_text_y = row_top + px(tr.cell_pad_y);
                         let cell_align = gpui_text_align(cell.align);
+                        let cell_hover = snap
+                            .hovered_link
+                            .as_ref()
+                            .filter(|hl| hl.line_ix == *line_ix && hl.table_col == Some(cix));
 
                         window.with_content_mask(
                             Some(ContentMask { bounds: cell_clip }),
@@ -3811,6 +4441,65 @@ impl Element for LiveCanvasElement {
                                     }
                                 }
 
+                                if let Some(ref inner) = cell.inner_range
+                                    && !snap.search_matches.is_empty()
+                                {
+                                    let cell_raw_end = cell.raw_offset + cell.projected.raw_len;
+                                    for (mix, m) in snap.search_matches.iter().enumerate() {
+                                        if m.end <= dl.byte_start || m.start >= dl.byte_end {
+                                            continue;
+                                        }
+                                        let m_ls = m.start.saturating_sub(dl.byte_start).max(inner.start);
+                                        let m_le = m.end.saturating_sub(dl.byte_start).min(inner.end);
+                                        if m_ls < m_le && m_ls <= cell_raw_end && m_le >= cell.raw_offset {
+                                            let hl_col = if snap.active_search_match == Some(mix) {
+                                                hex_alpha(0xe8a84980)
+                                            } else {
+                                                hex_alpha(0xc4b28a42)
+                                            };
+                                            paint_wrapped_selection_rects(
+                                                cell.shaped.as_ref(),
+                                                &cell.projected,
+                                                cell.raw_offset,
+                                                cell.projected.raw_len,
+                                                m_ls,
+                                                m_le,
+                                                false,
+                                                cell_text_x,
+                                                cell_text_y,
+                                                c.line_height,
+                                                cell_align,
+                                                cell_inner_w,
+                                                hl_col,
+                                                window,
+                                            );
+                                        }
+                                    }
+                                }
+
+                                let cell_hover_rects = cell_hover.map(|hl| {
+                                    let rects = link_hover_segment_rects(
+                                        cell.shaped.as_ref(),
+                                        cell.projected.display_text.len(),
+                                        &hl.disp_range,
+                                        cell_text_y,
+                                        c.line_height,
+                                        cell_align,
+                                        cell_inner_w,
+                                    );
+                                    let palette = hover_link_palette(&hl.target, hl.resolved);
+                                    paint_link_hover_bg(
+                                        &rects,
+                                        cell_text_x,
+                                        px(c.line_height),
+                                        2.0,
+                                        palette.0,
+                                        palette.1,
+                                        window,
+                                    );
+                                    (rects, palette.2)
+                                });
+
                                 if let Some(wl) = cell.shaped.as_ref() {
                                     let align_bounds = Bounds {
                                         origin: point(cell_text_x, cell_text_y),
@@ -3832,6 +4521,16 @@ impl Element for LiveCanvasElement {
                                         Some(align_bounds),
                                         window,
                                         cx,
+                                    );
+                                }
+
+                                if let Some((rects, underline_color)) = cell_hover_rects {
+                                    paint_link_hover_underline(
+                                        &rects,
+                                        cell_text_x,
+                                        px(c.line_height),
+                                        underline_color,
+                                        window,
                                     );
                                 }
 
@@ -4066,13 +4765,26 @@ impl Element for LiveCanvasElement {
                     }
                     PrefixVisual::Checkbox { checked, .. } => {
                         if let Some(cb_rect) = c.checkbox_rect {
+                            let is_hovered = snap.hovered_checkbox_line == Some(*line_ix);
                             let bg = if *checked {
-                                hex_color(kd::GREEN)
+                                if is_hovered {
+                                    hex_color(0xa2c7a2)
+                                } else {
+                                    hex_color(kd::GREEN)
+                                }
+                            } else if is_hovered {
+                                accent_alpha(0x28)
                             } else {
                                 hex_color(kd::BG_DEEP)
                             };
                             let border_c = if *checked {
-                                hex_color(kd::GREEN)
+                                if is_hovered {
+                                    hex_color(0xa2c7a2)
+                                } else {
+                                    hex_color(kd::GREEN)
+                                }
+                            } else if is_hovered {
+                                hex_color(kd::ACCENT_HOVER)
                             } else {
                                 hex_color(kd::FG_MUTED)
                             };
@@ -4203,12 +4915,88 @@ impl Element for LiveCanvasElement {
                     );
                 }
 
-                // Inline code & highlight run backgrounds + shaped text
+                // Search match highlights
+                if !snap.search_matches.is_empty() {
+                    let raw_len = dl.byte_end - dl.byte_start;
+                    let align_w =
+                        (snap.col_width - c.extra_left_inset - c.extra_right_inset).max(120.0);
+                    for (mix, m) in snap.search_matches.iter().enumerate() {
+                        if m.end <= dl.byte_start || m.start >= dl.byte_end {
+                            continue;
+                        }
+                        let ls = m.start.saturating_sub(dl.byte_start).min(raw_len);
+                        let le = m.end.saturating_sub(dl.byte_start).min(raw_len);
+                        if ls < le {
+                            let hl_col = if snap.active_search_match == Some(mix) {
+                                hex_alpha(0xe8a84980)
+                            } else {
+                                hex_alpha(0xc4b28a42)
+                            };
+                            paint_wrapped_selection_rects(
+                                c.shaped.as_ref(),
+                                &c.projected,
+                                0,
+                                raw_len,
+                                ls,
+                                le,
+                                false,
+                                col_left + px(c.text_x_rel),
+                                top_y + px(c.text_y_rel),
+                                c.line_height,
+                                TextAlign::Left,
+                                align_w,
+                                hl_col,
+                                window,
+                            );
+                        }
+                    }
+                }
+
+                // Inline code, highlight & hovered link run backgrounds + shaped text
+                let line_hover = snap
+                    .hovered_link
+                    .as_ref()
+                    .filter(|hl| hl.line_ix == *line_ix && hl.table_col.is_none());
+                let text_origin = point(col_left + px(c.text_x_rel), top_y + px(c.text_y_rel));
+                let align_width =
+                    (snap.col_width - c.extra_left_inset - c.extra_right_inset).max(120.0);
+                let line_hover_rects = line_hover.map(|hl| {
+                    let rects = link_hover_segment_rects(
+                        c.shaped.as_ref(),
+                        c.projected.display_text.len(),
+                        &hl.disp_range,
+                        text_origin.y,
+                        c.line_height,
+                        TextAlign::Left,
+                        align_width,
+                    );
+                    let palette = hover_link_palette(&hl.target, hl.resolved);
+                    paint_link_hover_bg(
+                        &rects,
+                        text_origin.x,
+                        px(c.line_height),
+                        3.0,
+                        palette.0,
+                        palette.1,
+                        window,
+                    );
+                    (rects, palette.2)
+                });
+
                 if let Some(wl) = c.shaped.as_ref() {
-                    let origin = point(col_left + px(c.text_x_rel), top_y + px(c.text_y_rel));
                     let lh = px(c.line_height);
-                    let _ = wl.paint_background(origin, lh, TextAlign::Left, None, window, cx);
-                    let _ = wl.paint(origin, lh, TextAlign::Left, None, window, cx);
+                    let _ = wl.paint_background(text_origin, lh, TextAlign::Left, None, window, cx);
+                    let _ = wl.paint(text_origin, lh, TextAlign::Left, None, window, cx);
+                }
+
+                if let Some((rects, underline_color)) = line_hover_rects {
+                    paint_link_hover_underline(
+                        &rects,
+                        text_origin.x,
+                        px(c.line_height),
+                        underline_color,
+                        window,
+                    );
                 }
 
                 // IME marked-text underline
@@ -4254,5 +5042,174 @@ impl Element for LiveCanvasElement {
                 ));
             }
         });
+    }
+}
+
+fn find_hit_link(
+    links: &[crate::live_md::ProjectedLink],
+    wl: &WrappedLine,
+    raw_local_x: f32,
+    raw_local_y: f32,
+    line_height_f: f32,
+    num_rows: usize,
+    table_col: Option<usize>,
+) -> Option<HitLinkInfo> {
+    if links.is_empty()
+        || raw_local_x < 0.0
+        || raw_local_y < 0.0
+        || raw_local_y >= num_rows as f32 * line_height_f
+    {
+        return None;
+    }
+    let exact_i = wl
+        .index_for_position(point(px(raw_local_x), px(raw_local_y)), px(line_height_f))
+        .ok()?;
+    links.iter().find_map(|link| {
+        (exact_i >= link.disp_range.start && exact_i < link.disp_range.end).then(|| HitLinkInfo {
+            table_col,
+            disp_range: link.disp_range.clone(),
+            target: link.target.clone(),
+            concealed: link.concealed,
+        })
+    })
+}
+
+fn link_is_interactive(concealed: bool, modifiers: Modifiers) -> bool {
+    !modifiers.alt && (concealed || modifiers.control)
+}
+
+fn hover_link_palette(target: &LinkTarget, resolved: bool) -> (Hsla, Hsla, Hsla) {
+    match target {
+        LinkTarget::Wikilink(_) if resolved => (
+            hex_alpha(0x8ea4a22e),
+            hex_alpha(0x8ea4a26c),
+            hex_color(0xb0cfcc),
+        ),
+        LinkTarget::Wikilink(_) => (
+            hex_alpha(0xc4b28a26),
+            hex_alpha(0xc4b28a64),
+            hex_color(kd::YELLOW),
+        ),
+        LinkTarget::Url(_) => (
+            accent_alpha(0x30),
+            accent_alpha(0x70),
+            hex_color(kd::ACCENT_HOVER),
+        ),
+    }
+}
+
+fn link_hover_segment_rects(
+    shaped: Option<&WrappedLine>,
+    disp_len: usize,
+    disp_range: &Range<usize>,
+    text_y: Pixels,
+    line_height_f: f32,
+    align: TextAlign,
+    align_width: f32,
+) -> Vec<(f32, f32, Pixels)> {
+    let ds = disp_range.start.min(disp_len);
+    let de = disp_range.end.min(disp_len);
+    if ds >= de {
+        return Vec::new();
+    }
+    let lh = px(line_height_f);
+    let p0 = disp_position_for_index(shaped, disp_len, ds, lh);
+    let p1 = disp_position_for_index(shaped, disp_len, de, lh);
+    let r0 = (f32::from(p0.y) / line_height_f).round().max(0.0) as usize;
+    let r1 = (f32::from(p1.y) / line_height_f).round().max(0.0) as usize;
+    let mut out = Vec::with_capacity(r1 - r0 + 1);
+    for r in r0..=r1 {
+        let align_dx = row_align_offset_x(shaped, r, align, align_width, lh);
+        let rx0 = align_dx + if r == r0 { f32::from(p0.x) } else { 0.0 };
+        let rx1 = align_dx
+            + if r == r1 {
+                f32::from(p1.x)
+            } else {
+                row_right_x(shaped, r, lh).max(8.0)
+            };
+        if rx1 > rx0 {
+            out.push((rx0, rx1, text_y + px(r as f32 * line_height_f)));
+        }
+    }
+    out
+}
+
+fn paint_link_hover_bg(
+    rects: &[(f32, f32, Pixels)],
+    text_x: Pixels,
+    lh: Pixels,
+    pad_x: f32,
+    pill_bg: Hsla,
+    pill_border: Hsla,
+    window: &mut Window,
+) {
+    for &(rx0, rx1, row_y) in rects {
+        window.paint_quad(quad(
+            Bounds {
+                origin: point(text_x + px(rx0 - pad_x), row_y + px(1.)),
+                size: size(px((rx1 - rx0) + pad_x * 2.0), (lh - px(2.)).max(px(4.))),
+            },
+            px(4.),
+            pill_bg,
+            gpui_kit::Edges::all(px(1.)),
+            pill_border,
+            BorderStyle::Solid,
+        ));
+    }
+}
+
+fn paint_link_hover_underline(
+    rects: &[(f32, f32, Pixels)],
+    text_x: Pixels,
+    lh: Pixels,
+    underline_color: Hsla,
+    window: &mut Window,
+) {
+    for &(rx0, rx1, row_y) in rects {
+        window.paint_quad(fill(
+            Bounds {
+                origin: point(text_x + px(rx0), row_y + lh - px(2.2)),
+                size: size(px(rx1 - rx0), px(1.8)),
+            },
+            underline_color,
+        ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_is_interactive_respects_conceal_and_modifiers() {
+        let none = Modifiers::none();
+        let ctrl = Modifiers::control();
+        let alt = Modifiers::alt();
+        let ctrl_alt = Modifiers {
+            control: true,
+            alt: true,
+            ..Modifiers::none()
+        };
+
+        assert!(link_is_interactive(true, none));
+        assert!(link_is_interactive(true, ctrl));
+        assert!(!link_is_interactive(true, alt));
+        assert!(!link_is_interactive(true, ctrl_alt));
+
+        assert!(!link_is_interactive(false, none));
+        assert!(link_is_interactive(false, ctrl));
+        assert!(!link_is_interactive(false, alt));
+        assert!(!link_is_interactive(false, ctrl_alt));
+    }
+
+    #[test]
+    fn hover_link_palette_distinguishes_resolved_missing_and_url() {
+        let wiki_resolved = hover_link_palette(&LinkTarget::Wikilink("Note".into()), true);
+        let wiki_missing = hover_link_palette(&LinkTarget::Wikilink("Missing".into()), false);
+        let url = hover_link_palette(&LinkTarget::Url("https://example.com".into()), true);
+
+        assert_ne!(wiki_resolved, wiki_missing);
+        assert_ne!(wiki_resolved, url);
+        assert_ne!(wiki_missing, url);
     }
 }

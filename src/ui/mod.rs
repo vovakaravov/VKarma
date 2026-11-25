@@ -3,6 +3,7 @@ pub mod audio_view;
 pub mod canvas_view;
 pub mod code_view;
 pub mod epub_view;
+pub mod find_bar;
 pub mod font_view;
 pub mod fountain_view;
 pub mod kanban_view;
@@ -27,6 +28,7 @@ use archive_view::ArchiveView;
 use audio_view::AudioView;
 use canvas_view::{CanvasView, CanvasViewEvent};
 use epub_view::EpubView;
+use find_bar::EditorFindBar;
 use font_view::FontView;
 use kanban_view::{KanbanView, KanbanViewEvent};
 use mermaid_view::{MermaidView, MermaidViewEvent};
@@ -52,12 +54,14 @@ use crate::theme::{hex_color, kd};
 use crate::typst_engine::{compile_typst_png, empty_typst_debounce, export_typst_pdf};
 use crate::vault::{
     FileKind, OutlineHeading, SearchHit, VaultIndex, atomic_write_string, detect_file_kind,
-    extract_headings, search_content,
+    extract_headings, find_all_byte_ranges, search_content,
 };
 use crate::watcher::WorkspaceWatcher;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{EditorState, InputEvent, InputState};
+use gpui_kit::component::input::{
+    EditorState, InputEvent, InputState, Replace as InputReplace, Search as InputSearch,
+};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::text::{FrontmatterPlugin, MarkdownExtensions, TaskToggleEvent};
@@ -68,13 +72,14 @@ use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable, Hsla,
     Image, ImageCache, ImageCacheError, InteractiveElement as _, IntoElement, KeyBinding,
     MouseButton, MouseDownEvent, NavigationDirection, ParentElement, PathPromptOptions, Render,
-    RenderImage, Resource, RetainAllImageCache, SharedString, StatefulInteractiveElement as _,
-    Styled, Subscription, UniformListScrollHandle, Window, actions, div,
-    prelude::FluentBuilder as _, px,
+    RenderImage, Resource, RetainAllImageCache, ScrollHandle, ScrollStrategy, SharedString,
+    StatefulInteractiveElement as _, Styled, Subscription, UniformListScrollHandle, Window,
+    actions, div, point, prelude::FluentBuilder as _, px,
 };
 use live_editor::{LiveEditorEvent, LiveMarkdownEditor};
 use std::collections::{HashSet, VecDeque};
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -195,12 +200,16 @@ actions!(
         SaveAll,
         QuickSwitcher,
         VaultSearch,
+        FindInTab,
+        ReplaceInTab,
         ToggleViewMode,
         ToggleSourceMode,
         ToggleZenMode,
         SplitRight,
         CloseTab,
         NextTab,
+        MoveTabLeft,
+        MoveTabRight,
         ToggleSidebar,
         ToggleRightPanel,
         NewNote,
@@ -231,6 +240,8 @@ pub fn register_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-shift-s", SaveAll, None),
         KeyBinding::new("ctrl-p", QuickSwitcher, None),
         KeyBinding::new("ctrl-shift-f", VaultSearch, None),
+        KeyBinding::new("ctrl-f", FindInTab, None),
+        KeyBinding::new("ctrl-h", ReplaceInTab, None),
         KeyBinding::new("ctrl-e", ToggleViewMode, None),
         KeyBinding::new("ctrl-m", ToggleSourceMode, None),
         KeyBinding::new("f11", ToggleZenMode, None),
@@ -238,6 +249,8 @@ pub fn register_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-\\", SplitRight, None),
         KeyBinding::new("ctrl-w", CloseTab, None),
         KeyBinding::new("ctrl-tab", NextTab, None),
+        KeyBinding::new("ctrl-shift-pageup", MoveTabLeft, None),
+        KeyBinding::new("ctrl-shift-pagedown", MoveTabRight, None),
         KeyBinding::new("ctrl-b", ToggleSidebar, None),
         KeyBinding::new("ctrl-shift-b", ToggleRightPanel, None),
         KeyBinding::new("ctrl-n", NewNote, None),
@@ -305,9 +318,55 @@ pub enum FountainViewMode {
     Script,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReadFindMatch {
+    pub line: usize,
+    pub range: Range<usize>,
+    pub snippet: String,
+}
+
+pub struct ReadFindState {
+    pub open: bool,
+    pub query: String,
+    pub case_sensitive: bool,
+    pub input: Entity<InputState>,
+    pub _sub: Subscription,
+    pub matches: Vec<ReadFindMatch>,
+    pub active: usize,
+}
+
+pub struct SpreadsheetFindState {
+    pub open: bool,
+    pub query: String,
+    pub case_sensitive: bool,
+    pub input: Entity<InputState>,
+    pub _sub: Subscription,
+    pub matches: Vec<(u32, i32, i32)>,
+    pub active: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct OfficeFindMatch {
+    pub block_ix: usize,
+    pub row_ix: usize,
+    pub col_ix: usize,
+    pub range: Range<usize>,
+}
+
+pub struct OfficeFindState {
+    pub open: bool,
+    pub query: String,
+    pub case_sensitive: bool,
+    pub input: Entity<InputState>,
+    pub _sub: Subscription,
+    pub matches: Vec<OfficeFindMatch>,
+    pub active: usize,
+}
+
 pub enum TabKind {
     Markdown {
         editor: Option<Entity<EditorState>>,
+        editor_find: Option<Entity<EditorFindBar>>,
         live_doc: Entity<LiveMarkdownEditor>,
         view_mode: MdViewMode,
         source_mode: bool,
@@ -319,11 +378,14 @@ pub enum TabKind {
         is_mdx: bool,
         chapter_mode: bool,
         active_chapter: usize,
+        read_find: ReadFindState,
+        read_scroll: ScrollHandle,
         _live_sub: Subscription,
         _sub: Option<Subscription>,
     },
     Fountain {
         editor: Entity<EditorState>,
+        find_bar: Entity<EditorFindBar>,
         view_mode: FountainViewMode,
         paper_light: bool,
         show_notes: bool,
@@ -333,6 +395,7 @@ pub enum TabKind {
     },
     Typst {
         editor: Entity<EditorState>,
+        find_bar: Entity<EditorFindBar>,
         view_mode: TypstViewMode,
         zoom: f32,
         pages: Vec<Arc<Image>>,
@@ -351,10 +414,12 @@ pub enum TabKind {
         formula_input: Entity<InputState>,
         row_scroll: UniformListScrollHandle,
         grid_focus: FocusHandle,
+        find: SpreadsheetFindState,
         _sub: Subscription,
     },
     Code {
         editor: Entity<EditorState>,
+        find_bar: Entity<EditorFindBar>,
         language: &'static str,
         badge: &'static str,
         soft_wrap: bool,
@@ -389,6 +454,8 @@ pub enum TabKind {
         paper_light: bool,
         font_scale: f32,
         file_size_bytes: u64,
+        scroll_handle: ScrollHandle,
+        find: OfficeFindState,
     },
     Epub {
         view: Entity<EpubView>,
@@ -889,31 +956,41 @@ impl VKarmaApp {
         })
     }
 
+    fn saved_tabs_for_pane(pane: &WorkspacePane) -> (Vec<PathBuf>, usize) {
+        let mut paths = Vec::new();
+        let mut mapped_active = 0usize;
+        for (idx, tab) in pane.tabs.iter().enumerate() {
+            if idx == pane.active_tab {
+                mapped_active = paths.len();
+            }
+            paths.push(tab.path.clone());
+        }
+        if paths.is_empty() {
+            mapped_active = 0;
+        } else if mapped_active >= paths.len() {
+            mapped_active = paths.len() - 1;
+        }
+        (paths, mapped_active)
+    }
+
     fn slot_to_workspace_config(&self, idx: usize, slot: &WorkspaceSlot) -> WorkspaceConfig {
         let (left_tabs, left_active_tab, right_tabs, right_active_tab, split_open) =
             if idx == self.active_workspace {
-                (
-                    self.left_pane.tabs.iter().map(|t| t.path.clone()).collect(),
-                    self.left_pane.active_tab,
-                    self.right_pane
-                        .as_ref()
-                        .map(|p| p.tabs.iter().map(|t| t.path.clone()).collect())
-                        .unwrap_or_default(),
-                    self.right_pane.as_ref().map(|p| p.active_tab).unwrap_or(0),
-                    self.right_pane.is_some(),
-                )
+                let (lt, la) = Self::saved_tabs_for_pane(&self.left_pane);
+                let (rt, ra) = self
+                    .right_pane
+                    .as_ref()
+                    .map(Self::saved_tabs_for_pane)
+                    .unwrap_or_default();
+                (lt, la, rt, ra, self.right_pane.is_some())
             } else if let Some(parked) = &slot.parked {
-                (
-                    parked.left_pane.tabs.iter().map(|t| t.path.clone()).collect(),
-                    parked.left_pane.active_tab,
-                    parked
-                        .right_pane
-                        .as_ref()
-                        .map(|p| p.tabs.iter().map(|t| t.path.clone()).collect())
-                        .unwrap_or_default(),
-                    parked.right_pane.as_ref().map(|p| p.active_tab).unwrap_or(0),
-                    parked.right_pane.is_some(),
-                )
+                let (lt, la) = Self::saved_tabs_for_pane(&parked.left_pane);
+                let (rt, ra) = parked
+                    .right_pane
+                    .as_ref()
+                    .map(Self::saved_tabs_for_pane)
+                    .unwrap_or_default();
+                (lt, la, rt, ra, parked.right_pane.is_some())
             } else {
                 (
                     slot.pending_left_tabs.clone(),
@@ -1653,9 +1730,10 @@ impl VKarmaApp {
         line_numbers: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> (Entity<EditorState>, Subscription) {
+    ) -> (Entity<EditorState>, Entity<EditorFindBar>, Subscription) {
         let editor = cx.new(|cx| {
             let mut state = EditorState::new(window, cx)
+                .searchable(false)
                 .language("markdown")
                 .soft_wrap(true)
                 .line_number(line_numbers)
@@ -1668,12 +1746,13 @@ impl VKarmaApp {
             });
             state
         });
+        let editor_find = cx.new(|cx| EditorFindBar::new(editor.clone(), window, cx));
         let sub = cx.subscribe_in(&editor, window, move |this, _ed, event, window, cx| {
             if matches!(event, InputEvent::Change) {
                 this.on_markdown_changed(side, tab_id, window, cx);
             }
         });
-        (editor, sub)
+        (editor, editor_find, sub)
     }
 
     fn build_document_tab(
@@ -1708,12 +1787,12 @@ impl VKarmaApp {
                 let source_mode = self.config.default_md_source_mode;
                 let view_mode = self.config.default_md_view;
 
-                let (editor, sub) = if source_mode {
-                    let (ed, s) =
+                let (editor, editor_find, sub) = if source_mode {
+                    let (ed, ef, s) =
                         Self::create_md_source_editor(side, tab_id, raw.clone(), true, window, cx);
-                    (Some(ed), Some(s))
+                    (Some(ed), Some(ef), Some(s))
                 } else {
-                    (None, None)
+                    (None, None, None)
                 };
 
                 let live_doc = cx.new(|cx| {
@@ -1759,8 +1838,35 @@ impl VKarmaApp {
                         }
                     });
 
+                let read_find_input = cx.new(|cx| {
+                    InputState::new(window, cx).placeholder("Find in document…")
+                });
+                let read_find_sub = cx.subscribe_in(
+                    &read_find_input,
+                    window,
+                    move |this, inp, event, _window, cx| match event {
+                        InputEvent::Change => {
+                            let val = inp.read(cx).value().to_string();
+                            if let Some(t) = this.find_tab_mut(side, tab_id)
+                                && let TabKind::Markdown { read_find, .. } = &mut t.kind
+                            {
+                                read_find.query = val;
+                            }
+                            this.recompute_md_read_find(side, tab_id, true, cx);
+                            cx.notify();
+                        }
+                        InputEvent::PressEnter {
+                            secondary, shift, ..
+                        } => {
+                            this.step_md_read_find(side, tab_id, !(*shift || *secondary), cx);
+                        }
+                        _ => {}
+                    },
+                );
+
                 TabKind::Markdown {
                     editor,
+                    editor_find,
                     live_doc,
                     view_mode,
                     source_mode,
@@ -1772,6 +1878,16 @@ impl VKarmaApp {
                     is_mdx,
                     chapter_mode: false,
                     active_chapter: 0,
+                    read_find: ReadFindState {
+                        open: false,
+                        query: String::new(),
+                        case_sensitive: false,
+                        input: read_find_input,
+                        _sub: read_find_sub,
+                        matches: Vec::new(),
+                        active: 0,
+                    },
+                    read_scroll: ScrollHandle::new(),
                     _live_sub,
                     _sub: sub,
                 }
@@ -1782,6 +1898,7 @@ impl VKarmaApp {
                 let headings = extract_fountain_headings(&parsed);
                 let editor = cx.new(|cx| {
                     let mut st = EditorState::new(window, cx)
+                        .searchable(false)
                         .soft_wrap(true)
                         .line_number(true)
                         .default_value(raw);
@@ -1793,6 +1910,7 @@ impl VKarmaApp {
                     });
                     st
                 });
+                let find_bar = cx.new(|cx| EditorFindBar::new(editor.clone(), window, cx));
                 let sub = cx.subscribe_in(&editor, window, move |this, _ed, event, window, cx| {
                     if matches!(event, InputEvent::Change) {
                         this.on_fountain_changed(side, tab_id, window, cx);
@@ -1800,6 +1918,7 @@ impl VKarmaApp {
                 });
                 TabKind::Fountain {
                     editor,
+                    find_bar,
                     view_mode: FountainViewMode::Split,
                     paper_light: false,
                     show_notes: true,
@@ -1813,11 +1932,13 @@ impl VKarmaApp {
                 let headings = extract_headings(&raw, true);
                 let editor = cx.new(|cx| {
                     EditorState::new(window, cx)
+                        .searchable(false)
                         .language("typst")
                         .soft_wrap(true)
                         .line_number(true)
                         .default_value(raw.clone())
                 });
+                let find_bar = cx.new(|cx| EditorFindBar::new(editor.clone(), window, cx));
 
                 let sub = cx.subscribe_in(&editor, window, move |this, _ed, event, window, cx| {
                     if matches!(event, InputEvent::Change) {
@@ -1830,6 +1951,7 @@ impl VKarmaApp {
 
                 TabKind::Typst {
                     editor,
+                    find_bar,
                     view_mode: TypstViewMode::Split,
                     zoom: 1.0,
                     pages: Vec::new(),
@@ -1860,6 +1982,32 @@ impl VKarmaApp {
                     },
                 );
 
+                let sheet_find_input = cx.new(|cx| {
+                    InputState::new(window, cx).placeholder("Find in workbook…")
+                });
+                let sheet_find_sub = cx.subscribe_in(
+                    &sheet_find_input,
+                    window,
+                    move |this, inp, event, _window, cx| match event {
+                        InputEvent::Change => {
+                            let val = inp.read(cx).value().to_string();
+                            if let Some(t) = this.find_tab_mut(side, tab_id)
+                                && let TabKind::Spreadsheet { find, .. } = &mut t.kind
+                            {
+                                find.query = val;
+                            }
+                            this.recompute_spreadsheet_find(side, tab_id, true, cx);
+                            cx.notify();
+                        }
+                        InputEvent::PressEnter {
+                            secondary, shift, ..
+                        } => {
+                            this.step_spreadsheet_find(side, tab_id, !(*shift || *secondary), cx);
+                        }
+                        _ => {}
+                    },
+                );
+
                 TabKind::Spreadsheet {
                     doc,
                     active_sheet: 0,
@@ -1868,6 +2016,15 @@ impl VKarmaApp {
                     formula_input,
                     row_scroll: UniformListScrollHandle::new(),
                     grid_focus: cx.focus_handle(),
+                    find: SpreadsheetFindState {
+                        open: false,
+                        query: String::new(),
+                        case_sensitive: false,
+                        input: sheet_find_input,
+                        _sub: sheet_find_sub,
+                        matches: Vec::new(),
+                        active: 0,
+                    },
                     _sub: sub,
                 }
             }
@@ -1976,17 +2133,52 @@ impl VKarmaApp {
             FileKind::Office => {
                 let meta = fs::metadata(path)?;
                 let doc = crate::formats::office::OfficeDoc::load(path)?;
+                let office_find_input = cx.new(|cx| {
+                    InputState::new(window, cx).placeholder("Find in document…")
+                });
+                let office_find_sub = cx.subscribe_in(
+                    &office_find_input,
+                    window,
+                    move |this, inp, event, _window, cx| match event {
+                        InputEvent::Change => {
+                            let val = inp.read(cx).value().to_string();
+                            if let Some(t) = this.find_tab_mut(side, tab_id)
+                                && let TabKind::Office { find, .. } = &mut t.kind
+                            {
+                                find.query = val;
+                            }
+                            this.recompute_office_find(side, tab_id, true, cx);
+                            cx.notify();
+                        }
+                        InputEvent::PressEnter {
+                            secondary, shift, ..
+                        } => {
+                            this.step_office_find(side, tab_id, !(*shift || *secondary), cx);
+                        }
+                        _ => {}
+                    },
+                );
                 TabKind::Office {
                     doc,
                     paper_light: false,
                     font_scale: 1.0,
                     file_size_bytes: meta.len(),
+                    scroll_handle: ScrollHandle::new(),
+                    find: OfficeFindState {
+                        open: false,
+                        query: String::new(),
+                        case_sensitive: false,
+                        input: office_find_input,
+                        _sub: office_find_sub,
+                        matches: Vec::new(),
+                        active: 0,
+                    },
                 }
             }
             FileKind::Epub => {
                 let meta = fs::metadata(path)?;
                 let book = crate::formats::epub::EpubBook::load(path)?;
-                let view = cx.new(|cx| EpubView::new(book, cx));
+                let view = cx.new(|cx| EpubView::new(path.to_path_buf(), book, window, cx));
                 TabKind::Epub {
                     view,
                     file_size_bytes: meta.len(),
@@ -2032,11 +2224,13 @@ impl VKarmaApp {
                 let raw = fs::read_to_string(path)?;
                 let editor = cx.new(|cx| {
                     EditorState::new(window, cx)
+                        .searchable(false)
                         .language(lang)
                         .soft_wrap(false)
                         .line_number(true)
                         .default_value(raw)
                 });
+                let find_bar = cx.new(|cx| EditorFindBar::new(editor.clone(), window, cx));
                 let sub = cx.subscribe_in(&editor, window, move |this, _ed, event, window, cx| {
                     if matches!(event, InputEvent::Change) {
                         this.on_code_changed(side, tab_id, window, cx);
@@ -2057,6 +2251,7 @@ impl VKarmaApp {
                     };
                 TabKind::Code {
                     editor,
+                    find_bar,
                     language: lang,
                     badge: file_kind.short_badge(),
                     soft_wrap: false,
@@ -2071,11 +2266,13 @@ impl VKarmaApp {
                 let raw = fs::read_to_string(path)?;
                 let editor = cx.new(|cx| {
                     EditorState::new(window, cx)
+                        .searchable(false)
                         .language("text")
                         .soft_wrap(true)
                         .line_number(true)
                         .default_value(raw)
                 });
+                let find_bar = cx.new(|cx| EditorFindBar::new(editor.clone(), window, cx));
                 let sub = cx.subscribe_in(&editor, window, move |this, _ed, event, window, cx| {
                     if matches!(event, InputEvent::Change) {
                         this.on_code_changed(side, tab_id, window, cx);
@@ -2083,6 +2280,7 @@ impl VKarmaApp {
                 });
                 TabKind::Code {
                     editor,
+                    find_bar,
                     language: "text",
                     badge: "TXT",
                     soft_wrap: true,
@@ -2107,14 +2305,31 @@ impl VKarmaApp {
     }
 
     fn find_tab_mut(&mut self, side: PaneSide, tab_id: u64) -> Option<&mut DocumentTab> {
-        self.pane_mut(side)?
+        let other = match side {
+            PaneSide::Left => PaneSide::Right,
+            PaneSide::Right => PaneSide::Left,
+        };
+        let in_primary = self
+            .pane(side)
+            .is_some_and(|p| p.tabs.iter().any(|t| t.id == tab_id));
+        let target_side = if in_primary { side } else { other };
+        self.pane_mut(target_side)?
             .tabs
             .iter_mut()
             .find(|t| t.id == tab_id)
     }
 
     fn find_tab(&self, side: PaneSide, tab_id: u64) -> Option<&DocumentTab> {
-        self.pane(side)?.tabs.iter().find(|t| t.id == tab_id)
+        let other = match side {
+            PaneSide::Left => PaneSide::Right,
+            PaneSide::Right => PaneSide::Left,
+        };
+        self.pane(side)
+            .and_then(|p| p.tabs.iter().find(|t| t.id == tab_id))
+            .or_else(|| {
+                self.pane(other)
+                    .and_then(|p| p.tabs.iter().find(|t| t.id == tab_id))
+            })
     }
 
     fn update_markdown_derived_state(
@@ -2734,6 +2949,165 @@ impl VKarmaApp {
         cx.notify();
     }
 
+    pub fn move_tab(&mut self, side: PaneSide, tab_idx: usize, delta: isize, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane_mut(side) else {
+            return;
+        };
+        let len = pane.tabs.len();
+        if tab_idx >= len {
+            return;
+        }
+        let target_isize = tab_idx as isize + delta;
+        if target_isize < 0 || target_isize as usize >= len {
+            return;
+        }
+        if reorder_with_active(
+            &mut pane.tabs,
+            &mut pane.active_tab,
+            tab_idx,
+            target_isize as usize,
+        ) {
+            self.persist_workspaces();
+            cx.notify();
+        }
+    }
+
+    pub fn reorder_tab(
+        &mut self,
+        from_side: PaneSide,
+        from_idx: usize,
+        to_side: PaneSide,
+        to_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if from_side == to_side {
+            let Some(pane) = self.pane_mut(from_side) else {
+                return;
+            };
+            if pane.tabs.is_empty() {
+                return;
+            }
+            let clamped_to = to_idx.min(pane.tabs.len() - 1);
+            if reorder_with_active(&mut pane.tabs, &mut pane.active_tab, from_idx, clamped_to) {
+                self.active_pane = from_side;
+                self.persist_workspaces();
+                cx.notify();
+            }
+            return;
+        }
+
+        let Some(src_path) = self
+            .pane(from_side)
+            .and_then(|p| p.tabs.get(from_idx))
+            .map(|t| t.path.clone())
+        else {
+            return;
+        };
+
+        if to_side == PaneSide::Right {
+            self.ensure_right_pane();
+        }
+
+        // Guard duplicate path in target pane: activate existing instead of duplicating.
+        if let Some(existing_idx) = self
+            .pane(to_side)
+            .and_then(|p| p.tabs.iter().position(|t| t.path == src_path))
+        {
+            self.activate_tab(to_side, existing_idx, window, cx);
+            return;
+        }
+
+        let moved = {
+            let (from_pane, to_pane) = match (from_side, to_side) {
+                (PaneSide::Left, PaneSide::Right) => {
+                    let Some(rp) = self.right_pane.as_mut() else {
+                        return;
+                    };
+                    (&mut self.left_pane, rp)
+                }
+                (PaneSide::Right, PaneSide::Left) => {
+                    let Some(rp) = self.right_pane.as_mut() else {
+                        return;
+                    };
+                    (rp, &mut self.left_pane)
+                }
+                _ => return,
+            };
+            move_tab_between_vecs(
+                &mut from_pane.tabs,
+                &mut from_pane.active_tab,
+                from_idx,
+                &mut to_pane.tabs,
+                &mut to_pane.active_tab,
+                to_idx,
+            )
+        };
+        if !moved {
+            return;
+        }
+
+        if from_side == PaneSide::Right
+            && self.right_pane.as_ref().is_some_and(|p| p.tabs.is_empty())
+        {
+            self.right_pane = None;
+        }
+        self.active_pane = to_side;
+        if let Some(new_idx) = self.pane(to_side).map(|p| p.active_tab) {
+            self.focus_tab_widget(to_side, new_idx, window, cx);
+        }
+        self.persist_workspaces();
+        cx.notify();
+    }
+
+    pub fn move_tab_to_other_pane(
+        &mut self,
+        from_side: PaneSide,
+        tab_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let other = match from_side {
+            PaneSide::Left => PaneSide::Right,
+            PaneSide::Right => PaneSide::Left,
+        };
+        let target_end = self.pane(other).map(|p| p.tabs.len()).unwrap_or(0);
+        self.reorder_tab(from_side, tab_idx, other, target_end, window, cx);
+    }
+
+    pub fn close_other_tabs(&mut self, side: PaneSide, keep_idx: usize, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane_mut(side) else {
+            return;
+        };
+        if keep_idx >= pane.tabs.len() || pane.tabs.len() <= 1 {
+            return;
+        }
+        let mut idx = 0usize;
+        pane.tabs.retain(|_| {
+            let keep = idx == keep_idx;
+            idx += 1;
+            keep
+        });
+        pane.active_tab = 0;
+        self.persist_workspaces();
+        trim_allocator();
+        cx.notify();
+    }
+
+    pub fn close_tabs_to_right(&mut self, side: PaneSide, keep_idx: usize, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane_mut(side) else {
+            return;
+        };
+        if keep_idx + 1 >= pane.tabs.len() {
+            return;
+        }
+        pane.tabs.truncate(keep_idx + 1);
+        pane.active_tab = pane.active_tab.min(pane.tabs.len().saturating_sub(1));
+        self.persist_workspaces();
+        trim_allocator();
+        cx.notify();
+    }
+
     pub fn split_active_to_right(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.right_pane.is_some() {
             if let Some(tab) = self.pane(PaneSide::Left).and_then(WorkspacePane::active) {
@@ -2828,16 +3202,22 @@ impl VKarmaApp {
                     s.focus(window, cx);
                 });
             } else {
-                let (editor, sub) =
+                let (editor, editor_find, sub) =
                     Self::create_md_source_editor(side, tab_id, raw, true, window, cx);
                 editor.update(cx, |s, cx| {
                     s.set_cursor_position(pos, window, cx);
                     s.focus(window, cx);
                 });
                 if let Some(tab) = self.find_tab_mut(side, tab_id)
-                    && let TabKind::Markdown { editor: slot, _sub, .. } = &mut tab.kind
+                    && let TabKind::Markdown {
+                        editor: slot,
+                        editor_find: slot_find,
+                        _sub,
+                        ..
+                    } = &mut tab.kind
                 {
                     *slot = Some(editor);
+                    *slot_find = Some(editor_find);
                     *_sub = Some(sub);
                 }
             }
@@ -2853,9 +3233,15 @@ impl VKarmaApp {
                 });
             }
             if let Some(tab) = self.find_tab_mut(side, tab_id)
-                && let TabKind::Markdown { editor: slot, _sub, .. } = &mut tab.kind
+                && let TabKind::Markdown {
+                    editor: slot,
+                    editor_find: slot_find,
+                    _sub,
+                    ..
+                } = &mut tab.kind
             {
                 *slot = None;
+                *slot_find = None;
                 *_sub = None;
             }
             live_doc.focus_handle(cx).focus(window, cx);
@@ -3152,6 +3538,1007 @@ impl VKarmaApp {
         }
     }
 
+    pub fn trigger_find_in_active_tab(
+        &mut self,
+        replace: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let side = self.active_pane;
+        let Some(tab) = self.pane(side).and_then(WorkspacePane::active) else {
+            return;
+        };
+        let tab_id = tab.id;
+        let zen_mode = self.zen_mode;
+
+        enum FindAction {
+            None,
+            MdLive(Entity<LiveMarkdownEditor>),
+            MdRead,
+            MdSwitchToEditLive(Entity<LiveMarkdownEditor>),
+            MdSwitchToEditSource(Entity<EditorFindBar>),
+            OpenFindBar(Entity<EditorFindBar>),
+            FocusInput(Entity<InputState>),
+            SwitchTypstAndFind(Entity<EditorFindBar>),
+            SwitchFountainAndFind(Entity<EditorFindBar>),
+            SvgView(Entity<SvgView>),
+            MermaidView(Entity<MermaidView>),
+            KanbanView(Entity<KanbanView>),
+            CanvasView(Entity<CanvasView>),
+            SubtitleView(Entity<SubtitleView>),
+            EpubView(Entity<EpubView>),
+            SqliteView(Entity<SqliteView>),
+            ArchiveView(Entity<ArchiveView>),
+            FontView(Entity<FontView>),
+            Spreadsheet,
+            Office,
+        }
+
+        let action = match &tab.kind {
+            TabKind::Markdown {
+                editor_find,
+                live_doc,
+                view_mode,
+                source_mode,
+                ..
+            } => {
+                let eff = if zen_mode && *view_mode == MdViewMode::Split {
+                    MdViewMode::Edit
+                } else {
+                    *view_mode
+                };
+                if eff == MdViewMode::Reading {
+                    if replace {
+                        if *source_mode
+                            && let Some(fb) = editor_find.as_ref()
+                        {
+                            FindAction::MdSwitchToEditSource(fb.clone())
+                        } else {
+                            FindAction::MdSwitchToEditLive(live_doc.clone())
+                        }
+                    } else {
+                        FindAction::MdRead
+                    }
+                } else if *source_mode
+                    && let Some(fb) = editor_find.as_ref()
+                {
+                    FindAction::OpenFindBar(fb.clone())
+                } else {
+                    FindAction::MdLive(live_doc.clone())
+                }
+            }
+            TabKind::Code {
+                find_bar,
+                data_view,
+                tree_filter,
+                ..
+            } => {
+                if !replace
+                    && *data_view == CodeViewMode::Tree
+                    && let Some(tf) = tree_filter.as_ref()
+                {
+                    FindAction::FocusInput(tf.clone())
+                } else {
+                    FindAction::OpenFindBar(find_bar.clone())
+                }
+            }
+            TabKind::Typst {
+                find_bar,
+                view_mode,
+                ..
+            } => {
+                if *view_mode == TypstViewMode::Preview {
+                    FindAction::SwitchTypstAndFind(find_bar.clone())
+                } else {
+                    FindAction::OpenFindBar(find_bar.clone())
+                }
+            }
+            TabKind::Fountain {
+                find_bar,
+                view_mode,
+                ..
+            } => {
+                if *view_mode == FountainViewMode::Script {
+                    FindAction::SwitchFountainAndFind(find_bar.clone())
+                } else {
+                    FindAction::OpenFindBar(find_bar.clone())
+                }
+            }
+            TabKind::Svg { view, .. } => FindAction::SvgView(view.clone()),
+            TabKind::Mermaid { view, .. } => FindAction::MermaidView(view.clone()),
+            TabKind::Kanban { view, .. } => FindAction::KanbanView(view.clone()),
+            TabKind::Canvas { view, .. } => FindAction::CanvasView(view.clone()),
+            TabKind::Subtitle { view, .. } => FindAction::SubtitleView(view.clone()),
+            TabKind::Epub { view, .. } => FindAction::EpubView(view.clone()),
+            TabKind::Sqlite { view, .. } => FindAction::SqliteView(view.clone()),
+            TabKind::Archive { view, .. } => FindAction::ArchiveView(view.clone()),
+            TabKind::Font { view, .. } => FindAction::FontView(view.clone()),
+            TabKind::Spreadsheet { .. } => FindAction::Spreadsheet,
+            TabKind::Office { .. } => FindAction::Office,
+            TabKind::Image { .. } | TabKind::Pdf { .. } | TabKind::Audio { .. } => FindAction::None,
+        };
+
+        match action {
+            FindAction::None => {}
+            FindAction::MdLive(live_doc) => {
+                live_doc.update(cx, |ed, cx| ed.open_search(replace, window, cx));
+            }
+            FindAction::MdRead => {
+                self.open_md_read_find(side, tab_id, window, cx);
+            }
+            FindAction::MdSwitchToEditLive(live_doc) => {
+                if let Some(t) = self.find_tab_mut(side, tab_id)
+                    && let TabKind::Markdown {
+                        view_mode,
+                        read_find,
+                        ..
+                    } = &mut t.kind
+                {
+                    *view_mode = MdViewMode::Edit;
+                    read_find.open = false;
+                }
+                live_doc.update(cx, |ed, cx| ed.open_search(true, window, cx));
+                cx.notify();
+            }
+            FindAction::MdSwitchToEditSource(fb) => {
+                if let Some(t) = self.find_tab_mut(side, tab_id)
+                    && let TabKind::Markdown {
+                        view_mode,
+                        read_find,
+                        ..
+                    } = &mut t.kind
+                {
+                    *view_mode = MdViewMode::Edit;
+                    read_find.open = false;
+                }
+                fb.update(cx, |b, cx| b.open(true, window, cx));
+                cx.notify();
+            }
+            FindAction::OpenFindBar(fb) => {
+                if let Some(t) = self.find_tab_mut(side, tab_id)
+                    && let TabKind::Code { data_view, .. } = &mut t.kind
+                    && *data_view != CodeViewMode::Code
+                {
+                    *data_view = CodeViewMode::Code;
+                }
+                fb.update(cx, |b, cx| b.open(replace, window, cx));
+                cx.notify();
+            }
+            FindAction::FocusInput(inp) => {
+                inp.update(cx, |s, cx| {
+                    let len = s.value().len();
+                    s.focus(window, cx);
+                    if len > 0 {
+                        s.set_selected_range(0..len, cx);
+                    }
+                });
+                cx.notify();
+            }
+            FindAction::SwitchTypstAndFind(fb) => {
+                if let Some(t) = self.find_tab_mut(side, tab_id)
+                    && let TabKind::Typst { view_mode, .. } = &mut t.kind
+                {
+                    *view_mode = TypstViewMode::Split;
+                }
+                fb.update(cx, |b, cx| b.open(replace, window, cx));
+                cx.notify();
+            }
+            FindAction::SwitchFountainAndFind(fb) => {
+                if let Some(t) = self.find_tab_mut(side, tab_id)
+                    && let TabKind::Fountain { view_mode, .. } = &mut t.kind
+                {
+                    *view_mode = FountainViewMode::Split;
+                }
+                fb.update(cx, |b, cx| b.open(replace, window, cx));
+                cx.notify();
+            }
+            FindAction::SvgView(v) => v.update(cx, |v, cx| v.open_find(replace, window, cx)),
+            FindAction::MermaidView(v) => v.update(cx, |v, cx| v.open_find(replace, window, cx)),
+            FindAction::KanbanView(v) => v.update(cx, |v, cx| v.open_find(replace, window, cx)),
+            FindAction::CanvasView(v) => v.update(cx, |v, cx| v.open_find(replace, window, cx)),
+            FindAction::SubtitleView(v) => v.update(cx, |v, cx| v.open_find(replace, window, cx)),
+            FindAction::EpubView(v) => v.update(cx, |v, cx| v.open_find(window, cx)),
+            FindAction::SqliteView(v) => v.update(cx, |v, cx| v.focus_filter(window, cx)),
+            FindAction::ArchiveView(v) => v.update(cx, |v, cx| v.focus_filter(window, cx)),
+            FindAction::FontView(v) => v.update(cx, |v, cx| v.focus_filter(window, cx)),
+            FindAction::Spreadsheet => self.open_spreadsheet_find(side, tab_id, window, cx),
+            FindAction::Office => self.open_office_find(side, tab_id, window, cx),
+        }
+    }
+
+    fn close_active_tab_find(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let side = self.active_pane;
+        let Some(tab) = self.pane(side).and_then(WorkspacePane::active) else {
+            return false;
+        };
+        let tab_id = tab.id;
+        match &tab.kind {
+            TabKind::Markdown {
+                editor_find,
+                live_doc,
+                view_mode,
+                source_mode,
+                read_find,
+                ..
+            } => {
+                let eff = if self.zen_mode && *view_mode == MdViewMode::Split {
+                    MdViewMode::Edit
+                } else {
+                    *view_mode
+                };
+                if eff == MdViewMode::Reading && read_find.open {
+                    self.close_md_read_find(side, tab_id, Some(window), cx);
+                    return true;
+                }
+                if *source_mode
+                    && let Some(fb) = editor_find.as_ref()
+                    && fb.read(cx).is_open()
+                {
+                    fb.clone().update(cx, |b, cx| b.close(Some(window), cx));
+                    return true;
+                }
+                if !*source_mode && live_doc.read(cx).is_search_open() {
+                    live_doc.clone().update(cx, |ed, cx| ed.close_search(window, cx));
+                    return true;
+                }
+                false
+            }
+            TabKind::Code { find_bar, .. }
+            | TabKind::Typst { find_bar, .. }
+            | TabKind::Fountain { find_bar, .. }
+                if find_bar.read(cx).is_open() =>
+            {
+                find_bar.clone().update(cx, |b, cx| b.close(Some(window), cx));
+                true
+            }
+            TabKind::Svg { view, .. } if view.read(cx).is_find_open(cx) => {
+                view.clone().update(cx, |v, cx| v.close_find(Some(window), cx));
+                true
+            }
+            TabKind::Mermaid { view, .. } if view.read(cx).is_find_open(cx) => {
+                view.clone().update(cx, |v, cx| v.close_find(Some(window), cx));
+                true
+            }
+            TabKind::Subtitle { view, .. } if view.read(cx).is_find_open(cx) => {
+                view.clone().update(cx, |v, cx| v.close_find(Some(window), cx));
+                true
+            }
+            TabKind::Spreadsheet { find, .. } if find.open => {
+                self.close_spreadsheet_find(side, tab_id, Some(window), cx);
+                true
+            }
+            TabKind::Office { find, .. } if find.open => {
+                self.close_office_find(side, tab_id, Some(window), cx);
+                true
+            }
+            TabKind::Epub { view, .. } if view.read(cx).is_find_open() => {
+                view.clone().update(cx, |v, cx| v.close_find(Some(window), cx));
+                true
+            }
+            TabKind::Kanban { view, .. } if view.read(cx).is_find_open(cx) => {
+                view.clone().update(cx, |v, cx| v.close_find(Some(window), cx));
+                true
+            }
+            TabKind::Canvas { view, .. } if view.read(cx).is_find_open(cx) => {
+                view.clone().update(cx, |v, cx| v.close_find(Some(window), cx));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn open_md_read_find(
+        &mut self,
+        side: PaneSide,
+        tab_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let inp = {
+            let Some(t) = self.find_tab_mut(side, tab_id) else {
+                return;
+            };
+            let TabKind::Markdown { read_find, .. } = &mut t.kind else {
+                return;
+            };
+            read_find.open = true;
+            read_find.input.clone()
+        };
+        let q = inp.read(cx).value().to_string();
+        if let Some(t) = self.find_tab_mut(side, tab_id)
+            && let TabKind::Markdown { read_find, .. } = &mut t.kind
+        {
+            read_find.query = q;
+        }
+        self.recompute_md_read_find(side, tab_id, false, cx);
+        inp.update(cx, |s, cx| {
+            let len = s.value().len();
+            s.focus(window, cx);
+            if len > 0 {
+                s.set_selected_range(0..len, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    pub fn close_md_read_find(
+        &mut self,
+        side: PaneSide,
+        tab_id: u64,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(t) = self.find_tab_mut(side, tab_id)
+            && let TabKind::Markdown { read_find, .. } = &mut t.kind
+        {
+            read_find.open = false;
+        }
+        if let Some(window) = window {
+            self.focus_handle.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_md_read_find_case(
+        &mut self,
+        side: PaneSide,
+        tab_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(t) = self.find_tab_mut(side, tab_id)
+            && let TabKind::Markdown { read_find, .. } = &mut t.kind
+        {
+            read_find.case_sensitive = !read_find.case_sensitive;
+        }
+        self.recompute_md_read_find(side, tab_id, true, cx);
+        cx.notify();
+    }
+
+    pub fn clear_md_read_find_query(
+        &mut self,
+        side: PaneSide,
+        tab_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(t) = self.find_tab_mut(side, tab_id)
+            && let TabKind::Markdown { read_find, .. } = &mut t.kind
+        {
+            read_find.query.clear();
+            read_find.matches.clear();
+            read_find.active = 0;
+        }
+        cx.notify();
+    }
+
+    fn scroll_md_read_to_active(
+        raw: &str,
+        matches: &[ReadFindMatch],
+        active: usize,
+        read_scroll: &ScrollHandle,
+    ) {
+        let Some(hit) = matches.get(active) else {
+            return;
+        };
+        let total_lines = raw.lines().count().max(1);
+        let max_y = f32::from(read_scroll.max_offset().y);
+        if max_y > 0.0 {
+            let frac = (hit.line.saturating_sub(1) as f32 / total_lines as f32).clamp(0.0, 1.0);
+            let target_y = (frac * max_y - 140.0).clamp(0.0, max_y);
+            read_scroll.set_offset(point(px(0.), px(-target_y)));
+        }
+    }
+
+    pub fn recompute_md_read_find(
+        &mut self,
+        side: PaneSide,
+        tab_id: u64,
+        jump: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(t) = self.find_tab(side, tab_id) else {
+            return;
+        };
+        let TabKind::Markdown {
+            editor,
+            live_doc,
+            source_mode,
+            read_find,
+            ..
+        } = &t.kind
+        else {
+            return;
+        };
+        let raw = if *source_mode
+            && let Some(ed) = editor.as_ref()
+        {
+            ed.read(cx).value().to_string()
+        } else {
+            live_doc.read(cx).text().to_string()
+        };
+        let trimmed = read_find.query.trim().to_string();
+        let case_sensitive = read_find.case_sensitive;
+        let mut matches = Vec::new();
+        if !trimmed.is_empty() {
+            for (line_idx, line) in raw.lines().enumerate() {
+                for range in find_all_byte_ranges(line, &trimmed, case_sensitive) {
+                    let snip = line.trim();
+                    let snippet = if snip.chars().count() > 80 {
+                        let mut s: String = snip.chars().take(77).collect();
+                        s.push('…');
+                        s
+                    } else {
+                        snip.to_string()
+                    };
+                    matches.push(ReadFindMatch {
+                        line: line_idx + 1,
+                        range,
+                        snippet,
+                    });
+                }
+            }
+        }
+
+        if let Some(t) = self.find_tab_mut(side, tab_id)
+            && let TabKind::Markdown {
+                read_find,
+                read_scroll,
+                ..
+            } = &mut t.kind
+        {
+            read_find.matches = matches;
+            if read_find.matches.is_empty() {
+                read_find.active = 0;
+            } else {
+                if jump || read_find.active >= read_find.matches.len() {
+                    read_find.active = 0;
+                }
+                if jump {
+                    Self::scroll_md_read_to_active(
+                        &raw,
+                        &read_find.matches,
+                        read_find.active,
+                        read_scroll,
+                    );
+                }
+            }
+        }
+    }
+
+    pub fn step_md_read_find(
+        &mut self,
+        side: PaneSide,
+        tab_id: u64,
+        forward: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let raw = {
+            let Some(t) = self.find_tab(side, tab_id) else {
+                return;
+            };
+            let TabKind::Markdown {
+                editor,
+                live_doc,
+                source_mode,
+                ..
+            } = &t.kind
+            else {
+                return;
+            };
+            if *source_mode
+                && let Some(ed) = editor.as_ref()
+            {
+                ed.read(cx).value().to_string()
+            } else {
+                live_doc.read(cx).text().to_string()
+            }
+        };
+        if let Some(t) = self.find_tab_mut(side, tab_id)
+            && let TabKind::Markdown {
+                read_find,
+                read_scroll,
+                ..
+            } = &mut t.kind
+        {
+            let len = read_find.matches.len();
+            if len == 0 {
+                return;
+            }
+            read_find.active = if forward {
+                (read_find.active + 1) % len
+            } else {
+                (read_find.active + len - 1) % len
+            };
+            Self::scroll_md_read_to_active(&raw, &read_find.matches, read_find.active, read_scroll);
+        }
+        cx.notify();
+    }
+
+    pub fn jump_md_read_match_to_edit(
+        &mut self,
+        side: PaneSide,
+        tab_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let hit_and_mode = {
+            let Some(t) = self.find_tab_mut(side, tab_id) else {
+                return;
+            };
+            let TabKind::Markdown {
+                editor,
+                live_doc,
+                view_mode,
+                source_mode,
+                read_find,
+                ..
+            } = &mut t.kind
+            else {
+                return;
+            };
+            let Some(hit) = read_find.matches.get(read_find.active).cloned() else {
+                return;
+            };
+            read_find.open = false;
+            *view_mode = MdViewMode::Edit;
+            (hit, *source_mode, editor.clone(), live_doc.clone())
+        };
+        let (hit, source_mode, editor_opt, live_doc) = hit_and_mode;
+        let line_0 = hit.line.saturating_sub(1);
+        if source_mode
+            && let Some(ed) = editor_opt
+        {
+            let raw = ed.read(cx).value().to_string();
+            let col_chars = raw
+                .lines()
+                .nth(line_0)
+                .map(|l| {
+                    let end = hit.range.start.min(l.len());
+                    l[..end].chars().count()
+                })
+                .unwrap_or(0);
+            let pos = gpui_kit::component::input::Position::new(line_0 as u32, col_chars as u32);
+            ed.focus_handle(cx).focus(window, cx);
+            ed.update(cx, |s, cx| s.set_cursor_position(pos, window, cx));
+        } else {
+            live_doc.update(cx, |ed, cx| ed.jump_to_line(line_0, window, cx));
+        }
+        cx.notify();
+    }
+
+    pub fn open_spreadsheet_find(
+        &mut self,
+        side: PaneSide,
+        tab_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let inp = {
+            let Some(t) = self.find_tab_mut(side, tab_id) else {
+                return;
+            };
+            let TabKind::Spreadsheet { find, .. } = &mut t.kind else {
+                return;
+            };
+            find.open = true;
+            find.input.clone()
+        };
+        let q = inp.read(cx).value().to_string();
+        if let Some(t) = self.find_tab_mut(side, tab_id)
+            && let TabKind::Spreadsheet { find, .. } = &mut t.kind
+        {
+            find.query = q;
+        }
+        self.recompute_spreadsheet_find(side, tab_id, false, cx);
+        inp.update(cx, |s, cx| {
+            let len = s.value().len();
+            s.focus(window, cx);
+            if len > 0 {
+                s.set_selected_range(0..len, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    pub fn close_spreadsheet_find(
+        &mut self,
+        side: PaneSide,
+        tab_id: u64,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        let gf = if let Some(t) = self.find_tab_mut(side, tab_id)
+            && let TabKind::Spreadsheet {
+                find, grid_focus, ..
+            } = &mut t.kind
+        {
+            find.open = false;
+            Some(grid_focus.clone())
+        } else {
+            None
+        };
+        if let (Some(window), Some(gf)) = (window, gf) {
+            gf.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_spreadsheet_find_case(
+        &mut self,
+        side: PaneSide,
+        tab_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(t) = self.find_tab_mut(side, tab_id)
+            && let TabKind::Spreadsheet { find, .. } = &mut t.kind
+        {
+            find.case_sensitive = !find.case_sensitive;
+        }
+        self.recompute_spreadsheet_find(side, tab_id, true, cx);
+        cx.notify();
+    }
+
+    pub fn clear_spreadsheet_find_query(
+        &mut self,
+        side: PaneSide,
+        tab_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(t) = self.find_tab_mut(side, tab_id)
+            && let TabKind::Spreadsheet { find, .. } = &mut t.kind
+        {
+            find.query.clear();
+            find.matches.clear();
+            find.active = 0;
+        }
+        cx.notify();
+    }
+
+    fn jump_spreadsheet_find_active(
+        tab: &mut DocumentTab,
+        cx: &mut App,
+    ) {
+        let TabKind::Spreadsheet {
+            doc,
+            active_sheet,
+            active_row,
+            active_col,
+            formula_input,
+            row_scroll,
+            find,
+            ..
+        } = &mut tab.kind
+        else {
+            return;
+        };
+        let Some(&(s_ix, r, c)) = find.matches.get(find.active) else {
+            return;
+        };
+        *active_sheet = s_ix;
+        *active_row = r.max(1);
+        *active_col = c.max(1);
+        let raw = doc.raw_input(s_ix, *active_row, *active_col);
+        let fi = formula_input.clone();
+        // Keep find input focused; update formula bar value passively without window focus steal
+        let _ = fi;
+        let _ = raw;
+        let _ = cx;
+        row_scroll.scroll_to_item((*active_row - 1).max(0) as usize, ScrollStrategy::Center);
+    }
+
+    pub fn recompute_spreadsheet_find(
+        &mut self,
+        side: PaneSide,
+        tab_id: u64,
+        jump: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(t) = self.find_tab_mut(side, tab_id) {
+            let formula_update = {
+                let TabKind::Spreadsheet {
+                    doc,
+                    active_sheet,
+                    find,
+                    ..
+                } = &mut t.kind
+                else {
+                    return;
+                };
+                let trimmed = find.query.trim().to_string();
+                let case_sensitive = find.case_sensitive;
+                let cur_sheet = *active_sheet;
+                let mut matches = Vec::new();
+                if !trimmed.is_empty() {
+                    let sheet_count = doc.sheet_names().len() as u32;
+                    for s_ix in 0..sheet_count {
+                        let (max_r, max_c) = doc.sheet_bounds(s_ix);
+                        for r in 1..=max_r {
+                            for c in 1..=max_c {
+                                let disp = doc.display_value(s_ix, r, c);
+                                let mut matched =
+                                    !find_all_byte_ranges(&disp, &trimmed, case_sensitive)
+                                        .is_empty();
+                                if !matched {
+                                    let raw = doc.raw_input(s_ix, r, c);
+                                    if !raw.is_empty() && raw != disp {
+                                        matched = !find_all_byte_ranges(
+                                            &raw,
+                                            &trimmed,
+                                            case_sensitive,
+                                        )
+                                        .is_empty();
+                                    }
+                                }
+                                if matched {
+                                    matches.push((s_ix, r, c));
+                                }
+                            }
+                        }
+                    }
+                }
+                find.matches = matches;
+                if find.matches.is_empty() {
+                    find.active = 0;
+                    false
+                } else {
+                    if jump {
+                        find.active = find
+                            .matches
+                            .iter()
+                            .position(|(s, _, _)| *s >= cur_sheet)
+                            .unwrap_or(0);
+                    } else if find.active >= find.matches.len() {
+                        find.active = 0;
+                    }
+                    jump
+                }
+            };
+            if formula_update {
+                Self::jump_spreadsheet_find_active(t, cx);
+            }
+        }
+    }
+
+    pub fn step_spreadsheet_find(
+        &mut self,
+        side: PaneSide,
+        tab_id: u64,
+        forward: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(t) = self.find_tab_mut(side, tab_id) {
+            if let TabKind::Spreadsheet { find, .. } = &mut t.kind {
+                let len = find.matches.len();
+                if len == 0 {
+                    return;
+                }
+                find.active = if forward {
+                    (find.active + 1) % len
+                } else {
+                    (find.active + len - 1) % len
+                };
+            }
+            Self::jump_spreadsheet_find_active(t, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn open_office_find(
+        &mut self,
+        side: PaneSide,
+        tab_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let inp = {
+            let Some(t) = self.find_tab_mut(side, tab_id) else {
+                return;
+            };
+            let TabKind::Office { find, .. } = &mut t.kind else {
+                return;
+            };
+            find.open = true;
+            find.input.clone()
+        };
+        let q = inp.read(cx).value().to_string();
+        if let Some(t) = self.find_tab_mut(side, tab_id)
+            && let TabKind::Office { find, .. } = &mut t.kind
+        {
+            find.query = q;
+        }
+        self.recompute_office_find(side, tab_id, false, cx);
+        inp.update(cx, |s, cx| {
+            let len = s.value().len();
+            s.focus(window, cx);
+            if len > 0 {
+                s.set_selected_range(0..len, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    pub fn close_office_find(
+        &mut self,
+        side: PaneSide,
+        tab_id: u64,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(t) = self.find_tab_mut(side, tab_id)
+            && let TabKind::Office { find, .. } = &mut t.kind
+        {
+            find.open = false;
+        }
+        if let Some(window) = window {
+            self.focus_handle.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_office_find_case(
+        &mut self,
+        side: PaneSide,
+        tab_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(t) = self.find_tab_mut(side, tab_id)
+            && let TabKind::Office { find, .. } = &mut t.kind
+        {
+            find.case_sensitive = !find.case_sensitive;
+        }
+        self.recompute_office_find(side, tab_id, true, cx);
+        cx.notify();
+    }
+
+    pub fn clear_office_find_query(
+        &mut self,
+        side: PaneSide,
+        tab_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(t) = self.find_tab_mut(side, tab_id)
+            && let TabKind::Office { find, .. } = &mut t.kind
+        {
+            find.query.clear();
+            find.matches.clear();
+            find.active = 0;
+        }
+        cx.notify();
+    }
+
+    fn scroll_office_to_active(
+        total_blocks: usize,
+        matches: &[OfficeFindMatch],
+        active: usize,
+        scroll_handle: &ScrollHandle,
+    ) {
+        let Some(hit) = matches.get(active) else {
+            return;
+        };
+        let max_y = f32::from(scroll_handle.max_offset().y);
+        if max_y > 0.0 {
+            let frac = (hit.block_ix as f32 / total_blocks.max(1) as f32).clamp(0.0, 1.0);
+            let target_y = (frac * max_y - 140.0).clamp(0.0, max_y);
+            scroll_handle.set_offset(point(px(0.), px(-target_y)));
+        }
+    }
+
+    pub fn recompute_office_find(
+        &mut self,
+        side: PaneSide,
+        tab_id: u64,
+        jump: bool,
+        _cx: &mut Context<Self>,
+    ) {
+        let Some(t) = self.find_tab_mut(side, tab_id) else {
+            return;
+        };
+        let TabKind::Office {
+            doc,
+            scroll_handle,
+            find,
+            ..
+        } = &mut t.kind
+        else {
+            return;
+        };
+        let trimmed = find.query.trim().to_string();
+        let case_sensitive = find.case_sensitive;
+        let mut matches = Vec::new();
+        if !trimmed.is_empty() {
+            for (blk_ix, blk) in doc.blocks.iter().enumerate() {
+                match blk {
+                    crate::formats::office::OfficeBlock::Heading { text, .. } => {
+                        for range in find_all_byte_ranges(text, &trimmed, case_sensitive) {
+                            matches.push(OfficeFindMatch {
+                                block_ix: blk_ix,
+                                row_ix: 0,
+                                col_ix: 0,
+                                range,
+                            });
+                        }
+                    }
+                    crate::formats::office::OfficeBlock::Paragraph { runs, list_prefix } => {
+                        let text =
+                            office_view::office_paragraph_text(runs, list_prefix.as_deref());
+                        for range in find_all_byte_ranges(&text, &trimmed, case_sensitive) {
+                            matches.push(OfficeFindMatch {
+                                block_ix: blk_ix,
+                                row_ix: 0,
+                                col_ix: 0,
+                                range,
+                            });
+                        }
+                    }
+                    crate::formats::office::OfficeBlock::Table { rows } => {
+                        for (rix, row) in rows.iter().enumerate() {
+                            for (cix, cell) in row.iter().enumerate() {
+                                for range in find_all_byte_ranges(cell, &trimmed, case_sensitive) {
+                                    matches.push(OfficeFindMatch {
+                                        block_ix: blk_ix,
+                                        row_ix: rix,
+                                        col_ix: cix,
+                                        range,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    crate::formats::office::OfficeBlock::Image { .. } => {}
+                }
+            }
+        }
+        find.matches = matches;
+        if find.matches.is_empty() {
+            find.active = 0;
+        } else {
+            if jump || find.active >= find.matches.len() {
+                find.active = 0;
+            }
+            if jump {
+                Self::scroll_office_to_active(
+                    doc.blocks.len(),
+                    &find.matches,
+                    find.active,
+                    scroll_handle,
+                );
+            }
+        }
+    }
+
+    pub fn step_office_find(
+        &mut self,
+        side: PaneSide,
+        tab_id: u64,
+        forward: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(t) = self.find_tab_mut(side, tab_id)
+            && let TabKind::Office {
+                doc,
+                scroll_handle,
+                find,
+                ..
+            } = &mut t.kind
+        {
+            let len = find.matches.len();
+            if len == 0 {
+                return;
+            }
+            find.active = if forward {
+                (find.active + 1) % len
+            } else {
+                (find.active + len - 1) % len
+            };
+            Self::scroll_office_to_active(
+                doc.blocks.len(),
+                &find.matches,
+                find.active,
+                scroll_handle,
+            );
+        }
+        cx.notify();
+    }
+
     pub fn export_typst_current_pdf(
         &mut self,
         side: PaneSide,
@@ -3396,6 +4783,8 @@ impl VKarmaApp {
                     view.update(cx, |v, _| v.relocate_archive(updated));
                 } else if let TabKind::Audio { view, .. } = &tab.kind {
                     view.update(cx, |v, _| v.relocate_audio(updated));
+                } else if let TabKind::Epub { view, .. } = &tab.kind {
+                    view.update(cx, |v, _| v.relocate_book(updated));
                 }
             }
         }
@@ -3902,6 +5291,18 @@ impl Render for VKarmaApp {
                 this.search_input.focus_handle(cx).focus(window, cx);
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &FindInTab, window, cx| {
+                this.trigger_find_in_active_tab(false, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ReplaceInTab, window, cx| {
+                this.trigger_find_in_active_tab(true, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &InputSearch, window, cx| {
+                this.trigger_find_in_active_tab(false, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &InputReplace, window, cx| {
+                this.trigger_find_in_active_tab(true, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleViewMode, window, cx| {
                 this.toggle_md_view_mode(window, cx);
             }))
@@ -3931,6 +5332,18 @@ impl Render for VKarmaApp {
                 });
                 if let Some(next_idx) = next {
                     this.activate_tab(side, next_idx, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &MoveTabLeft, _, cx| {
+                let side = this.active_pane;
+                if let Some(idx) = this.pane(side).map(|p| p.active_tab) {
+                    this.move_tab(side, idx, -1, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &MoveTabRight, _, cx| {
+                let side = this.active_pane;
+                if let Some(idx) = this.pane(side).map(|p| p.active_tab) {
+                    this.move_tab(side, idx, 1, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &NavigateBack, window, cx| {
@@ -3966,6 +5379,7 @@ impl Render for VKarmaApp {
                 } else if this.quick_switcher.is_some() {
                     this.quick_switcher = None;
                     cx.notify();
+                } else if this.close_active_tab_find(window, cx) {
                 } else {
                     cx.propagate();
                 }
@@ -4084,6 +5498,29 @@ pub(crate) fn reorder_with_active<T>(
     true
 }
 
+pub(crate) fn move_tab_between_vecs<T>(
+    from_tabs: &mut Vec<T>,
+    from_active: &mut usize,
+    from_idx: usize,
+    to_tabs: &mut Vec<T>,
+    to_active: &mut usize,
+    to_idx: usize,
+) -> bool {
+    if from_idx >= from_tabs.len() {
+        return false;
+    }
+    let item = from_tabs.remove(from_idx);
+    if from_tabs.is_empty() {
+        *from_active = 0;
+    } else if from_idx < *from_active || *from_active >= from_tabs.len() {
+        *from_active = from_active.saturating_sub(1).min(from_tabs.len() - 1);
+    }
+    let insert_idx = to_idx.min(to_tabs.len());
+    to_tabs.insert(insert_idx, item);
+    *to_active = insert_idx;
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4196,5 +5633,65 @@ mod tests {
             relocate_path(&PathBuf::from("/vault/Notes2/B.md"), &old_dir, &new_dir),
             None
         );
+    }
+
+    #[test]
+    fn move_tab_between_vecs_tracks_source_and_target_active_indices() {
+        let mut left = vec!["A", "B", "C"];
+        let mut left_active = 2; // "C"
+        let mut right = vec!["X", "Y"];
+        let mut right_active = 0; // "X"
+
+        // Move "A" before active "C" into middle of right pane -> shifts left_active down and activates inserted tab in right
+        assert!(move_tab_between_vecs(
+            &mut left,
+            &mut left_active,
+            0,
+            &mut right,
+            &mut right_active,
+            1
+        ));
+        assert_eq!(left, vec!["B", "C"]);
+        assert_eq!(left[left_active], "C");
+        assert_eq!(right, vec!["X", "A", "Y"]);
+        assert_eq!(right[right_active], "A");
+
+        // Move active "C" (last index) out of left pane to end of right pane
+        assert!(move_tab_between_vecs(
+            &mut left,
+            &mut left_active,
+            1,
+            &mut right,
+            &mut right_active,
+            99
+        ));
+        assert_eq!(left, vec!["B"]);
+        assert_eq!(left_active, 0);
+        assert_eq!(right, vec!["X", "A", "Y", "C"]);
+        assert_eq!(right[right_active], "C");
+
+        // Move last remaining item "B" out of left pane -> left becomes empty cleanly
+        assert!(move_tab_between_vecs(
+            &mut left,
+            &mut left_active,
+            0,
+            &mut right,
+            &mut right_active,
+            0
+        ));
+        assert!(left.is_empty());
+        assert_eq!(left_active, 0);
+        assert_eq!(right, vec!["B", "X", "A", "Y", "C"]);
+        assert_eq!(right[right_active], "B");
+
+        // Out-of-bounds source index is a safe no-op
+        assert!(!move_tab_between_vecs(
+            &mut left,
+            &mut left_active,
+            0,
+            &mut right,
+            &mut right_active,
+            0
+        ));
     }
 }

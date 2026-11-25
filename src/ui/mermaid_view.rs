@@ -1,3 +1,4 @@
+use super::find_bar::{EditorFindBar, wrap_editor_with_find};
 use super::svg_view::{SvgBgMode, render_svg_preview_box};
 use super::{PaneSide, TabKind, TypstViewMode, VKarmaApp};
 use crate::formats::mermaid::mermaid_to_svg;
@@ -22,6 +23,7 @@ pub enum MermaidViewEvent {
 
 pub struct MermaidView {
     editor: Entity<EditorState>,
+    find_bar: Entity<EditorFindBar>,
     _ed_sub: Subscription,
     pub view_mode: TypstViewMode,
     pub dark_theme: bool,
@@ -51,11 +53,13 @@ impl MermaidView {
         let (svg_text, rendered, last_error) = compile_mermaid(&raw, true);
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
+                .searchable(false)
                 .language("markdown")
                 .soft_wrap(false)
                 .line_number(true)
                 .default_value(raw)
         });
+        let find_bar = cx.new(|cx| EditorFindBar::new(editor.clone(), window, cx));
         let ed_sub = cx.subscribe(&editor, |this, _, event, cx| {
             if matches!(event, InputEvent::Change) {
                 this.recompile(cx);
@@ -65,6 +69,7 @@ impl MermaidView {
 
         Self {
             editor,
+            find_bar,
             _ed_sub: ed_sub,
             view_mode: TypstViewMode::Split,
             dark_theme: true,
@@ -75,6 +80,23 @@ impl MermaidView {
             last_error,
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    pub fn is_find_open(&self, cx: &App) -> bool {
+        self.view_mode != TypstViewMode::Preview && self.find_bar.read(cx).is_open()
+    }
+
+    pub fn open_find(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view_mode == TypstViewMode::Preview {
+            self.view_mode = TypstViewMode::Split;
+        }
+        self.find_bar.update(cx, |b, cx| b.open(replace, window, cx));
+        cx.notify();
+    }
+
+    pub fn close_find(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        self.find_bar.update(cx, |b, cx| b.close(window, cx));
+        cx.notify();
     }
 
     fn recompile(&mut self, cx: &mut Context<Self>) {
@@ -158,10 +180,15 @@ impl Render for MermaidView {
             self.zoom,
             SharedString::from(format!("mmd-scroll-{:?}", cx.entity_id())),
         );
-        let editor_pane = Editor::new(&self.editor)
-            .size_full()
-            .appearance(false)
-            .bordered(false);
+        let editor_pane = wrap_editor_with_find(
+            Editor::new(&self.editor)
+                .size_full()
+                .appearance(false)
+                .bordered(false)
+                .into_any_element(),
+            &self.find_bar,
+            cx,
+        );
 
         match self.view_mode {
             TypstViewMode::Edit => div()
@@ -200,6 +227,7 @@ pub fn render_mermaid_tab(
     let view_mode = mv.view_mode;
     let dark_theme = mv.dark_theme;
     let summary = mv.summary();
+    let find_open = mv.is_find_open(cx);
 
     let v_edit = view.clone();
     let v_split = view.clone();
@@ -344,6 +372,21 @@ pub fn render_mermaid_tab(
                                 });
                             })),
                     )
+                })
+                .child({
+                    let v_find = view.clone();
+                    Button::new(SharedString::from(format!("mmd-find-{tab_id}")))
+                        .with_variant(if find_open {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Ghost
+                        })
+                        .xsmall()
+                        .icon(IconName::Search)
+                        .tooltip("Find & Replace (Ctrl+F)")
+                        .on_click(cx.listener(move |_, _, window, cx| {
+                            v_find.update(cx, |v, cx| v.open_find(false, window, cx));
+                        }))
                 })
                 .child(
                     Button::new(SharedString::from(format!("mmd-svg-{tab_id}")))

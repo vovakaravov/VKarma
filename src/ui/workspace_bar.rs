@@ -55,6 +55,7 @@ pub fn preset_accent_color(preset: WorkspacePreset) -> Hsla {
         WorkspacePreset::Code => hex_color(kd::YELLOW),
         WorkspacePreset::Sheets => hex_color(kd::GREEN),
         WorkspacePreset::Typst => hex_color(kd::AQUA),
+        WorkspacePreset::Library => hex_color(kd::VIOLET),
     }
 }
 

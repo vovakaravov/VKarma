@@ -6,7 +6,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontWeight,
     InteractiveElement as _, IntoElement, ParentElement, Render, SharedString,
@@ -34,6 +34,20 @@ pub struct FontView {
 impl Focusable for FontView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+impl FontView {
+    pub fn focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.mode = FontTabMode::Glyphs;
+        self.glyph_filter.update(cx, |s, cx| {
+            let len = s.value().len();
+            s.focus(window, cx);
+            if len > 0 {
+                s.set_selected_range(0..len, cx);
+            }
+        });
+        cx.notify();
     }
 }
 
@@ -262,7 +276,34 @@ impl Render for FontView {
                         h_flex()
                             .gap_2()
                             .items_center()
-                            .child(div().w(px(280.)).child(Input::new(&self.glyph_filter).xsmall()))
+                            .child({
+                                let has_q = !self.glyph_filter.read(cx).value().is_empty();
+                                let clear_btn = Button::new(SharedString::from(format!(
+                                    "fnt-flt-x-{:?}",
+                                    cx.entity_id()
+                                )))
+                                .text()
+                                .xsmall()
+                                .tab_stop(false)
+                                .icon(IconName::Close)
+                                .tooltip("Clear")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.glyph_filter
+                                        .update(cx, |s, cx| s.set_value("", window, cx));
+                                    this.glyph_filter.focus_handle(cx).focus(window, cx);
+                                    cx.notify();
+                                }));
+                                div().w(px(280.)).child(
+                                    Input::new(&self.glyph_filter)
+                                        .xsmall()
+                                        .prefix(
+                                            Icon::new(IconName::Search)
+                                                .xsmall()
+                                                .text_color(hex_color(kd::FG_MUTED)),
+                                        )
+                                        .when(has_q, |i| i.suffix(clear_btn)),
+                                )
+                            })
                             .child(
                                 div()
                                     .text_xs()

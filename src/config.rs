@@ -24,6 +24,7 @@ pub enum WorkspacePreset {
     Code,
     Sheets,
     Typst,
+    Library,
 }
 
 impl WorkspacePreset {
@@ -44,6 +45,7 @@ impl WorkspacePreset {
             Self::Code => "Code",
             Self::Sheets => "Sheets",
             Self::Typst => "Typst",
+            Self::Library => "Library",
         }
     }
 
@@ -54,6 +56,7 @@ impl WorkspacePreset {
             Self::Code => "Focused left file tree, Source mode default, compact sidebars",
             Self::Sheets => "Spreadsheet & CSV workbench with split Markdown reference",
             Self::Typst => "Typst live studio with side-by-side preview and outline",
+            Self::Library => "E-book bookshelf, EPUB metadata & cover editor, and reader",
         }
     }
 
@@ -65,6 +68,7 @@ impl WorkspacePreset {
             Self::Code => (true, false, MdViewMode::Edit, true),
             Self::Sheets => (true, false, MdViewMode::Split, false),
             Self::Typst => (true, true, MdViewMode::Split, false),
+            Self::Library => (false, false, MdViewMode::Edit, false),
         }
     }
 }

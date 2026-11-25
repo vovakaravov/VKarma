@@ -1,3 +1,4 @@
+use super::find_bar::{EditorFindBar, FIND_INPUT_W, find_count_badge, floating_find_card, wrap_editor_with_find};
 use super::{PaneSide, TabKind, VKarmaApp};
 use crate::formats::kanban::KanbanBoard;
 use crate::theme::{accent_alpha, hex_alpha, hex_color, kd};
@@ -69,7 +70,13 @@ pub struct KanbanView {
     adding_column_input: Option<(Entity<InputState>, Subscription)>,
     source_mode: bool,
     source_editor: Entity<EditorState>,
+    source_find_bar: Entity<EditorFindBar>,
     _source_sub: Subscription,
+    find_open: bool,
+    find_input: Entity<InputState>,
+    _find_sub: Subscription,
+    find_query: String,
+    find_needs_focus: bool,
 }
 
 impl EventEmitter<KanbanViewEvent> for KanbanView {}
@@ -89,14 +96,24 @@ impl KanbanView {
         let board = KanbanBoard::parse(&raw);
         let source_editor = cx.new(|cx| {
             EditorState::new(window, cx)
+                .searchable(false)
                 .language("markdown")
                 .soft_wrap(true)
                 .line_number(true)
                 .default_value(raw)
         });
+        let source_find_bar = cx.new(|cx| EditorFindBar::new(source_editor.clone(), window, cx));
         let source_sub = cx.subscribe(&source_editor, |this, _, event, cx| {
             if matches!(event, InputEvent::Change) && this.source_mode {
                 cx.emit(KanbanViewEvent::Changed);
+            }
+        });
+
+        let find_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter cards…"));
+        let _find_sub = cx.subscribe(&find_input, |this, state, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.find_query = state.read(cx).value().to_string();
+                cx.notify();
             }
         });
 
@@ -109,7 +126,13 @@ impl KanbanView {
             adding_column_input: None,
             source_mode: false,
             source_editor,
+            source_find_bar,
             _source_sub: source_sub,
+            find_open: false,
+            find_input,
+            _find_sub,
+            find_query: String::new(),
+            find_needs_focus: false,
         };
         view.ensure_column_inputs(window, cx);
         view
@@ -152,6 +175,79 @@ impl KanbanView {
     pub fn summary(&self) -> String {
         let (cols, done, total) = self.board.counts();
         format!("{cols} cols · {done}/{total} done")
+    }
+
+    pub fn is_find_open(&self, cx: &App) -> bool {
+        if self.source_mode {
+            self.source_find_bar.read(cx).is_open()
+        } else {
+            self.find_open
+        }
+    }
+
+    pub fn open_find(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.source_mode {
+            self.source_find_bar
+                .update(cx, |b, cx| b.open(replace, window, cx));
+            cx.notify();
+            return;
+        }
+        self.find_open = true;
+        self.find_needs_focus = true;
+        let query = self.find_input.read(cx).value().to_string();
+        if query != self.find_query {
+            self.find_query = query;
+        }
+        self.find_input.update(cx, |s, cx| {
+            let len = s.value().len();
+            s.focus(window, cx);
+            if len > 0 {
+                s.set_selected_range(0..len, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    pub fn close_find(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        if self.source_mode {
+            self.source_find_bar
+                .update(cx, |b, cx| b.close(window, cx));
+            cx.notify();
+            return;
+        }
+        if !self.find_open {
+            return;
+        }
+        self.find_open = false;
+        self.find_needs_focus = false;
+        if let Some(window) = window {
+            self.focus_handle.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn card_matches_filter(title: &str, notes: &[String], tags: &[String], q_lower: &str) -> bool {
+        if q_lower.is_empty() {
+            return true;
+        }
+        title.to_lowercase().contains(q_lower)
+            || notes.iter().any(|n| n.to_lowercase().contains(q_lower))
+            || tags.iter().any(|t| t.to_lowercase().contains(q_lower))
+    }
+
+    fn count_board_matches(&self, q_lower: &str) -> (usize, usize) {
+        let mut matched = 0usize;
+        let mut total = 0usize;
+        for col in &self.board.columns {
+            for card in &col.cards {
+                total += 1;
+                let tags = card.extract_tags();
+                if Self::card_matches_filter(&card.title, &card.notes, &tags, q_lower) {
+                    matched += 1;
+                }
+            }
+        }
+        (matched, total)
     }
 
     pub fn toggle_source_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -278,22 +374,39 @@ fn tag_badge_color(tag: &str) -> u32 {
 }
 
 impl Render for KanbanView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.source_mode {
             return div()
                 .size_full()
                 .bg(hex_color(kd::BG_MAIN))
-                .child(
+                .child(wrap_editor_with_find(
                     Editor::new(&self.source_editor)
                         .size_full()
                         .appearance(false)
-                        .bordered(false),
-                )
+                        .bordered(false)
+                        .into_any_element(),
+                    &self.source_find_bar,
+                    cx,
+                ))
                 .into_any_element();
         }
 
+        let query_lower = self.find_query.trim().to_lowercase();
+        let filter_active = self.find_open && !query_lower.is_empty();
+        let (matched_cards, total_cards) = if self.find_open {
+            self.count_board_matches(&query_lower)
+        } else {
+            (0, 0)
+        };
+        if self.find_open && self.find_needs_focus {
+            self.find_needs_focus = false;
+            self.find_input.focus_handle(cx).focus(window, cx);
+        }
+
         let col_count = self.board.columns.len();
+        let query_for_cols = query_lower.clone();
         let columns_ui = self.board.columns.iter().enumerate().map(|(col_ix, col)| {
+            let query_for_col = query_for_cols.clone();
             let col_id = col.id;
             let col_title = col.title.clone();
             let done_cnt = col.cards.iter().filter(|c| c.done).count();
@@ -313,6 +426,9 @@ impl Render for KanbanView {
                 let tags = card.extract_tags();
                 let done = card.done;
                 let notes = card.notes.clone();
+                let is_find_match = filter_active
+                    && Self::card_matches_filter(&full_title, &notes, &tags, &query_for_col);
+                let is_find_dimmed = filter_active && !is_find_match;
 
                 let editing_this_card = match &self.inline_edit {
                     Some(InlineKanbanEdit::Card {
@@ -329,9 +445,18 @@ impl Render for KanbanView {
                     .w_full()
                     .p_2p5()
                     .rounded(px(7.))
-                    .bg(hex_color(kd::BG_MAIN))
+                    .bg(if is_find_match {
+                        crate::theme::hex_alpha(0xc4b28a18)
+                    } else {
+                        hex_color(kd::BG_MAIN)
+                    })
                     .border_1()
-                    .border_color(hex_color(kd::BORDER_SUBTLE))
+                    .border_color(if is_find_match {
+                        hex_color(kd::YELLOW)
+                    } else {
+                        hex_color(kd::BORDER_SUBTLE)
+                    })
+                    .when(is_find_dimmed, |c| c.opacity(0.32))
                     .cursor_pointer()
                     .on_drag(
                         DraggedKanbanCard {
@@ -650,12 +775,23 @@ impl Render for KanbanView {
         });
 
         div()
-            .id(SharedString::from(format!("kanban-board-{:?}", cx.entity_id())))
+            .id(SharedString::from(format!("kbn-wrap-{:?}", cx.entity_id())))
+            .relative()
             .size_full()
             .bg(hex_color(kd::BG_DEEP))
             .track_focus(&self.focus_handle)
-            .overflow_x_scrollbar()
-            .p_4()
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                if ev.keystroke.key.as_str() == "escape" && this.find_open {
+                    cx.stop_propagation();
+                    this.close_find(Some(window), cx);
+                }
+            }))
+            .child(
+                div()
+                    .id(SharedString::from(format!("kanban-board-{:?}", cx.entity_id())))
+                    .size_full()
+                    .overflow_x_scrollbar()
+                    .p_4()
             .child(
                 h_flex()
                     .h_full()
@@ -681,7 +817,75 @@ impl Render for KanbanView {
                                 .child(Input::new(input).xsmall()),
                         )
                     }),
+                ),
             )
+            .when(self.find_open, |root| {
+                let raw_q = self.find_query.clone();
+                let count_label = if query_lower.is_empty() {
+                    format!("{total_cards} cards")
+                } else {
+                    format!("{matched_cards} / {total_cards} cards")
+                };
+                let count_is_zero = filter_active && matched_cards == 0;
+                let clear_btn = Button::new(SharedString::from(format!(
+                    "kbn-find-x-{:?}",
+                    cx.entity_id()
+                )))
+                .text()
+                .xsmall()
+                .tab_stop(false)
+                .icon(IconName::Close)
+                .tooltip("Clear")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.find_input.update(cx, |s, cx| s.set_value("", window, cx));
+                    this.find_query.clear();
+                    this.find_input.focus_handle(cx).focus(window, cx);
+                    cx.notify();
+                }));
+                root.child(
+                    floating_find_card(SharedString::from(format!(
+                        "kbn-find-card-{:?}",
+                        cx.entity_id()
+                    )))
+                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                        if ev.keystroke.key.as_str() == "escape" {
+                            cx.stop_propagation();
+                            this.close_find(Some(window), cx);
+                        }
+                    }))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                div().w(px(FIND_INPUT_W)).child(
+                                    Input::new(&self.find_input)
+                                        .xsmall()
+                                        .prefix(
+                                            Icon::new(IconName::Search)
+                                                .xsmall()
+                                                .text_color(hex_color(kd::FG_MUTED)),
+                                        )
+                                        .when(!raw_q.is_empty(), |i| i.suffix(clear_btn)),
+                                ),
+                            )
+                            .child(find_count_badge(count_label, count_is_zero))
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "kbn-find-close-{:?}",
+                                    cx.entity_id()
+                                )))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Close)
+                                .tooltip("Close (Esc)")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.close_find(Some(window), cx);
+                                })),
+                            ),
+                    ),
+                )
+            })
             .into_any_element()
     }
 }
@@ -703,7 +907,9 @@ pub fn render_kanban_tab(
     let kv = view.read(cx);
     let summary = kv.summary();
     let source_mode = kv.source_mode;
+    let find_open = kv.is_find_open(cx);
 
+    let v_find = view.clone();
     let v_add_col = view.clone();
     let v_src = view.clone();
 
@@ -740,6 +946,20 @@ pub fn render_kanban_tab(
             h_flex()
                 .gap_1p5()
                 .items_center()
+                .child(
+                    Button::new(SharedString::from(format!("kbn-find-{tab_id}")))
+                        .with_variant(if find_open {
+                            gpui_kit::component::button::ButtonVariant::Primary
+                        } else {
+                            gpui_kit::component::button::ButtonVariant::Ghost
+                        })
+                        .xsmall()
+                        .icon(IconName::Search)
+                        .tooltip("Find Cards (Ctrl+F)")
+                        .on_click(cx.listener(move |_, _, window, cx| {
+                            v_find.update(cx, |v, cx| v.open_find(false, window, cx));
+                        })),
+                )
                 .when(!source_mode, |this| {
                     this.child(
                         Button::new(SharedString::from(format!("kbn-new-col-{tab_id}")))

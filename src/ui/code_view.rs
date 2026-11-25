@@ -23,6 +23,7 @@ pub fn render_code_tab(
 ) -> impl IntoElement {
     let TabKind::Code {
         editor,
+        find_bar,
         language,
         badge,
         soft_wrap,
@@ -46,6 +47,8 @@ pub fn render_code_tab(
     } else {
         CodeViewMode::Code
     };
+    let find_is_open = find_bar.read(cx).is_open();
+    let fb_btn = find_bar.clone();
 
     let header = h_flex()
         .h(px(36.))
@@ -170,6 +173,27 @@ pub fn render_code_tab(
                             })),
                     )
                 })
+                .child(
+                    Button::new(SharedString::from(format!("code-find-{tab_id}")))
+                        .with_variant(if find_is_open {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Ghost
+                        })
+                        .xsmall()
+                        .icon(IconName::Search)
+                        .tooltip("Find & Replace (Ctrl+F)")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let Some(t) = this.find_tab_mut(side, tab_id)
+                                && let TabKind::Code { data_view, .. } = &mut t.kind
+                                && *data_view != CodeViewMode::Code
+                            {
+                                *data_view = CodeViewMode::Code;
+                            }
+                            fb_btn.update(cx, |b, cx| b.open(false, window, cx));
+                            cx.notify();
+                        })),
+                )
                 .when(dirty, |this| {
                     this.child(
                         Button::new(SharedString::from(format!("code-save-{tab_id}")))
@@ -185,12 +209,16 @@ pub fn render_code_tab(
         );
 
     let body: AnyElement = match active_view {
-        CodeViewMode::Code => super::zen_editor_frame(
-            Editor::new(editor)
-                .size_full()
-                .appearance(false)
-                .bordered(false),
-            zen_mode,
+        CodeViewMode::Code => super::find_bar::wrap_editor_with_find(
+            super::zen_editor_frame(
+                Editor::new(editor)
+                    .size_full()
+                    .appearance(false)
+                    .bordered(false),
+                zen_mode,
+            ),
+            find_bar,
+            cx,
         ),
         CodeViewMode::Tree => {
             let raw = editor.read(cx).value().to_string();
@@ -206,10 +234,34 @@ pub fn render_code_tab(
                     collect_container_paths(&root, "", &mut all_containers);
 
                     let filter_widget = tree_filter.as_ref().map(|inp| {
+                        let has_q = !filter_q.is_empty();
+                        let inp_clr = inp.clone();
+                        let clear_btn = Button::new(SharedString::from(format!(
+                            "code-tree-x-{tab_id}"
+                        )))
+                        .text()
+                        .xsmall()
+                        .tab_stop(false)
+                        .icon(IconName::Close)
+                        .tooltip("Clear")
+                        .on_click(cx.listener(move |_, _, window, cx| {
+                            inp_clr.update(cx, |s, cx| s.set_value("", window, cx));
+                            inp_clr.focus_handle(cx).focus(window, cx);
+                            cx.notify();
+                        }));
                         div()
                             .flex_1()
                             .max_w(px(300.))
-                            .child(Input::new(inp).xsmall())
+                            .child(
+                                Input::new(inp)
+                                    .xsmall()
+                                    .prefix(
+                                        Icon::new(IconName::Search)
+                                            .xsmall()
+                                            .text_color(hex_color(kd::FG_MUTED)),
+                                    )
+                                    .when(has_q, |i| i.suffix(clear_btn)),
+                            )
                             .into_any_element()
                     });
 

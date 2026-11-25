@@ -1,3 +1,4 @@
+use super::find_bar::{EditorFindBar, wrap_editor_with_find};
 use super::{PaneSide, TabKind, VKarmaApp};
 use crate::formats::subtitle::{
     SubtitleDoc, SubtitleFormat, format_duration_short, format_timestamp_ms, parse_timestamp_ms,
@@ -7,7 +8,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
     InteractiveElement as _, IntoElement, ParentElement, Render, SharedString,
@@ -32,6 +33,7 @@ pub struct SubtitleView {
     syncing_editor: bool,
     source_mode: bool,
     source_editor: Entity<EditorState>,
+    source_find_bar: Entity<EditorFindBar>,
     _source_sub: Subscription,
 }
 
@@ -40,6 +42,37 @@ impl EventEmitter<SubtitleViewEvent> for SubtitleView {}
 impl Focusable for SubtitleView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+impl SubtitleView {
+    pub fn is_find_open(&self, cx: &App) -> bool {
+        self.source_mode && self.source_find_bar.read(cx).is_open()
+    }
+
+    pub fn open_find(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.source_mode {
+            self.source_find_bar
+                .update(cx, |b, cx| b.open(replace, window, cx));
+            cx.notify();
+            return;
+        }
+        self.filter_input.update(cx, |s, cx| {
+            let len = s.value().len();
+            s.focus(window, cx);
+            if len > 0 {
+                s.set_selected_range(0..len, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    pub fn close_find(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        if self.source_mode {
+            self.source_find_bar
+                .update(cx, |b, cx| b.close(window, cx));
+            cx.notify();
+        }
     }
 }
 
@@ -62,7 +95,7 @@ impl SubtitleView {
 
         let edit_start = cx.new(|cx| InputState::new(window, cx));
         let edit_end = cx.new(|cx| InputState::new(window, cx));
-        let edit_text = cx.new(|cx| EditorState::new(window, cx).soft_wrap(true));
+        let edit_text = cx.new(|cx| EditorState::new(window, cx).searchable(false).soft_wrap(true));
 
         let s1 = cx.subscribe(&edit_start, |this, inp, event, cx| {
             if !this.syncing_editor && matches!(event, InputEvent::Change) {
@@ -105,11 +138,13 @@ impl SubtitleView {
 
         let source_editor = cx.new(|cx| {
             EditorState::new(window, cx)
+                .searchable(false)
                 .language("text")
                 .soft_wrap(true)
                 .line_number(true)
                 .default_value(raw)
         });
+        let source_find_bar = cx.new(|cx| EditorFindBar::new(source_editor.clone(), window, cx));
         let source_sub = cx.subscribe(&source_editor, |this, _, event, cx| {
             if matches!(event, InputEvent::Change) && this.source_mode {
                 cx.emit(SubtitleViewEvent::Changed);
@@ -129,6 +164,7 @@ impl SubtitleView {
             syncing_editor: false,
             source_mode: false,
             source_editor,
+            source_find_bar,
             _source_sub: source_sub,
         };
         if let Some(fid) = first_id {
@@ -228,12 +264,15 @@ impl Render for SubtitleView {
             return div()
                 .size_full()
                 .bg(hex_color(kd::BG_MAIN))
-                .child(
+                .child(wrap_editor_with_find(
                     Editor::new(&self.source_editor)
                         .size_full()
                         .appearance(false)
-                        .bordered(false),
-                )
+                        .bordered(false)
+                        .into_any_element(),
+                    &self.source_find_bar,
+                    cx,
+                ))
                 .into_any_element();
         }
 
@@ -400,7 +439,32 @@ impl Render for SubtitleView {
                         div()
                             .flex_1()
                             .max_w(px(320.))
-                            .child(Input::new(&self.filter_input).xsmall()),
+                            .child({
+                                let has_q = !self.filter_input.read(cx).value().is_empty();
+                                let clear_btn = Button::new(SharedString::from(format!(
+                                    "sub-flt-x-{:?}",
+                                    cx.entity_id()
+                                )))
+                                .text()
+                                .xsmall()
+                                .tab_stop(false)
+                                .icon(IconName::Close)
+                                .tooltip("Clear")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.filter_input
+                                        .update(cx, |s, cx| s.set_value("", window, cx));
+                                    this.filter_input.focus_handle(cx).focus(window, cx);
+                                    cx.notify();
+                                }));
+                                Input::new(&self.filter_input)
+                                    .xsmall()
+                                    .prefix(
+                                        Icon::new(IconName::Search)
+                                            .xsmall()
+                                            .text_color(hex_color(kd::FG_MUTED)),
+                                    )
+                                    .when(has_q, |i| i.suffix(clear_btn))
+                            }),
                     ),
             )
             .child(

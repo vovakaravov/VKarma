@@ -1,20 +1,27 @@
+use super::find_bar::{
+    EditorFindBar, FIND_INPUT_W, find_count_badge, floating_find_card, wrap_editor_with_find,
+};
 use super::{PaneSide, TabKind, VKarmaApp};
 use crate::config::MdViewMode;
 use crate::markdown::{
     preprocess_markdown_with_options, resolve_inline_image_source, split_markdown_chapters,
 };
 use crate::theme::{hex_color, kd};
+use crate::vault::VaultIndex;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
-use gpui_kit::component::input::Editor;
+use gpui_kit::component::input::{Editor, Input};
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::text::TextView;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    Context, InteractiveElement as _, IntoElement, ParentElement, SharedString, Styled, div,
+    AppContext as _, Context, Focusable as _, InteractiveElement as _, IntoElement, KeyDownEvent,
+    ParentElement, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled, div,
     prelude::FluentBuilder as _, px, relative,
 };
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub fn render_markdown_tab(
@@ -25,6 +32,7 @@ pub fn render_markdown_tab(
 ) -> impl IntoElement {
     let TabKind::Markdown {
         editor,
+        editor_find,
         live_doc,
         view_mode,
         source_mode,
@@ -34,6 +42,8 @@ pub fn render_markdown_tab(
         is_mdx,
         chapter_mode,
         active_chapter,
+        read_find,
+        read_scroll,
         ..
     } = &tab.kind
     else {
@@ -52,6 +62,26 @@ pub fn render_markdown_tab(
     let read_mins = if wc == 0 { 0 } else { (wc + 219) / 220 };
     let preprocessed_str = preprocessed.clone();
     let zen_mode = app.zen_mode;
+    let effective_mode = if zen_mode && view_mode == MdViewMode::Split {
+        MdViewMode::Edit
+    } else {
+        view_mode
+    };
+    let read_find_open = read_find.open;
+    let read_find_query = read_find.query.clone();
+    let read_find_case = read_find.case_sensitive;
+    let read_find_input = read_find.input.clone();
+    let read_find_total = read_find.matches.len();
+    let read_find_active = read_find.active;
+    let read_find_hit = read_find.matches.get(read_find.active).cloned();
+    let read_scroll = read_scroll.clone();
+    let find_btn_active = (effective_mode == MdViewMode::Reading && read_find_open)
+        || (effective_mode != MdViewMode::Reading
+            && ((!source_mode && live_doc.read(cx).is_search_open())
+                || (source_mode
+                    && editor_find
+                        .as_ref()
+                        .is_some_and(|fb| fb.read(cx).is_open()))));
 
     let (effective_preview, chapter_nav) = if chapter_mode && view_mode != MdViewMode::Edit {
         let raw_text: String = if source_mode
@@ -222,6 +252,26 @@ pub fn render_markdown_tab(
                             })),
                     )
                 })
+                .child(
+                    Button::new(SharedString::from(format!("md-find-{tab_id}")))
+                        .with_variant(if find_btn_active {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Ghost
+                        })
+                        .xsmall()
+                        .icon(IconName::Search)
+                        .tooltip("Find in File (Ctrl+F)")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.active_pane = side;
+                            if let Some(p) = this.pane_mut(side)
+                                && let Some(pos) = p.tabs.iter().position(|t| t.id == tab_id)
+                            {
+                                p.active_tab = pos;
+                            }
+                            this.trigger_find_in_active_tab(false, window, cx);
+                        })),
+                )
                 .when(dirty, |this| {
                     this.child(
                         Button::new(SharedString::from(format!("md-save-{tab_id}")))
@@ -236,21 +286,26 @@ pub fn render_markdown_tab(
                 }),
         );
 
+    let current_file = tab.path.clone();
     let app_entity = cx.entity();
     let extensions = app.markdown_extensions.clone();
-    let effective_mode = if zen_mode && view_mode == MdViewMode::Split {
-        MdViewMode::Edit
-    } else {
-        view_mode
-    };
     let live_doc = live_doc.clone();
     let body = match effective_mode {
         MdViewMode::Edit => {
             if source_mode
                 && let Some(ed) = editor.as_ref()
             {
-                render_md_editor_pane(app_entity, side, tab_id, ed, source_mode, zen_mode, cx)
-                    .into_any_element()
+                render_md_editor_pane(
+                    app_entity,
+                    side,
+                    tab_id,
+                    ed,
+                    editor_find.as_ref(),
+                    source_mode,
+                    zen_mode,
+                    cx,
+                )
+                .into_any_element()
             } else {
                 let vault = Arc::clone(&app.vault);
                 live_doc.update(cx, |ed, _| ed.sync_render_context(true, zen_mode, vault));
@@ -261,11 +316,14 @@ pub fn render_markdown_tab(
             app_entity,
             side,
             tab_id,
+            current_file,
+            Arc::clone(&app.vault),
             effective_preview,
             extensions,
             true,
             zen_mode,
             chapter_nav,
+            Some(read_scroll),
             cx,
         )
         .into_any_element(),
@@ -278,6 +336,7 @@ pub fn render_markdown_tab(
                     side,
                     tab_id,
                     ed,
+                    editor_find.as_ref(),
                     source_mode,
                     zen_mode,
                     cx,
@@ -292,11 +351,14 @@ pub fn render_markdown_tab(
                 app_entity,
                 side,
                 tab_id,
+                current_file,
+                Arc::clone(&app.vault),
                 effective_preview,
                 extensions,
                 false,
                 zen_mode,
                 chapter_nav,
+                None,
                 cx,
             );
             h_resizable(SharedString::from(format!("md-split-{side:?}-{tab_id}")))
@@ -314,11 +376,157 @@ pub fn render_markdown_tab(
         }
     };
 
+    let read_find_card = if effective_mode == MdViewMode::Reading && read_find_open {
+        let trimmed_non_empty = !read_find_query.trim().is_empty();
+        let count_text = if !trimmed_non_empty {
+            String::new()
+        } else if read_find_total == 0 {
+            "0 / 0".to_string()
+        } else {
+            format!("{} / {}", read_find_active + 1, read_find_total)
+        };
+        let hit_row = read_find_hit.as_ref().map(|h| {
+            h_flex()
+                .gap_1p5()
+                .items_center()
+                .pl(px(4.))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(hex_color(kd::ACCENT))
+                        .child(format!("L{}", h.line)),
+                )
+                .child(
+                    div()
+                        .max_w(px(210.))
+                        .text_xs()
+                        .text_color(hex_color(kd::FG_MUTED))
+                        .truncate()
+                        .child(h.snippet.clone()),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("md-rfind-edit-{tab_id}")))
+                        .secondary()
+                        .xsmall()
+                        .icon(IconName::Pencil)
+                        .label("Edit")
+                        .tooltip("Jump to match in Edit mode")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.jump_md_read_match_to_edit(side, tab_id, window, cx);
+                        })),
+                )
+        });
+        let rfi_clr = read_find_input.clone();
+        let clear_btn = Button::new(SharedString::from(format!("md-rfind-x-{tab_id}")))
+            .text()
+            .xsmall()
+            .tab_stop(false)
+            .icon(IconName::Close)
+            .tooltip("Clear")
+            .on_click(cx.listener(move |this, _, window, cx| {
+                rfi_clr.update(cx, |s, cx| s.set_value("", window, cx));
+                rfi_clr.focus_handle(cx).focus(window, cx);
+                this.clear_md_read_find_query(side, tab_id, cx);
+            }));
+
+        let row1 = h_flex()
+            .gap_1()
+            .items_center()
+            .child(
+                div().w(px(FIND_INPUT_W)).child(
+                    Input::new(&read_find_input)
+                        .xsmall()
+                        .prefix(
+                            Icon::new(IconName::Search)
+                                .xsmall()
+                                .text_color(hex_color(kd::FG_MUTED)),
+                        )
+                        .when(!read_find_query.is_empty(), |i| i.suffix(clear_btn)),
+                ),
+            )
+            .when(!count_text.is_empty(), |row| {
+                row.child(find_count_badge(
+                    count_text,
+                    trimmed_non_empty && read_find_total == 0,
+                ))
+            })
+            .child(
+                Button::new(SharedString::from(format!("md-rfind-case-{tab_id}")))
+                    .with_variant(if read_find_case {
+                        ButtonVariant::Secondary
+                    } else {
+                        ButtonVariant::Ghost
+                    })
+                    .xsmall()
+                    .label("Aa")
+                    .tooltip("Match Case")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_md_read_find_case(side, tab_id, cx);
+                    })),
+            )
+            .child(
+                Button::new(SharedString::from(format!("md-rfind-prev-{tab_id}")))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::ChevronUp)
+                    .tooltip("Previous Match (Shift+Enter)")
+                    .disabled(read_find_total == 0)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.step_md_read_find(side, tab_id, false, cx);
+                    })),
+            )
+            .child(
+                Button::new(SharedString::from(format!("md-rfind-next-{tab_id}")))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::ChevronDown)
+                    .tooltip("Next Match (Enter)")
+                    .disabled(read_find_total == 0)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.step_md_read_find(side, tab_id, true, cx);
+                    })),
+            )
+            .child(
+                Button::new(SharedString::from(format!("md-rfind-close-{tab_id}")))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Close)
+                    .tooltip("Close (Esc)")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.close_md_read_find(side, tab_id, Some(window), cx);
+                    })),
+            );
+
+        Some(
+            floating_find_card(SharedString::from(format!("md-rfind-card-{tab_id}")))
+                .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
+                    if ev.keystroke.key.as_str() == "escape" {
+                        cx.stop_propagation();
+                        this.close_md_read_find(side, tab_id, Some(window), cx);
+                    } else if ev.keystroke.key.as_str() == "f3" {
+                        cx.stop_propagation();
+                        this.step_md_read_find(side, tab_id, !ev.keystroke.modifiers.shift, cx);
+                    }
+                }))
+                .child(v_flex().gap_1().child(row1).children(hit_row)),
+        )
+    } else {
+        None
+    };
+
     v_flex()
         .size_full()
         .bg(hex_color(kd::BG_MAIN))
         .when(!zen_mode, |this| this.child(header))
-        .child(div().flex_1().min_h_0().w_full().child(body))
+        .child(
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(body)
+                .when_some(read_find_card, |d, card| d.child(card)),
+        )
         .into_any_element()
 }
 
@@ -353,11 +561,13 @@ fn mode_pill_btn(
         }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_md_editor_pane(
     app_entity: gpui_kit::Entity<VKarmaApp>,
     side: PaneSide,
     tab_id: u64,
     editor: &gpui_kit::Entity<gpui_kit::component::input::EditorState>,
+    editor_find: Option<&gpui_kit::Entity<EditorFindBar>>,
     source_mode: bool,
     zen_mode: bool,
     cx: &mut Context<VKarmaApp>,
@@ -381,7 +591,42 @@ fn render_md_editor_pane(
             })
         });
 
-    super::zen_editor_frame(ed, zen_mode)
+    let framed = super::zen_editor_frame(ed, zen_mode);
+    if let Some(fb) = editor_find {
+        wrap_editor_with_find(framed, fb, cx)
+    } else {
+        framed
+    }
+}
+
+fn preview_link_tooltip_text(url: &str, current_file: &Path, vault: &VaultIndex) -> String {
+    if let Some(target) =
+        crate::markdown::decode_uri_payload(url, crate::markdown::VKARMA_NOTE_SCHEME)
+    {
+        if let Some(resolved) = vault.resolve_wikilink(&target, current_file) {
+            let rel = resolved.strip_prefix(&vault.root).unwrap_or(&resolved);
+            return format!("Open {}", rel.display());
+        }
+        let mut clean = target
+            .split('|')
+            .next()
+            .unwrap_or(&target)
+            .split('#')
+            .next()
+            .unwrap_or(&target)
+            .trim();
+        while let Some(rest) = clean.strip_prefix("./").or_else(|| clean.strip_prefix(".\\")) {
+            clean = rest;
+        }
+        let normalized = crate::vault::normalize_new_file_name(clean);
+        let fallback = if normalized.is_empty() {
+            target
+        } else {
+            normalized
+        };
+        return format!("Create {fallback}");
+    }
+    url.to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -389,11 +634,14 @@ fn render_md_preview_pane(
     app_entity: gpui_kit::Entity<VKarmaApp>,
     side: PaneSide,
     tab_id: u64,
+    current_file: PathBuf,
+    vault: Arc<VaultIndex>,
     preprocessed: SharedString,
     extensions: gpui_kit::component::text::MarkdownExtensions,
     centered_read: bool,
     zen_mode: bool,
     chapter_nav: Option<(usize, usize, String)>,
+    scroll_handle: Option<ScrollHandle>,
     cx: &mut Context<VKarmaApp>,
 ) -> impl IntoElement {
     let col_max_width = super::column_max_width(centered_read, zen_mode);
@@ -410,6 +658,10 @@ fn render_md_preview_pane(
         .markdown_extensions(extensions)
         .image_source(resolve_inline_image_source)
         .selectable(true)
+        .link_tooltip(move |url, _, cx| {
+            let label = preview_link_tooltip_text(url.as_ref(), &current_file, &vault);
+            cx.new(|_| Tooltip::new(label)).into()
+        })
         .on_link_click(move |url, _, window, cx| {
             app_for_links.update(cx, |app, cx| {
                 app.handle_markdown_link(tab_id, side, url, window, cx);
@@ -427,6 +679,7 @@ fn render_md_preview_pane(
 
     let scroll = div()
         .id(SharedString::from(format!("md-preview-scroll-{side:?}-{tab_id}{ch_suffix}")))
+        .when_some(scroll_handle, |d, h| d.track_scroll(&h))
         .flex_1()
         .min_h_0()
         .w_full()
@@ -500,4 +753,53 @@ fn render_md_preview_pane(
                     ),
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::markdown::{VKARMA_NOTE_SCHEME, encode_uri_payload};
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn preview_link_tooltip_text_formats_resolved_missing_and_url() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+
+        let welcome = root.join("docs/welcome.md");
+        let screenplay = root.join("scripts/Screenplay.fountain");
+        fs::write(&welcome, "# Welcome").unwrap();
+        fs::write(&screenplay, "Title: Demo").unwrap();
+
+        let vault = VaultIndex::build(root, false);
+
+        let resolved_uri = format!(
+            "{VKARMA_NOTE_SCHEME}{}",
+            encode_uri_payload("Screenplay.fountain|Read Script")
+        );
+        assert_eq!(
+            preview_link_tooltip_text(&resolved_uri, &welcome, &vault),
+            "Open scripts/Screenplay.fountain"
+        );
+
+        let missing_md_uri = format!("{VKARMA_NOTE_SCHEME}{}", encode_uri_payload("Missing Note"));
+        assert_eq!(
+            preview_link_tooltip_text(&missing_md_uri, &welcome, &vault),
+            "Create Missing Note.md"
+        );
+
+        let missing_cs_uri = format!("{VKARMA_NOTE_SCHEME}{}", encode_uri_payload("Player.cs"));
+        assert_eq!(
+            preview_link_tooltip_text(&missing_cs_uri, &welcome, &vault),
+            "Create Player.cs"
+        );
+
+        assert_eq!(
+            preview_link_tooltip_text("https://example.com", &welcome, &vault),
+            "https://example.com"
+        );
+    }
 }

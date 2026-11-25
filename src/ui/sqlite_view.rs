@@ -8,7 +8,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{Disableable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontWeight,
     InteractiveElement as _, IntoElement, ParentElement, Render, SharedString,
@@ -33,6 +33,8 @@ pub struct SqliteView {
     last_error: Option<String>,
     selected_cell: Option<String>,
     focus_handle: FocusHandle,
+    filter_input: Entity<InputState>,
+    _filter_sub: Subscription,
 }
 
 impl Focusable for SqliteView {
@@ -60,6 +62,13 @@ impl SqliteView {
             }
         });
 
+        let filter_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter rows…"));
+        let filter_sub = cx.subscribe(&filter_input, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+
         let mut view = Self {
             db_path,
             meta,
@@ -74,6 +83,8 @@ impl SqliteView {
             last_error: init_err,
             selected_cell: None,
             focus_handle: cx.focus_handle(),
+            filter_input,
+            _filter_sub: filter_sub,
         };
         if let Some(tbl) = first_table {
             view.select_table(tbl, window, cx);
@@ -105,6 +116,18 @@ impl SqliteView {
             }
             Err(e) => self.last_error = Some(e),
         }
+        cx.notify();
+    }
+
+    pub fn focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_schema = false;
+        self.filter_input.update(cx, |s, cx| {
+            let len = s.value().len();
+            s.focus(window, cx);
+            if len > 0 {
+                s.set_selected_range(0..len, cx);
+            }
+        });
         cx.notify();
     }
 
@@ -408,7 +431,64 @@ impl Render for SqliteView {
                             .child(c.clone())
                     }));
 
-                let rows_ui = res.rows.iter().enumerate().map(|(rix, cells)| {
+                let raw_flt = self.filter_input.read(cx).value().to_string();
+                let flt_q = raw_flt.trim().to_ascii_lowercase();
+                let mut filtered_rows: Vec<(usize, &Vec<Option<String>>)> = res
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, cells)| {
+                        flt_q.is_empty()
+                            || cells.iter().flatten().any(|v| v.to_ascii_lowercase().contains(&flt_q))
+                    })
+                    .collect();
+                let total_page_rows = res.rows.len();
+                let shown_rows = filtered_rows.len();
+
+                let filter_bar = h_flex()
+                    .px_3()
+                    .py_1()
+                    .gap_2()
+                    .items_center()
+                    .bg(hex_color(kd::BG_SIDEBAR))
+                    .border_b_1()
+                    .border_color(hex_color(kd::BORDER_SUBTLE))
+                    .child({
+                        let clear_btn = Button::new(SharedString::from(format!(
+                            "db-flt-x-{:?}",
+                            cx.entity_id()
+                        )))
+                        .text()
+                        .xsmall()
+                        .tab_stop(false)
+                        .icon(IconName::Close)
+                        .tooltip("Clear Filter")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.filter_input
+                                .update(cx, |s, cx| s.set_value("", window, cx));
+                            this.filter_input.focus_handle(cx).focus(window, cx);
+                            cx.notify();
+                        }));
+                        div().w(px(210.)).child(
+                            Input::new(&self.filter_input)
+                                .xsmall()
+                                .prefix(
+                                    Icon::new(IconName::Search)
+                                        .xsmall()
+                                        .text_color(hex_color(kd::FG_MUTED)),
+                                )
+                                .when(!raw_flt.is_empty(), |i| i.suffix(clear_btn)),
+                        )
+                    })
+                    .child(div().text_xs().text_color(hex_color(kd::FG_MUTED)).child(
+                        if flt_q.is_empty() {
+                            format!("{total_page_rows} rows")
+                        } else {
+                            format!("{shown_rows} / {total_page_rows} rows")
+                        },
+                    ));
+
+                let rows_ui = filtered_rows.drain(..).map(|(rix, cells)| {
                     let row_num = self.page * PAGE_SIZE + rix + 1;
                     h_flex()
                         .bg(if rix % 2 == 1 {
@@ -455,15 +535,21 @@ impl Render for SqliteView {
                         }))
                 });
 
-                div()
-                    .id(SharedString::from(format!("db-tbl-x-{:?}", cx.entity_id())))
+                v_flex()
                     .size_full()
-                    .overflow_x_scrollbar()
+                    .child(filter_bar)
                     .child(
-                        v_flex()
-                            .w(px(total_w))
-                            .min_w(relative(1.))
-                            .h_full()
+                        div()
+                            .id(SharedString::from(format!("db-tbl-x-{:?}", cx.entity_id())))
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .overflow_x_scrollbar()
+                            .child(
+                                v_flex()
+                                    .w(px(total_w))
+                                    .min_w(relative(1.))
+                                    .h_full()
                             .min_h_0()
                             .child(hdr)
                             .child(
@@ -478,6 +564,7 @@ impl Render for SqliteView {
                                     .overflow_y_scrollbar()
                                     .child(v_flex().children(rows_ui)),
                             ),
+                        ),
                     )
                     .into_any_element()
             }
