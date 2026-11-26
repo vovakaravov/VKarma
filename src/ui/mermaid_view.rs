@@ -418,7 +418,7 @@ pub fn render_mermaid_tab(
                             }
                         })),
                 )
-                .when(dirty, |this| {
+                .when(dirty && !app.config.autosave, |this| {
                     this.child(
                         Button::new(SharedString::from(format!("mmd-save-{tab_id}")))
                             .primary()

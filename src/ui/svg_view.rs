@@ -495,7 +495,7 @@ pub fn render_svg_tab(
                             }
                         })),
                 )
-                .when(dirty, |this| {
+                .when(dirty && !app.config.autosave, |this| {
                     this.child(
                         Button::new(SharedString::from(format!("svg-save-{tab_id}")))
                             .primary()

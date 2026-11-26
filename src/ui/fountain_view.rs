@@ -197,7 +197,7 @@ pub fn render_fountain_tab(
                             this.export_fountain_current_pdf(side, tab_id, window, cx);
                         })),
                 )
-                .when(dirty, |this| {
+                .when(dirty && !app.config.autosave, |this| {
                     this.child(
                         Button::new(SharedString::from(format!("ftn-save-{tab_id}")))
                             .primary()

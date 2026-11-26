@@ -228,7 +228,7 @@ pub fn render_typst_tab(
                             this.export_typst_current_pdf(side, tab_id, window, cx);
                         })),
                 )
-                .when(dirty, |this| {
+                .when(dirty && !app.config.autosave, |this| {
                     this.child(
                         Button::new(SharedString::from(format!("typ-save-{tab_id}")))
                             .primary()

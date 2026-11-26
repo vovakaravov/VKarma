@@ -16,11 +16,12 @@ use gpui_kit::{
 };
 
 pub fn render_code_tab(
+    app: &VKarmaApp,
     side: PaneSide,
     tab: &super::DocumentTab,
-    zen_mode: bool,
     cx: &mut Context<VKarmaApp>,
 ) -> impl IntoElement {
+    let zen_mode = app.zen_mode;
     let TabKind::Code {
         editor,
         find_bar,
@@ -194,7 +195,7 @@ pub fn render_code_tab(
                             cx.notify();
                         })),
                 )
-                .when(dirty, |this| {
+                .when(dirty && !app.config.autosave, |this| {
                     this.child(
                         Button::new(SharedString::from(format!("code-save-{tab_id}")))
                             .primary()

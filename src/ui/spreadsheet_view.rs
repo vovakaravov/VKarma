@@ -19,7 +19,7 @@ const CELL_W: f32 = 116.0;
 const ROW_H: f32 = 26.0;
 
 pub fn render_spreadsheet_tab(
-    _app: &VKarmaApp,
+    app: &VKarmaApp,
     side: PaneSide,
     tab: &super::DocumentTab,
     _window: &mut Window,
@@ -104,7 +104,7 @@ pub fn render_spreadsheet_tab(
             h_flex()
                 .gap_1()
                 .items_center()
-                .when(dirty, |this| {
+                .when(dirty && !app.config.autosave, |this| {
                     this.child(
                         Button::new(SharedString::from(format!("xls-save-{tab_id}")))
                             .primary()

@@ -47,6 +47,7 @@ pub fn render_markdown_tab(
     let tab_id = tab.id;
     let rel_path = tab.rel_path.clone();
     let dirty = tab.dirty;
+    let show_save = dirty && !app.config.autosave;
     let view_mode = *view_mode;
     let source_mode = *source_mode;
     let wc = *word_count;
@@ -256,7 +257,7 @@ pub fn render_markdown_tab(
                             this.trigger_find_in_active_tab(false, window, cx);
                         })),
                 )
-                .when(dirty, |this| {
+                .when(show_save, |this| {
                     this.child(
                         Button::new(SharedString::from(format!("md-save-{tab_id}")))
                             .primary()

@@ -392,7 +392,7 @@ pub fn render_pane(
                     .into_any_element()
             }
             TabKind::Code { .. } => {
-                code_view::render_code_tab(side, tab, app.zen_mode, cx).into_any_element()
+                code_view::render_code_tab(app, side, tab, cx).into_any_element()
             }
             TabKind::Image { .. } => {
                 code_view::render_image_tab(tab, app.zen_mode, cx).into_any_element()

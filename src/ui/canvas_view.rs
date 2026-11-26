@@ -1616,7 +1616,7 @@ pub fn render_canvas_tab(
                             }
                         })),
                 )
-                .when(dirty, |this| {
+                .when(dirty && !app.config.autosave, |this| {
                     this.child(
                         Button::new(SharedString::from(format!("cnv-save-{tab_id}")))
                             .primary()
