@@ -41,6 +41,20 @@ pub enum DrawerCreateKind {
 }
 
 #[derive(Debug, Clone)]
+pub enum ItemContextTarget {
+    Note {
+        path: PathBuf,
+        rel_path: String,
+        display_name: String,
+    },
+    Folder {
+        path: PathBuf,
+        rel_path: String,
+        display_name: String,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub struct FolderPickerState {
     pub browsing_dir: PathBuf,
     pub subdirs: Vec<(String, PathBuf)>,
@@ -135,6 +149,9 @@ pub struct VKarmaMobileApp {
     pub more_sheet_open: bool,
     pub rename_mode: bool,
     pub new_note_modal_open: bool,
+    pub item_context_menu: Option<ItemContextTarget>,
+    pub context_rename_mode: bool,
+    pub context_delete_armed: bool,
 
     pub edit_revision: u64,
 
@@ -262,7 +279,13 @@ impl VKarmaMobileApp {
         subs.push(
             cx.subscribe_in(&rename_note_input, window, |this, _, ev, window, cx| match ev {
                 InputEvent::Focus | InputEvent::Blur | InputEvent::Change => {}
-                InputEvent::PressEnter { .. } => this.submit_rename_note(window, cx),
+                InputEvent::PressEnter { .. } => {
+                    if this.context_rename_mode {
+                        this.submit_context_rename(window, cx);
+                    } else {
+                        this.submit_rename_note(window, cx);
+                    }
+                }
             }),
         );
 
@@ -378,6 +401,9 @@ impl VKarmaMobileApp {
             more_sheet_open: false,
             rename_mode: false,
             new_note_modal_open: false,
+            item_context_menu: None,
+            context_rename_mode: false,
+            context_delete_armed: false,
             edit_revision: 0,
             folder_picker: None,
             status_banner: None,
@@ -786,6 +812,18 @@ impl VKarmaMobileApp {
                 self.close_settings(window, cx);
             }
             AppSurface::Notes => {
+                if self.item_context_menu.is_some() {
+                    if self.context_rename_mode {
+                        self.context_rename_mode = false;
+                        self.context_delete_armed = false;
+                        window.blur(cx);
+                        gpui_mobile::hide_keyboard();
+                        cx.notify();
+                    } else {
+                        self.close_item_context_menu(window, cx);
+                    }
+                    return;
+                }
                 if self.new_note_modal_open {
                     self.new_note_modal_open = false;
                     window.blur(cx);
@@ -852,6 +890,7 @@ impl VKarmaMobileApp {
             || self.quick_switcher_open
             || self.new_note_modal_open
             || self.more_sheet_open
+            || self.item_context_menu.is_some()
             || self.folder_picker.is_some()
     }
 
@@ -1495,6 +1534,308 @@ impl VKarmaMobileApp {
         self.refresh_vault_async(cx);
         cx.notify();
     }
+
+    pub fn open_item_context_menu(
+        &mut self,
+        target: ItemContextTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.blur(cx);
+        gpui_mobile::hide_keyboard();
+        self.item_context_menu = Some(target);
+        self.context_rename_mode = false;
+        self.context_delete_armed = false;
+        cx.notify();
+    }
+
+    pub fn close_item_context_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.item_context_menu = None;
+        self.context_rename_mode = false;
+        self.context_delete_armed = false;
+        window.blur(cx);
+        gpui_mobile::hide_keyboard();
+        cx.notify();
+    }
+
+    pub fn begin_context_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cur_name = match &self.item_context_menu {
+            Some(ItemContextTarget::Note { display_name, .. })
+            | Some(ItemContextTarget::Folder { display_name, .. }) => display_name.clone(),
+            None => return,
+        };
+        self.context_rename_mode = true;
+        self.context_delete_armed = false;
+        self.rename_note_input
+            .update(cx, |inp, cx| inp.set_value(cur_name, window, cx));
+        self.rename_note_input
+            .update(cx, |inp, cx| inp.focus(window, cx));
+        gpui_mobile::show_keyboard();
+        cx.notify();
+    }
+
+    pub fn submit_context_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.item_context_menu.clone() else {
+            return;
+        };
+        let new_name = self.rename_note_input.read(cx).value().trim().to_string();
+        if new_name.is_empty() {
+            return;
+        }
+        match target {
+            ItemContextTarget::Note { path, .. } => {
+                self.flush_active_note_sync(cx);
+                match rename_note_file(&path, &new_name) {
+                    Ok(new_path) => {
+                        for p in &mut self.history_back {
+                            if *p == path {
+                                *p = new_path.clone();
+                            }
+                        }
+                        for p in &mut self.history_forward {
+                            if *p == path {
+                                *p = new_path.clone();
+                            }
+                        }
+                        for p in &mut self.recent_notes {
+                            if *p == path {
+                                *p = new_path.clone();
+                            }
+                        }
+                        let was_active = self
+                            .active_note
+                            .as_ref()
+                            .is_some_and(|n| n.path == path);
+                        self.item_context_menu = None;
+                        self.context_rename_mode = false;
+                        self.context_delete_armed = false;
+                        window.blur(cx);
+                        gpui_mobile::hide_keyboard();
+                        self.refresh_vault_async(cx);
+                        if was_active {
+                            self.open_note(new_path, false, false, window, cx);
+                        } else {
+                            self.persist_workspace_state_async(cx);
+                            cx.notify();
+                        }
+                    }
+                    Err(err) => {
+                        self.status_banner = Some(format!("Rename failed: {err}"));
+                        cx.notify();
+                    }
+                }
+            }
+            ItemContextTarget::Folder {
+                path,
+                rel_path: old_rel,
+                ..
+            } => {
+                if new_name.contains('/') || new_name.contains('\\') || new_name == "." || new_name == ".." {
+                    self.status_banner = Some("Invalid folder name".to_string());
+                    cx.notify();
+                    return;
+                }
+                let Some(parent) = path.parent() else {
+                    return;
+                };
+                let new_path = parent.join(&new_name);
+                if new_path == path {
+                    self.close_item_context_menu(window, cx);
+                    return;
+                }
+                if new_path.exists() {
+                    self.status_banner = Some(format!("Folder '{}' already exists", new_name));
+                    cx.notify();
+                    return;
+                }
+                self.flush_active_note_sync(cx);
+                match fs::rename(&path, &new_path) {
+                    Ok(()) => {
+                        let new_rel = normalize_rel_path(&self.vault_root, &new_path);
+                        let remap_under_old = |p: &mut PathBuf| {
+                            if let Ok(suffix) = p.strip_prefix(&path) {
+                                *p = new_path.join(suffix);
+                            }
+                        };
+                        for p in &mut self.history_back {
+                            remap_under_old(p);
+                        }
+                        for p in &mut self.history_forward {
+                            remap_under_old(p);
+                        }
+                        for p in &mut self.recent_notes {
+                            remap_under_old(p);
+                        }
+                        if self.expanded_dirs.remove(&old_rel) && !new_rel.is_empty() {
+                            self.expanded_dirs.insert(new_rel);
+                        }
+                        if self
+                            .drawer_target_dir
+                            .as_ref()
+                            .is_some_and(|d| d.starts_with(&path))
+                        {
+                            if let Some(d) = self.drawer_target_dir.as_mut() {
+                                remap_under_old(d);
+                            }
+                        }
+                        let active_moved = self
+                            .active_note
+                            .as_ref()
+                            .and_then(|n| n.path.strip_prefix(&path).ok().map(|s| new_path.join(s)));
+                        self.item_context_menu = None;
+                        self.context_rename_mode = false;
+                        self.context_delete_armed = false;
+                        window.blur(cx);
+                        gpui_mobile::hide_keyboard();
+                        self.refresh_vault_async(cx);
+                        if let Some(moved) = active_moved {
+                            self.open_note(moved, false, false, window, cx);
+                        } else {
+                            self.persist_workspace_state_async(cx);
+                            cx.notify();
+                        }
+                    }
+                    Err(err) => {
+                        self.status_banner = Some(format!("Rename folder failed: {err}"));
+                        cx.notify();
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn copy_context_wikilink(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ItemContextTarget::Note { display_name, .. }) = &self.item_context_menu else {
+            return;
+        };
+        let wl = format!("[[{display_name}]]");
+        cx.write_to_clipboard(ClipboardItem::new_string(wl.clone()));
+        self.status_banner = Some(format!("Copied {wl}"));
+        self.close_item_context_menu(window, cx);
+    }
+
+    pub fn duplicate_context_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ItemContextTarget::Note { path, .. }) = self.item_context_menu.clone() else {
+            return;
+        };
+        self.flush_active_note_sync(cx);
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Note");
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("md");
+        let mut candidate = parent.join(format!("{stem} copy.{ext}"));
+        let mut n = 2usize;
+        while candidate.exists() {
+            candidate = parent.join(format!("{stem} copy {n}.{ext}"));
+            n += 1;
+        }
+        match fs::read_to_string(&path).and_then(|body| fs::write(&candidate, body)) {
+            Ok(()) => {
+                self.status_banner = Some(format!(
+                    "Duplicated as {}",
+                    candidate.file_name().and_then(|s| s.to_str()).unwrap_or("copy")
+                ));
+                self.close_item_context_menu(window, cx);
+                self.refresh_vault_async(cx);
+            }
+            Err(err) => {
+                self.status_banner = Some(format!("Duplicate failed: {err}"));
+                cx.notify();
+            }
+        }
+    }
+
+    pub fn delete_context_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.context_delete_armed {
+            self.context_delete_armed = true;
+            cx.notify();
+            return;
+        }
+        let Some(target) = self.item_context_menu.clone() else {
+            return;
+        };
+        match target {
+            ItemContextTarget::Note { path, .. } => {
+                if let Err(err) = fs::remove_file(&path) {
+                    self.status_banner = Some(format!("Delete failed: {err}"));
+                    self.context_delete_armed = false;
+                    cx.notify();
+                    return;
+                }
+                self.history_back.retain(|p| p != &path);
+                self.history_forward.retain(|p| p != &path);
+                self.recent_notes.retain(|p| p != &path);
+                if self.active_note.as_ref().is_some_and(|n| n.path == path) {
+                    self.active_note = None;
+                }
+            }
+            ItemContextTarget::Folder { path, rel_path, .. } => {
+                if path == self.vault_root {
+                    self.status_banner = Some("Cannot delete vault root folder".to_string());
+                    self.context_delete_armed = false;
+                    cx.notify();
+                    return;
+                }
+                if let Err(err) = fs::remove_dir_all(&path) {
+                    self.status_banner = Some(format!("Delete folder failed: {err}"));
+                    self.context_delete_armed = false;
+                    cx.notify();
+                    return;
+                }
+                self.history_back.retain(|p| !p.starts_with(&path));
+                self.history_forward.retain(|p| !p.starts_with(&path));
+                self.recent_notes.retain(|p| !p.starts_with(&path));
+                self.expanded_dirs.remove(&rel_path);
+                if self
+                    .drawer_target_dir
+                    .as_ref()
+                    .is_some_and(|d| d.starts_with(&path))
+                {
+                    self.drawer_target_dir = Some(self.vault_root.clone());
+                }
+                if self
+                    .active_note
+                    .as_ref()
+                    .is_some_and(|n| n.path.starts_with(&path))
+                {
+                    self.active_note = None;
+                }
+            }
+        }
+        self.close_item_context_menu(window, cx);
+        self.persist_workspace_state_async(cx);
+        self.refresh_vault_async(cx);
+    }
+
+    pub fn context_create_in_folder(
+        &mut self,
+        kind: DrawerCreateKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ItemContextTarget::Folder { path, rel_path, .. }) =
+            self.item_context_menu.clone()
+        else {
+            return;
+        };
+        if !rel_path.is_empty() {
+            self.expanded_dirs.insert(rel_path);
+        }
+        self.drawer_target_dir = Some(path);
+        self.item_context_menu = None;
+        self.context_rename_mode = false;
+        self.context_delete_armed = false;
+        self.drawer_open = true;
+        self.start_drawer_create(kind, window, cx);
+    }
 }
 
 impl Render for VKarmaMobileApp {
@@ -1561,6 +1902,16 @@ impl Render for VKarmaMobileApp {
                         |frame| {
                             frame.child(notes_view::render_sidebar_drawer(
                                 self, window, cx,
+                            ))
+                        },
+                    )
+                    .when(
+                        self.surface == AppSurface::Notes && self.item_context_menu.is_some(),
+                        |frame| {
+                            frame.child(notes_view::render_item_context_menu(
+                                self,
+                                bottom_inset,
+                                cx,
                             ))
                         },
                     )

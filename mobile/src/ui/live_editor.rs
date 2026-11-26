@@ -29,6 +29,12 @@ pub enum LiveEditorEvent {
     FocusChanged(bool),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionHandle {
+    Start,
+    End,
+}
+
 struct LiveScrollState {
     scroll_y: f32,
     total_height: f32,
@@ -923,6 +929,13 @@ pub struct LiveMarkdownEditor {
     last_col_geo: Option<(f32, f32, f32)>,
     preferred_x: Option<f32>,
     dragging: bool,
+    touch_selecting: bool,
+    touch_anchor_range: Option<Range<usize>>,
+    dragging_handle: Option<SelectionHandle>,
+    context_menu_open: bool,
+    context_menu_anchor: Option<Point<Pixels>>,
+    sel_handle_positions: Rc<RefCell<Option<(Option<Point<Pixels>>, Option<Point<Pixels>>)>>>,
+    context_menu_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     caret_visible: bool,
     caret_blink_epoch: u64,
     read_only: bool,
@@ -968,6 +981,13 @@ impl LiveMarkdownEditor {
             last_col_geo: None,
             preferred_x: None,
             dragging: false,
+            touch_selecting: false,
+            touch_anchor_range: None,
+            dragging_handle: None,
+            context_menu_open: false,
+            context_menu_anchor: None,
+            sel_handle_positions: Rc::new(RefCell::new(None)),
+            context_menu_bounds: Rc::new(RefCell::new(None)),
             caret_visible: true,
             caret_blink_epoch: 0,
             read_only: false,
@@ -982,6 +1002,12 @@ impl LiveMarkdownEditor {
         if self.read_only != read_only {
             self.read_only = read_only;
             self.dragging = false;
+            self.touch_selecting = false;
+            self.touch_anchor_range = None;
+            self.dragging_handle = None;
+            self.context_menu_open = false;
+            *self.context_menu_bounds.borrow_mut() = None;
+            *self.sel_handle_positions.borrow_mut() = None;
             self.caret_visible = false;
             self.doc.marked_range = None;
             self.layout_cache.clear();
@@ -993,6 +1019,11 @@ impl LiveMarkdownEditor {
             self.interaction_blocked = blocked;
             if blocked {
                 self.dragging = false;
+                self.touch_selecting = false;
+                self.touch_anchor_range = None;
+                self.dragging_handle = None;
+                self.context_menu_open = false;
+                *self.context_menu_bounds.borrow_mut() = None;
             }
         }
     }
@@ -1019,9 +1050,107 @@ impl LiveMarkdownEditor {
         let col_w = self.last_col_geo.map_or(360.0, |g| g.1);
         self.height_table = LineHeightTable::from_lines(&self.doc.lines, &self.doc.text, col_w);
         self.preferred_x = None;
+        self.touch_selecting = false;
+        self.touch_anchor_range = None;
+        self.dragging_handle = None;
+        self.context_menu_open = false;
+        *self.context_menu_bounds.borrow_mut() = None;
+        *self.sel_handle_positions.borrow_mut() = None;
         self.scroll.borrow_mut().scroll_y = 0.0;
         self.reset_caret_blink();
         cx.notify();
+    }
+
+    pub fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.doc.has_selection() {
+            return false;
+        }
+        let s = self.doc.text[self.doc.selection_range()].to_string();
+        cx.write_to_clipboard(ClipboardItem::new_string(s));
+        self.context_menu_open = false;
+        cx.notify();
+        true
+    }
+
+    pub fn cut_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.read_only || !self.doc.has_selection() {
+            return false;
+        }
+        let sel = self.doc.selection_range();
+        let s = self.doc.text[sel.clone()].to_string();
+        cx.write_to_clipboard(ClipboardItem::new_string(s));
+        self.doc.replace_range(sel, "", EditKind::Atomic);
+        self.sync_height_table_after_edit();
+        self.preferred_x = None;
+        self.context_menu_open = false;
+        self.ensure_caret_visible();
+        self.reset_caret_blink();
+        cx.emit(LiveEditorEvent::Changed);
+        cx.notify();
+        true
+    }
+
+    pub fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.read_only {
+            return false;
+        }
+        let Some(item) = cx.read_from_clipboard() else {
+            return false;
+        };
+        let Some(txt) = item.text() else {
+            return false;
+        };
+        self.doc.insert_text(&txt);
+        self.sync_height_table_after_edit();
+        self.preferred_x = None;
+        self.context_menu_open = false;
+        self.ensure_caret_visible();
+        self.reset_caret_blink();
+        cx.emit(LiveEditorEvent::Changed);
+        cx.notify();
+        true
+    }
+
+    pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
+        if self.doc.text.is_empty() {
+            return;
+        }
+        self.doc.set_selection(0, self.doc.text.len());
+        self.context_menu_open = true;
+        cx.notify();
+    }
+
+    pub fn toggle_highlight_selection(&mut self, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
+        self.doc.marked_range = None;
+        self.doc.toggle_wrap("==");
+        self.sync_height_table_after_edit();
+        self.preferred_x = None;
+        self.context_menu_open = false;
+        self.ensure_caret_visible();
+        self.reset_caret_blink();
+        cx.emit(LiveEditorEvent::Changed);
+        cx.notify();
+    }
+
+    fn visual_point_for_byte(
+        &mut self,
+        byte_off: usize,
+        bounds: Bounds<Pixels>,
+        col_left_rel: f32,
+        top_pad: f32,
+        scroll_y: f32,
+    ) -> Option<(Point<Pixels>, f32)> {
+        let li = self.doc.line_index_for_byte(byte_off);
+        let dl = self.doc.lines.get(li)?;
+        let c = self.layout_cache.get(&li)?;
+        let local_raw = byte_off.saturating_sub(dl.byte_start);
+        let (vx, vy, lh) = raw_offset_to_visual_point(c, local_raw);
+        let x = bounds.origin.x + px(col_left_rel + vx);
+        let y = bounds.origin.y + px(top_pad + self.height_table.y_for_line(li) - scroll_y + vy);
+        Some((point(x, y), lh))
     }
 
     pub fn scroll_to_line(&mut self, line_0based: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1834,6 +1963,222 @@ impl EntityInputHandler for LiveMarkdownEditor {
 
 impl Render for LiveMarkdownEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let show_menu = self.context_menu_open && !self.interaction_blocked;
+        if !show_menu {
+            *self.context_menu_bounds.borrow_mut() = None;
+        }
+        let floating_menu = if show_menu {
+            let st = self.scroll.borrow();
+            let bounds = st.viewport_bounds;
+            let scroll_y = st.scroll_y;
+            drop(st);
+            let (col_left_rel, _, top_pad) = self
+                .last_col_geo
+                .unwrap_or((MOBILE_SIDE_PAD, 360.0, MOBILE_TOP_PAD));
+            let vp_w = f32::from(bounds.size.width).max(320.0);
+            let vp_h = f32::from(bounds.size.height).max(200.0);
+            let has_sel = self.doc.has_selection();
+
+            let mut menu_x = (vp_w * 0.5 - 150.0).max(8.0);
+            let mut menu_y = 24.0_f32;
+            if has_sel {
+                let sel = self.doc.selection_range();
+                if let Some((sp, _)) =
+                    self.visual_point_for_byte(sel.start, bounds, col_left_rel, top_pad, scroll_y)
+                {
+                    let rel_sx = f32::from(sp.x - bounds.origin.x);
+                    let rel_sy = f32::from(sp.y - bounds.origin.y);
+                    let ep_opt = self.visual_point_for_byte(
+                        sel.end,
+                        bounds,
+                        col_left_rel,
+                        top_pad,
+                        scroll_y,
+                    );
+                    let center_x = match ep_opt {
+                        Some((ep, _)) if (f32::from(ep.y - sp.y)).abs() < 10.0 => {
+                            (rel_sx + f32::from(ep.x - bounds.origin.x)) * 0.5
+                        }
+                        _ => vp_w * 0.5,
+                    };
+                    let est_w = (vp_w - 16.0).min(336.0);
+                    menu_x = (center_x - est_w * 0.5).clamp(8.0, (vp_w - est_w - 8.0).max(8.0));
+                    menu_y = if rel_sy >= 68.0 {
+                        rel_sy - 56.0
+                    } else if let Some((ep, elh)) = ep_opt {
+                        f32::from(ep.y - bounds.origin.y) + elh + 26.0
+                    } else {
+                        rel_sy + 44.0
+                    }
+                    .clamp(8.0, (vp_h - 86.0).max(8.0));
+                } else if let Some(anchor) = self.context_menu_anchor {
+                    let est_w = (vp_w - 16.0).min(336.0);
+                    menu_x = (f32::from(anchor.x - bounds.origin.x) - est_w * 0.5)
+                        .clamp(8.0, (vp_w - est_w - 8.0).max(8.0));
+                    menu_y = (f32::from(anchor.y - bounds.origin.y) - 60.0)
+                        .clamp(8.0, (vp_h - 86.0).max(8.0));
+                }
+            } else if let Some(anchor) = self.context_menu_anchor {
+                let est_w = 180.0_f32.min((vp_w - 16.0).max(120.0));
+                menu_x = (f32::from(anchor.x - bounds.origin.x) - est_w * 0.5)
+                    .clamp(8.0, (vp_w - est_w - 8.0).max(8.0));
+                menu_y = (f32::from(anchor.y - bounds.origin.y) - 52.0)
+                    .clamp(8.0, (vp_h - 60.0).max(8.0));
+            }
+
+            let menu_btn = |id: &'static str,
+                            label: &'static str,
+                            accent: bool,
+                            on_click: Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>| {
+                div()
+                    .id(id)
+                    .h(px(32.))
+                    .px_2p5()
+                    .rounded(px(7.))
+                    .cursor_pointer()
+                    .bg(hex_color(if accent { kd::ACCENT } else { kd::BG_PANEL }))
+                    .border_1()
+                    .border_color(hex_color(if accent {
+                        kd::ACCENT
+                    } else {
+                        kd::BORDER_SUBTLE
+                    }))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(hex_color(if accent { kd::BG_MAIN } else { kd::FG }))
+                    .on_click(move |ev, window, cx| on_click(ev, window, cx))
+                    .child(label)
+            };
+
+            let bounds_tracker = self.context_menu_bounds.clone();
+            let mut row = div()
+                .id("live-ed-ctx-menu")
+                .relative()
+                .max_w(px((vp_w - 16.0).min(340.0)))
+                .p_1p5()
+                .rounded(px(12.))
+                .bg(hex_color(kd::BG_DEEP))
+                .border_1()
+                .border_color(hex_color(kd::BORDER))
+                .shadow_lg()
+                .occlude()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap_1()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_scroll(|_, _, cx| cx.stop_propagation())
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(
+                    canvas(
+                        move |b, _, _| {
+                            *bounds_tracker.borrow_mut() = Some(b);
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0(),
+                );
+
+            if has_sel {
+                if !self.read_only {
+                    row = row.child(menu_btn(
+                        "ed-ctx-hl",
+                        "Highlight",
+                        true,
+                        Box::new(cx.listener(|this, _, _, cx| {
+                            this.toggle_highlight_selection(cx);
+                        })),
+                    ));
+                }
+                row = row.child(menu_btn(
+                    "ed-ctx-copy",
+                    "Copy",
+                    false,
+                    Box::new(cx.listener(|this, _, _, cx| {
+                        this.copy_selection(cx);
+                    })),
+                ));
+                if !self.read_only {
+                    row = row
+                        .child(menu_btn(
+                            "ed-ctx-cut",
+                            "Cut",
+                            false,
+                            Box::new(cx.listener(|this, _, _, cx| {
+                                this.cut_selection(cx);
+                            })),
+                        ))
+                        .child(menu_btn(
+                            "ed-ctx-paste",
+                            "Paste",
+                            false,
+                            Box::new(cx.listener(|this, _, _, cx| {
+                                this.paste_from_clipboard(cx);
+                            })),
+                        ))
+                        .child(menu_btn(
+                            "ed-ctx-bold",
+                            "Bold",
+                            false,
+                            Box::new(cx.listener(|this, _, window, cx| {
+                                this.context_menu_open = false;
+                                this.apply_format(MarkdownFormatAction::Bold, window, cx);
+                            })),
+                        ))
+                        .child(menu_btn(
+                            "ed-ctx-italic",
+                            "Italic",
+                            false,
+                            Box::new(cx.listener(|this, _, window, cx| {
+                                this.context_menu_open = false;
+                                this.apply_format(MarkdownFormatAction::Italic, window, cx);
+                            })),
+                        ));
+                }
+                row = row.child(menu_btn(
+                    "ed-ctx-all",
+                    "All",
+                    false,
+                    Box::new(cx.listener(|this, _, _, cx| {
+                        this.select_all_text(cx);
+                    })),
+                ));
+            } else if !self.read_only {
+                row = row
+                    .child(menu_btn(
+                        "ed-ctx-paste",
+                        "Paste",
+                        false,
+                        Box::new(cx.listener(|this, _, _, cx| {
+                            this.paste_from_clipboard(cx);
+                        })),
+                    ))
+                    .child(menu_btn(
+                        "ed-ctx-all",
+                        "Select All",
+                        false,
+                        Box::new(cx.listener(|this, _, _, cx| {
+                            this.select_all_text(cx);
+                        })),
+                    ));
+            }
+
+            Some(
+                div()
+                    .absolute()
+                    .top(px(menu_y))
+                    .left(px(menu_x))
+                    .child(row),
+            )
+        } else {
+            None
+        };
+
         div()
             .id(SharedString::from(format!("live-md-editor-{:?}", cx.entity_id())))
             .relative()
@@ -1849,10 +2194,23 @@ impl Render for LiveMarkdownEditor {
                     if this.interaction_blocked {
                         return;
                     }
+                    if this
+                        .context_menu_bounds
+                        .borrow()
+                        .is_some_and(|b| b.contains(&ev.position))
+                    {
+                        return;
+                    }
+                    this.context_menu_open = false;
                     cx.stop_propagation();
                     this.doc.break_undo_coalescing();
 
                     let Some(hit) = this.hit_test_byte_at_point(ev.position) else {
+                        if this.doc.has_selection() {
+                            let h = this.doc.head;
+                            this.doc.set_cursor(h, false);
+                            cx.notify();
+                        }
                         if !this.read_only {
                             this.focus_handle.focus(window, cx);
                             cx.notify();
@@ -1893,6 +2251,11 @@ impl Render for LiveMarkdownEditor {
                     }
 
                     if this.read_only {
+                        if this.doc.has_selection() {
+                            let h = this.doc.head;
+                            this.doc.set_cursor(h, false);
+                        }
+                        cx.notify();
                         return;
                     }
 
@@ -1954,6 +2317,7 @@ impl Render for LiveMarkdownEditor {
                 editor: cx.entity(),
             })
             .child(Scrollbar::vertical(&self.scrollbar))
+            .when_some(floating_menu, |root, m| root.child(m))
     }
 }
 
@@ -1980,6 +2344,8 @@ struct PaintSnapshot {
     caret_y_top: f32,
     caret_disp_x_y: Option<(f32, f32, f32)>,
     selection_range: Range<usize>,
+    start_handle: Option<(Point<Pixels>, f32)>,
+    end_handle: Option<(Point<Pixels>, f32)>,
     caret_visible: bool,
     focused: bool,
     read_only: bool,
@@ -2082,6 +2448,25 @@ impl Element for LiveCanvasElement {
                 None
             };
 
+            let selection_range = ed.doc.selection_range();
+            let (start_handle, end_handle) = if !selection_range.is_empty() && !ed.interaction_blocked
+            {
+                let mut vis = |byte_off: usize| -> Option<(Point<Pixels>, f32)> {
+                    let (pt, lh) =
+                        ed.visual_point_for_byte(byte_off, bounds, geo.0, geo.2, scroll_y)?;
+                    (pt.y + px(lh) >= bounds.top() && pt.y <= bounds.bottom()).then_some((pt, lh))
+                };
+                let sh = vis(selection_range.start);
+                let eh = vis(selection_range.end);
+                let sk = sh.map(|(p, lh)| point(p.x, p.y + px(lh) + px(8.0)));
+                let ek = eh.map(|(p, lh)| point(p.x, p.y + px(lh) + px(8.0)));
+                *ed.sel_handle_positions.borrow_mut() = Some((sk, ek));
+                (sh, eh)
+            } else {
+                *ed.sel_handle_positions.borrow_mut() = None;
+                (None, None)
+            };
+
             let (prose_base, mono_font) = ed.resolved_fonts(window, cx);
             let mut prose_bold_font = prose_base;
             prose_bold_font.weight = FontWeight::BOLD;
@@ -2099,7 +2484,9 @@ impl Element for LiveCanvasElement {
                     caret_cached,
                     caret_y_top,
                     caret_disp_x_y,
-                    selection_range: ed.doc.selection_range(),
+                    selection_range,
+                    start_handle,
+                    end_handle,
                     caret_visible: ed.caret_visible,
                     focused,
                     read_only: ed.read_only,
@@ -2643,6 +3030,201 @@ impl Element for LiveCanvasElement {
                     hex_color(kd::ACCENT),
                 ));
             }
+
+            // Mobile selection teardrop handles
+            let paint_handle = |win: &mut Window, pt: Point<Pixels>, lh: f32| {
+                win.paint_quad(fill(
+                    Bounds {
+                        origin: pt,
+                        size: size(px(2.), px(lh)),
+                    },
+                    hex_color(kd::ACCENT_HOVER),
+                ));
+                win.paint_quad(quad(
+                    Bounds {
+                        origin: point(pt.x - px(8.), pt.y + px(lh)),
+                        size: size(px(16.), px(16.)),
+                    },
+                    px(8.),
+                    hex_color(kd::ACCENT),
+                    gpui::Edges::all(px(1.5)),
+                    hex_color(kd::FG),
+                    BorderStyle::Solid,
+                ));
+            };
+            if let Some((sp, slh)) = snap.start_handle {
+                paint_handle(window, sp, slh);
+            }
+            if let Some((ep, elh)) = snap.end_handle {
+                paint_handle(window, ep, elh);
+            }
+        });
+
+        let ed_lp = self.editor.clone();
+        let cap_ent = self.editor.clone();
+        let lp_bounds = snap.bounds;
+        window.on_mouse_event(move |ev: &LongPressEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble {
+                return;
+            }
+            let _ = ed_lp.update(cx, |ed, cx| {
+                if ed.interaction_blocked {
+                    return;
+                }
+                let in_menu = ed
+                    .context_menu_bounds
+                    .borrow()
+                    .is_some_and(|b| b.contains(&ev.position));
+                if in_menu {
+                    return;
+                }
+                match ev.phase {
+                    TouchPhase::Started => {
+                        if window.default_prevented() || !lp_bounds.contains(&ev.start_position) {
+                            return;
+                        }
+                        window.capture_long_press(&cap_ent);
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        if let Some(hit) = ed.hit_test_byte_at_point(ev.start_position) {
+                            ed.doc.select_word_at(hit.raw_byte);
+                            if ed.doc.has_selection() {
+                                let r = ed.doc.selection_range();
+                                ed.touch_selecting = true;
+                                ed.touch_anchor_range = Some(r);
+                                ed.context_menu_open = true;
+                                ed.context_menu_anchor = Some(ev.start_position);
+                            } else if !ed.read_only {
+                                ed.doc.set_cursor(hit.raw_byte, false);
+                                ed.touch_selecting = false;
+                                ed.touch_anchor_range = None;
+                                ed.context_menu_open = true;
+                                ed.context_menu_anchor = Some(ev.start_position);
+                            }
+                            cx.notify();
+                        }
+                    }
+                    TouchPhase::Moved => {
+                        if !ed.touch_selecting {
+                            return;
+                        }
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        if let Some(hit) = ed.hit_test_byte_at_point(ev.position)
+                            && let Some(anchor) = &ed.touch_anchor_range
+                        {
+                            let (a, b) = if hit.raw_byte < anchor.start {
+                                (anchor.end, hit.raw_byte)
+                            } else if hit.raw_byte > anchor.end {
+                                (anchor.start, hit.raw_byte)
+                            } else {
+                                (anchor.start, anchor.end)
+                            };
+                            ed.doc.set_selection(a, b);
+                            ed.context_menu_anchor = Some(ev.position);
+                            cx.notify();
+                        }
+                    }
+                    TouchPhase::Ended | TouchPhase::Cancelled => {
+                        if ed.touch_selecting {
+                            ed.touch_selecting = false;
+                            ed.touch_anchor_range = None;
+                            cx.notify();
+                        }
+                    }
+                }
+            });
+        });
+
+        let ed_td = self.editor.clone();
+        window.on_mouse_event(move |ev: &TouchDragEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble {
+                return;
+            }
+            let _ = ed_td.update(cx, |ed, cx| {
+                if ed.interaction_blocked || !ed.doc.has_selection() {
+                    return;
+                }
+                let in_menu = ed
+                    .context_menu_bounds
+                    .borrow()
+                    .is_some_and(|b| b.contains(&ev.position));
+                if in_menu && ed.dragging_handle.is_none() {
+                    return;
+                }
+                match ev.phase {
+                    TouchPhase::Started => {
+                        if window.default_prevented() {
+                            return;
+                        }
+                        let positions = *ed.sel_handle_positions.borrow();
+                        let Some((s_pt, e_pt)) = positions else {
+                            return;
+                        };
+                        let r_sq = 30.0_f32 * 30.0;
+                        let near = |pt_opt: Option<Point<Pixels>>| -> Option<f32> {
+                            let p = pt_opt?;
+                            let dx = f32::from(ev.start_position.x - p.x);
+                            let dy = f32::from(ev.start_position.y - p.y);
+                            let d2 = dx * dx + dy * dy;
+                            (d2 <= r_sq).then_some(d2)
+                        };
+                        let chosen = match (near(s_pt), near(e_pt)) {
+                            (Some(a), Some(b)) => Some(if a <= b {
+                                SelectionHandle::Start
+                            } else {
+                                SelectionHandle::End
+                            }),
+                            (Some(_), None) => Some(SelectionHandle::Start),
+                            (None, Some(_)) => Some(SelectionHandle::End),
+                            (None, None) => None,
+                        };
+                        if let Some(h) = chosen {
+                            ed.dragging_handle = Some(h);
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }
+                    TouchPhase::Moved => {
+                        let Some(h) = ed.dragging_handle else {
+                            return;
+                        };
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        let test_pos = point(ev.position.x, ev.position.y - px(12.));
+                        if let Some(hit) = ed.hit_test_byte_at_point(test_pos) {
+                            let cur = ed.doc.selection_range();
+                            match h {
+                                SelectionHandle::Start => {
+                                    if hit.raw_byte < cur.end {
+                                        ed.doc.set_selection(cur.end, hit.raw_byte);
+                                    } else if hit.raw_byte > cur.end {
+                                        ed.doc.set_selection(cur.end, hit.raw_byte);
+                                        ed.dragging_handle = Some(SelectionHandle::End);
+                                    }
+                                }
+                                SelectionHandle::End => {
+                                    if hit.raw_byte > cur.start {
+                                        ed.doc.set_selection(cur.start, hit.raw_byte);
+                                    } else if hit.raw_byte < cur.start {
+                                        ed.doc.set_selection(cur.start, hit.raw_byte);
+                                        ed.dragging_handle = Some(SelectionHandle::Start);
+                                    }
+                                }
+                            }
+                            ed.context_menu_open = true;
+                            cx.notify();
+                        }
+                    }
+                    TouchPhase::Ended | TouchPhase::Cancelled => {
+                        if ed.dragging_handle.take().is_some() {
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }
+                }
+            });
         });
     }
 }

@@ -4112,4 +4112,17 @@ mod tests {
         let bold_dash = project_line("**Hello--World**", &ctx, None);
         assert_eq!(bold_dash.display_text, "Hello—World");
     }
+
+    #[test]
+    fn toggle_wrap_highlight_wraps_and_unwraps_selection() {
+        let mut buf = LiveDocBuffer::new("Alpha beta gamma".to_string(), false);
+        buf.set_selection(6, 10);
+        buf.toggle_wrap("==");
+        assert_eq!(buf.text, "Alpha ==beta== gamma");
+        assert_eq!(buf.selection_range(), 8..12);
+
+        buf.toggle_wrap("==");
+        assert_eq!(buf.text, "Alpha beta gamma");
+        assert_eq!(buf.selection_range(), 6..10);
+    }
 }

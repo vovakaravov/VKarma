@@ -1,4 +1,4 @@
-use super::{ActiveNote, DrawerCreateKind, VKarmaMobileApp};
+use super::{ActiveNote, DrawerCreateKind, ItemContextTarget, VKarmaMobileApp};
 use crate::theme::{accent_alpha, hex_alpha, hex_color, kd};
 use crate::vault::{MarkdownFormatAction, find_line_matches};
 use gpui::{prelude::*, *};
@@ -9,6 +9,31 @@ use std::path::PathBuf;
 
 fn svg_icon(name: IconName, sz: f32, color: u32) -> impl IntoElement {
     Icon::new(name).size(px(sz)).text_color(hex_color(color))
+}
+
+fn long_press_overlay(
+    on_trigger: impl Fn(Point<Pixels>, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let on_trigger = std::rc::Rc::new(on_trigger);
+    canvas(
+        |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
+        move |_bounds, hitbox, window, _cx| {
+            let on_trigger = on_trigger.clone();
+            window.on_mouse_event(move |ev: &gpui::LongPressEvent, phase, window, cx| {
+                if phase == gpui::DispatchPhase::Bubble
+                    && ev.phase == gpui::TouchPhase::Started
+                    && !window.default_prevented()
+                    && hitbox.is_hovered(window)
+                {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    on_trigger(ev.position, window, cx);
+                }
+            });
+        },
+    )
+    .absolute()
+    .inset_0()
 }
 
 pub fn render_notes_workspace(
@@ -901,8 +926,12 @@ fn render_empty_tab_home(
                             .child("RECENT NOTES"),
                     )
                     .children(recents.into_iter().enumerate().map(|(ix, (path, name, rel))| {
+                        let lp_path = path.clone();
+                        let lp_rel = rel.clone();
+                        let lp_name = name.clone();
                         div()
                             .id(SharedString::from(format!("recent-note-{ix}")))
+                            .relative()
                             .w_full()
                             .min_h(px(48.))
                             .px_3p5()
@@ -918,6 +947,22 @@ fn render_empty_tab_home(
                             .gap_2()
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.open_note(path.clone(), false, true, window, cx);
+                            }))
+                            .child(long_press_overlay({
+                                let weak = cx.entity().downgrade();
+                                move |_, window, cx| {
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.open_item_context_menu(
+                                            ItemContextTarget::Note {
+                                                path: lp_path.clone(),
+                                                rel_path: lp_rel.clone(),
+                                                display_name: lp_name.clone(),
+                                            },
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }
                             }))
                             .child(
                                 v_flex()
@@ -1265,8 +1310,12 @@ pub fn render_sidebar_drawer(
                                 let indent = px(10.0 + (row.depth.min(5) as f32) * 14.0);
                                 let is_dir = row.is_dir;
                                 let rel_dir = row.rel_path.clone();
+                                let lp_rel = row.rel_path.clone();
+                                let lp_name = row.display_name.clone();
                                 let row_path = row.path.clone();
+                                let lp_path = row.path.clone();
                                 let weak = app_weak.clone();
+                                let lp_weak = app_weak.clone();
 
                                 let right_meta = if is_dir {
                                     format!("{}", row.child_count)
@@ -1292,6 +1341,7 @@ pub fn render_sidebar_drawer(
 
                                 div()
                                     .id(SharedString::from(format!("tree-row-{ix}")))
+                                    .relative()
                                     .w_full()
                                     .h(px(42.))
                                     .pl(indent)
@@ -1332,6 +1382,28 @@ pub fn render_sidebar_drawer(
                                             });
                                         }
                                     })
+                                    .child(long_press_overlay(move |_, window, cx| {
+                                        if let Some(any_ent) = lp_weak.upgrade()
+                                            && let Ok(ent) = any_ent.downcast::<VKarmaMobileApp>()
+                                        {
+                                            let target = if is_dir {
+                                                ItemContextTarget::Folder {
+                                                    path: lp_path.clone(),
+                                                    rel_path: lp_rel.clone(),
+                                                    display_name: lp_name.clone(),
+                                                }
+                                            } else {
+                                                ItemContextTarget::Note {
+                                                    path: lp_path.clone(),
+                                                    rel_path: lp_rel.clone(),
+                                                    display_name: lp_name.clone(),
+                                                }
+                                            };
+                                            ent.update(cx, |this, cx| {
+                                                this.open_item_context_menu(target, window, cx);
+                                            });
+                                        }
+                                    }))
                                     .child(
                                         h_flex()
                                             .flex_1()
@@ -2130,4 +2202,229 @@ fn sheet_action_row(
         .text_color(hex_color(if danger { kd::RED } else { kd::FG }))
         .on_click(on_click)
         .child(label)
+}
+
+pub fn render_item_context_menu(
+    app: &VKarmaMobileApp,
+    bottom_inset: f32,
+    cx: &mut Context<VKarmaMobileApp>,
+) -> impl IntoElement {
+    let Some(target) = app.item_context_menu.clone() else {
+        return div().into_any_element();
+    };
+    let (is_dir, name, rel_path, item_path) = match &target {
+        ItemContextTarget::Note {
+            path,
+            rel_path,
+            display_name,
+        } => (false, display_name.clone(), rel_path.clone(), path.clone()),
+        ItemContextTarget::Folder {
+            path,
+            rel_path,
+            display_name,
+        } => (true, display_name.clone(), rel_path.clone(), path.clone()),
+    };
+    let delete_armed = app.context_delete_armed;
+
+    div()
+        .id("obs-item-ctx-scrim")
+        .size_full()
+        .absolute()
+        .inset_0()
+        .occlude()
+        .bg(hex_alpha(0x00000090))
+        .flex()
+        .flex_col()
+        .justify_end()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_scroll(|_, _, cx| cx.stop_propagation())
+        .on_click(cx.listener(|this, _, window, cx| {
+            cx.stop_propagation();
+            this.close_item_context_menu(window, cx);
+        }))
+        .child(
+            v_flex()
+                .id("obs-item-ctx-panel")
+                .w_full()
+                .p_4()
+                .pb(px(bottom_inset + 16.0))
+                .gap_2()
+                .rounded_t(px(16.))
+                .bg(hex_color(kd::BG_SIDEBAR))
+                .border_t_1()
+                .border_color(hex_color(kd::BORDER))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(
+                    h_flex()
+                        .pb_2()
+                        .border_b_1()
+                        .border_color(hex_color(kd::BORDER_SUBTLE))
+                        .gap_2p5()
+                        .items_center()
+                        .child(svg_icon(
+                            if is_dir {
+                                IconName::Folder
+                            } else {
+                                IconName::FileText
+                            },
+                            18.,
+                            kd::ACCENT_HOVER,
+                        ))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(hex_color(kd::FG))
+                                        .truncate()
+                                        .child(name),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(hex_color(kd::FG_MUTED))
+                                        .truncate()
+                                        .child(rel_path),
+                                ),
+                        ),
+                )
+                .when(app.context_rename_mode, |col| {
+                    col.child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(Input::new(&app.rename_note_input).small()),
+                            )
+                            .child(
+                                Button::new("ctx-rename-save")
+                                    .primary()
+                                    .small()
+                                    .label("Save")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.submit_context_rename(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("ctx-rename-cancel")
+                                    .ghost()
+                                    .small()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.context_rename_mode = false;
+                                        window.blur(cx);
+                                        gpui_mobile::hide_keyboard();
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                })
+                .when(!app.context_rename_mode && !is_dir, |col| {
+                    let p_open = item_path.clone();
+                    col.child(sheet_action_row(
+                        "ictx-open",
+                        "Open Note",
+                        false,
+                        cx.listener(move |this, _, window, cx| {
+                            this.item_context_menu = None;
+                            this.context_delete_armed = false;
+                            this.open_note(p_open.clone(), false, true, window, cx);
+                        }),
+                    ))
+                    .child(sheet_action_row(
+                        "ictx-rename",
+                        "Rename",
+                        false,
+                        cx.listener(|this, _, window, cx| {
+                            this.begin_context_rename(window, cx);
+                        }),
+                    ))
+                    .child(sheet_action_row(
+                        "ictx-wikilink",
+                        "Copy [[Wikilink]]",
+                        false,
+                        cx.listener(|this, _, window, cx| {
+                            this.copy_context_wikilink(window, cx);
+                        }),
+                    ))
+                    .child(sheet_action_row(
+                        "ictx-duplicate",
+                        "Duplicate",
+                        false,
+                        cx.listener(|this, _, window, cx| {
+                            this.duplicate_context_note(window, cx);
+                        }),
+                    ))
+                    .child(sheet_action_row(
+                        "ictx-delete-note",
+                        if delete_armed {
+                            "Tap again to confirm delete"
+                        } else {
+                            "Delete Note"
+                        },
+                        true,
+                        cx.listener(|this, _, window, cx| {
+                            this.delete_context_item(window, cx);
+                        }),
+                    ))
+                })
+                .when(!app.context_rename_mode && is_dir, |col| {
+                    col.child(sheet_action_row(
+                        "ictx-new-note",
+                        "New Note Here",
+                        false,
+                        cx.listener(|this, _, window, cx| {
+                            this.context_create_in_folder(DrawerCreateKind::Note, window, cx);
+                        }),
+                    ))
+                    .child(sheet_action_row(
+                        "ictx-new-dir",
+                        "New Subfolder",
+                        false,
+                        cx.listener(|this, _, window, cx| {
+                            this.context_create_in_folder(DrawerCreateKind::Folder, window, cx);
+                        }),
+                    ))
+                    .child(sheet_action_row(
+                        "ictx-rename-dir",
+                        "Rename Folder",
+                        false,
+                        cx.listener(|this, _, window, cx| {
+                            this.begin_context_rename(window, cx);
+                        }),
+                    ))
+                    .child(sheet_action_row(
+                        "ictx-delete-dir",
+                        if delete_armed {
+                            "Tap again to delete folder & contents"
+                        } else {
+                            "Delete Folder"
+                        },
+                        true,
+                        cx.listener(|this, _, window, cx| {
+                            this.delete_context_item(window, cx);
+                        }),
+                    ))
+                })
+                .child(
+                    Button::new("ictx-cancel")
+                        .ghost()
+                        .small()
+                        .label("Cancel")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.close_item_context_menu(window, cx);
+                        })),
+                ),
+        )
+        .into_any_element()
 }
