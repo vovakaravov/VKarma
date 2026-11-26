@@ -925,6 +925,8 @@ pub struct LiveMarkdownEditor {
     dragging: bool,
     caret_visible: bool,
     caret_blink_epoch: u64,
+    read_only: bool,
+    interaction_blocked: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -968,10 +970,35 @@ impl LiveMarkdownEditor {
             dragging: false,
             caret_visible: true,
             caret_blink_epoch: 0,
+            read_only: false,
+            interaction_blocked: false,
             _subs: vec![sub_focus, sub_blur],
         };
         editor.start_blink_loop(window, cx);
         editor
+    }
+
+    pub fn set_read_only(&mut self, read_only: bool) {
+        if self.read_only != read_only {
+            self.read_only = read_only;
+            self.dragging = false;
+            self.caret_visible = false;
+            self.doc.marked_range = None;
+            self.layout_cache.clear();
+        }
+    }
+
+    pub fn set_interaction_blocked(&mut self, blocked: bool) {
+        if self.interaction_blocked != blocked {
+            self.interaction_blocked = blocked;
+            if blocked {
+                self.dragging = false;
+            }
+        }
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     pub fn text(&self) -> &str {
@@ -1133,11 +1160,12 @@ impl LiveMarkdownEditor {
     ) -> Option<Rc<CachedLine>> {
         let dl = self.doc.lines.get(li)?.clone();
         let col_w = self.last_col_geo.map_or(360.0, |g| g.1);
-        let cursor_local = cursor_range_for_line(&self.doc, &dl, focused);
+        let effective_focused = focused && !self.read_only;
+        let cursor_local = cursor_range_for_line(&self.doc, &dl, effective_focused);
         let key = cursor_local.as_ref().map(|r| (r.start, r.end));
         let raw_len = dl.byte_end - dl.byte_start;
         let (table_span, table_active, delim_expanded) =
-            table_state_for_line(&self.doc, &dl.ctx, focused);
+            table_state_for_line(&self.doc, &dl.ctx, effective_focused);
 
         let hit = self.layout_cache.get(&li).is_some_and(|c| {
             c.doc_version == self.doc.version
@@ -1179,7 +1207,7 @@ impl LiveMarkdownEditor {
         let vp_w = f32::from(bounds.size.width).max(200.0);
         let vp_h = f32::from(bounds.size.height).max(80.0);
         let geo = compute_column_geometry(vp_w);
-        let focused = self.focus_handle.is_focused(window);
+        let focused = self.focus_handle.is_focused(window) && !self.read_only;
 
         if self
             .last_col_geo
@@ -1460,6 +1488,9 @@ impl LiveMarkdownEditor {
     }
 
     fn handle_key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         let ks = &ev.keystroke;
         let cmd = ks.modifiers.control || ks.modifiers.platform;
         let shift = ks.modifiers.shift;
@@ -1673,6 +1704,9 @@ impl EntityInputHandler for LiveMarkdownEditor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         if let Some(r16) = range_utf16 {
             self.doc.marked_range = None;
             let s = utf16_to_utf8_offset(&self.doc.text, r16.start);
@@ -1705,6 +1739,9 @@ impl EntityInputHandler for LiveMarkdownEditor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let replace_u8 = if let Some(r16) = range_utf16 {
             utf16_to_utf8_offset(&self.doc.text, r16.start)
                 ..utf16_to_utf8_offset(&self.doc.text, r16.end)
@@ -1809,16 +1846,23 @@ impl Render for LiveMarkdownEditor {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                    if this.interaction_blocked {
+                        return;
+                    }
                     cx.stop_propagation();
                     this.doc.break_undo_coalescing();
 
                     let Some(hit) = this.hit_test_byte_at_point(ev.position) else {
-                        this.focus_handle.focus(window, cx);
-                        cx.notify();
+                        if !this.read_only {
+                            this.focus_handle.focus(window, cx);
+                            cx.notify();
+                        }
                         return;
                     };
 
-                    if let Some((row_li, col_ix)) = hit.phantom_table_cell {
+                    if !this.read_only
+                        && let Some((row_li, col_ix)) = hit.phantom_table_cell
+                    {
                         this.doc.table_ensure_cell(row_li, col_ix);
                         this.sync_height_table_after_edit();
                         this.focus_handle.focus(window, cx);
@@ -1848,6 +1892,10 @@ impl Render for LiveMarkdownEditor {
                         return;
                     }
 
+                    if this.read_only {
+                        return;
+                    }
+
                     this.focus_handle.focus(window, cx);
                     this.preferred_x = None;
                     match ev.click_count {
@@ -1864,7 +1912,7 @@ impl Render for LiveMarkdownEditor {
                 }),
             )
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
-                if !this.dragging {
+                if this.interaction_blocked || this.read_only || !this.dragging {
                     return;
                 }
                 if !ev.dragging() {
@@ -1885,6 +1933,9 @@ impl Render for LiveMarkdownEditor {
                 }),
             )
             .on_scroll(cx.listener(|this, ev: &ScrollEvent, _window, cx| {
+                if this.interaction_blocked {
+                    return;
+                }
                 let dy = f32::from(ev.delta.pixel_delta(px(24.)).y);
                 if dy.abs() > 0.01 {
                     let mut st = this.scroll.borrow_mut();
@@ -1931,6 +1982,7 @@ struct PaintSnapshot {
     selection_range: Range<usize>,
     caret_visible: bool,
     focused: bool,
+    read_only: bool,
     marked_range: Option<Range<usize>>,
     mono_font: Font,
     prose_bold_font: Font,
@@ -2050,6 +2102,7 @@ impl Element for LiveCanvasElement {
                     selection_range: ed.doc.selection_range(),
                     caret_visible: ed.caret_visible,
                     focused,
+                    read_only: ed.read_only,
                     marked_range: ed.doc.marked_range.clone(),
                     mono_font,
                     prose_bold_font,
@@ -2081,11 +2134,13 @@ impl Element for LiveCanvasElement {
             return;
         };
 
-        window.handle_input(
-            &snap.focus_handle,
-            ElementInputHandler::new(bounds, self.editor.clone()),
-            cx,
-        );
+        if !snap.read_only {
+            window.handle_input(
+                &snap.focus_handle,
+                ElementInputHandler::new(bounds, self.editor.clone()),
+                cx,
+            );
+        }
 
         let sel_bg = cx.theme().colors.selection;
         let col_left = snap.bounds.origin.x + px(snap.col_left_rel);
@@ -2540,7 +2595,8 @@ impl Element for LiveCanvasElement {
                 }
 
                 // IME composing underline
-                if let Some(mr) = &snap.marked_range
+                if !snap.read_only
+                    && let Some(mr) = &snap.marked_range
                     && mr.start < mr.end
                     && mr.start <= dl.byte_end
                     && mr.end >= dl.byte_start
@@ -2570,7 +2626,8 @@ impl Element for LiveCanvasElement {
             }
 
             // Blinking Caret
-            if snap.focused
+            if !snap.read_only
+                && snap.focused
                 && snap.caret_visible
                 && let Some((vx, vy, lh)) = snap.caret_disp_x_y
                 && snap.caret_cached.is_some()

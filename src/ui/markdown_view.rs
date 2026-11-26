@@ -1,27 +1,22 @@
 use super::find_bar::{
     EditorFindBar, FIND_INPUT_W, find_count_badge, floating_find_card, wrap_editor_with_find,
 };
+use super::live_editor::LiveMarkdownEditor;
 use super::{PaneSide, TabKind, VKarmaApp};
 use crate::config::MdViewMode;
-use crate::markdown::{
-    preprocess_markdown_with_options, resolve_inline_image_source, split_markdown_chapters,
-};
+use crate::markdown::split_markdown_chapters;
 use crate::theme::{hex_color, kd};
 use crate::vault::VaultIndex;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, Input};
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
-use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::text::TextView;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AppContext as _, Context, Focusable as _, InteractiveElement as _, IntoElement, KeyDownEvent,
-    ParentElement, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled, div,
-    prelude::FluentBuilder as _, px, relative,
+    Context, Entity, Focusable as _, InteractiveElement as _, IntoElement, KeyDownEvent,
+    ParentElement, SharedString, Styled, div, prelude::FluentBuilder as _, px, relative,
 };
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 pub fn render_markdown_tab(
@@ -34,16 +29,15 @@ pub fn render_markdown_tab(
         editor,
         editor_find,
         live_doc,
+        preview_live_doc,
         view_mode,
         source_mode,
-        preprocessed,
         word_count,
         char_count,
         is_mdx,
         chapter_mode,
         active_chapter,
         read_find,
-        read_scroll,
         ..
     } = &tab.kind
     else {
@@ -60,7 +54,6 @@ pub fn render_markdown_tab(
     let is_mdx = *is_mdx;
     let chapter_mode = *chapter_mode;
     let read_mins = if wc == 0 { 0 } else { (wc + 219) / 220 };
-    let preprocessed_str = preprocessed.clone();
     let zen_mode = app.zen_mode;
     let effective_mode = if zen_mode && view_mode == MdViewMode::Split {
         MdViewMode::Edit
@@ -74,45 +67,36 @@ pub fn render_markdown_tab(
     let read_find_total = read_find.matches.len();
     let read_find_active = read_find.active;
     let read_find_hit = read_find.matches.get(read_find.active).cloned();
-    let read_scroll = read_scroll.clone();
-    let find_btn_active = (effective_mode == MdViewMode::Reading && read_find_open)
-        || (effective_mode != MdViewMode::Reading
-            && ((!source_mode && live_doc.read(cx).is_search_open())
-                || (source_mode
-                    && editor_find
-                        .as_ref()
-                        .is_some_and(|fb| fb.read(cx).is_open()))));
 
-    let (effective_preview, chapter_nav) = if chapter_mode && view_mode != MdViewMode::Edit {
-        let raw_text: String = if source_mode
-            && let Some(ed) = editor.as_ref()
-        {
-            ed.read(cx).value().to_string()
+    let raw_text: String = if source_mode
+        && let Some(ed) = editor.as_ref()
+    {
+        ed.read(cx).value().to_string()
+    } else {
+        live_doc.read(cx).text().to_string()
+    };
+    let chapters = split_markdown_chapters(&raw_text);
+    let has_chapters = chapters.len() >= 2;
+    let chapter_nav = if chapter_mode && view_mode != MdViewMode::Edit && has_chapters {
+        let idx = (*active_chapter).min(chapters.len().saturating_sub(1));
+        let ch = &chapters[idx];
+        Some((idx, chapters.len(), ch.title.clone(), ch.content.clone()))
+    } else {
+        None
+    };
+
+    let find_btn_active = if effective_mode == MdViewMode::Reading {
+        if chapter_nav.is_some() || source_mode {
+            preview_live_doc.read(cx).is_search_open()
         } else {
-            live_doc.read(cx).text().to_string()
-        };
-        let chapters = split_markdown_chapters(&raw_text);
-        if chapters.len() >= 2 {
-            let idx = (*active_chapter).min(chapters.len().saturating_sub(1));
-            let ch = &chapters[idx];
-            let ch_pre: SharedString =
-                preprocess_markdown_with_options(&ch.content, &tab.path, &app.vault, 0, is_mdx)
-                    .into();
-            (ch_pre, Some((idx, chapters.len(), ch.title.clone())))
-        } else {
-            (preprocessed_str, None)
+            live_doc.read(cx).is_search_open()
         }
     } else {
-        (preprocessed_str, None)
-    };
-    let has_chapters = chapter_nav.is_some() || {
-        if source_mode
-            && let Some(ed) = editor.as_ref()
-        {
-            split_markdown_chapters(ed.read(cx).value().as_ref()).len() >= 2
-        } else {
-            split_markdown_chapters(live_doc.read(cx).text()).len() >= 2
-        }
+        (!source_mode && live_doc.read(cx).is_search_open())
+            || (source_mode
+                && editor_find
+                    .as_ref()
+                    .is_some_and(|fb| fb.read(cx).is_open()))
     };
 
     let header = h_flex()
@@ -286,10 +270,9 @@ pub fn render_markdown_tab(
                 }),
         );
 
-    let current_file = tab.path.clone();
     let app_entity = cx.entity();
-    let extensions = app.markdown_extensions.clone();
     let live_doc = live_doc.clone();
+    let preview_live_doc = preview_live_doc.clone();
     let body = match effective_mode {
         MdViewMode::Edit => {
             if source_mode
@@ -308,25 +291,33 @@ pub fn render_markdown_tab(
                 .into_any_element()
             } else {
                 let vault = Arc::clone(&app.vault);
-                live_doc.update(cx, |ed, _| ed.sync_render_context(true, zen_mode, vault));
+                live_doc.update(cx, |ed, _| ed.sync_render_context(true, zen_mode, vault, false));
                 live_doc.into_any_element()
             }
         }
-        MdViewMode::Reading => render_md_preview_pane(
-            app_entity,
-            side,
-            tab_id,
-            current_file,
-            Arc::clone(&app.vault),
-            effective_preview,
-            extensions,
-            true,
-            zen_mode,
-            chapter_nav,
-            Some(read_scroll),
-            cx,
-        )
-        .into_any_element(),
+        MdViewMode::Reading => {
+            if let Some((idx, total, title, ch_content)) = chapter_nav {
+                let vault = Arc::clone(&app.vault);
+                sync_read_preview_doc(&preview_live_doc, &ch_content, true, zen_mode, vault, cx);
+                wrap_with_chapter_footer(
+                    preview_live_doc.into_any_element(),
+                    side,
+                    tab_id,
+                    idx,
+                    total,
+                    title,
+                    cx,
+                )
+            } else if source_mode && editor.is_some() {
+                let vault = Arc::clone(&app.vault);
+                sync_read_preview_doc(&preview_live_doc, &raw_text, true, zen_mode, vault, cx);
+                preview_live_doc.into_any_element()
+            } else {
+                let vault = Arc::clone(&app.vault);
+                live_doc.update(cx, |ed, _| ed.sync_render_context(true, zen_mode, vault, true));
+                live_doc.into_any_element()
+            }
+        }
         MdViewMode::Split => {
             let edit_el = if source_mode
                 && let Some(ed) = editor.as_ref()
@@ -344,23 +335,26 @@ pub fn render_markdown_tab(
                 .into_any_element()
             } else {
                 let vault = Arc::clone(&app.vault);
-                live_doc.update(cx, |ed, _| ed.sync_render_context(false, zen_mode, vault));
+                live_doc.update(cx, |ed, _| ed.sync_render_context(false, zen_mode, vault, false));
                 live_doc.into_any_element()
             };
-            let preview_el = render_md_preview_pane(
-                app_entity,
-                side,
-                tab_id,
-                current_file,
-                Arc::clone(&app.vault),
-                effective_preview,
-                extensions,
-                false,
-                zen_mode,
-                chapter_nav,
-                None,
-                cx,
-            );
+            let preview_el = if let Some((idx, total, title, ch_content)) = chapter_nav {
+                let vault = Arc::clone(&app.vault);
+                sync_read_preview_doc(&preview_live_doc, &ch_content, false, zen_mode, vault, cx);
+                wrap_with_chapter_footer(
+                    preview_live_doc.into_any_element(),
+                    side,
+                    tab_id,
+                    idx,
+                    total,
+                    title,
+                    cx,
+                )
+            } else {
+                let vault = Arc::clone(&app.vault);
+                sync_read_preview_doc(&preview_live_doc, &raw_text, false, zen_mode, vault, cx);
+                preview_live_doc.into_any_element()
+            };
             h_resizable(SharedString::from(format!("md-split-{side:?}-{tab_id}")))
                 .child(
                     resizable_panel()
@@ -629,130 +623,90 @@ fn preview_link_tooltip_text(url: &str, current_file: &Path, vault: &VaultIndex)
     url.to_string()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_md_preview_pane(
-    app_entity: gpui_kit::Entity<VKarmaApp>,
+fn sync_read_preview_doc(
+    preview_doc: &Entity<LiveMarkdownEditor>,
+    target_raw: &str,
+    centered: bool,
+    zen_mode: bool,
+    vault: Arc<VaultIndex>,
+    cx: &mut Context<VKarmaApp>,
+) {
+    let needs_text_sync = preview_doc.read(cx).text() != target_raw;
+    preview_doc.update(cx, |ed, cx| {
+        if needs_text_sync {
+            ed.set_text(target_raw.to_string(), 0, 0, cx);
+        }
+        ed.sync_render_context(centered, zen_mode, vault, true);
+    });
+}
+
+fn wrap_with_chapter_footer(
+    content: gpui_kit::AnyElement,
     side: PaneSide,
     tab_id: u64,
-    current_file: PathBuf,
-    vault: Arc<VaultIndex>,
-    preprocessed: SharedString,
-    extensions: gpui_kit::component::text::MarkdownExtensions,
-    centered_read: bool,
-    zen_mode: bool,
-    chapter_nav: Option<(usize, usize, String)>,
-    scroll_handle: Option<ScrollHandle>,
+    idx: usize,
+    total: usize,
+    title: String,
     cx: &mut Context<VKarmaApp>,
-) -> impl IntoElement {
-    let col_max_width = super::column_max_width(centered_read, zen_mode);
-    let app_for_links = app_entity.clone();
-    let app_for_tasks = app_entity;
-
-    let ch_suffix = chapter_nav
-        .as_ref()
-        .map(|(idx, _, _)| format!("-ch{idx}"))
-        .unwrap_or_default();
-    let tv_id: SharedString = format!("md-preview-{side:?}-{tab_id}{ch_suffix}").into();
-
-    let text_view = TextView::markdown(tv_id, preprocessed)
-        .markdown_extensions(extensions)
-        .image_source(resolve_inline_image_source)
-        .selectable(true)
-        .link_tooltip(move |url, _, cx| {
-            let label = preview_link_tooltip_text(url.as_ref(), &current_file, &vault);
-            cx.new(|_| Tooltip::new(label)).into()
-        })
-        .on_link_click(move |url, _, window, cx| {
-            app_for_links.update(cx, |app, cx| {
-                app.handle_markdown_link(tab_id, side, url, window, cx);
-            });
-        })
-        .on_task_toggle(move |ev, window, cx| {
-            app_for_tasks.update(cx, |app, cx| {
-                app.handle_task_toggle(tab_id, side, ev, window, cx);
-            });
-        })
-        .w_full()
-        .text_size(px(15.))
-        .line_height(relative(1.65))
-        .text_color(hex_color(kd::FG));
-
-    let scroll = div()
-        .id(SharedString::from(format!("md-preview-scroll-{side:?}-{tab_id}{ch_suffix}")))
-        .when_some(scroll_handle, |d, h| d.track_scroll(&h))
-        .flex_1()
-        .min_h_0()
-        .w_full()
-        .bg(hex_color(kd::BG_MAIN))
-        .overflow_y_scrollbar()
-        .px(px(if col_max_width.is_some() { 32. } else { 24. }))
-        .py(px(if zen_mode { 56. } else { 20. }))
-        .child(
-            div()
-                .w_full()
-                .when_some(col_max_width, |d, w| d.max_w(px(w)).mx_auto())
-                .child(text_view),
-        );
-
+) -> gpui_kit::AnyElement {
+    let can_prev = idx > 0;
+    let can_next = idx + 1 < total;
     v_flex()
         .size_full()
         .bg(hex_color(kd::BG_MAIN))
-        .child(scroll)
-        .when_some(chapter_nav, |this, (idx, total, title)| {
-            let can_prev = idx > 0;
-            let can_next = idx + 1 < total;
-            this.child(
-                h_flex()
-                    .h(px(40.))
-                    .w_full()
-                    .px_4()
-                    .items_center()
-                    .justify_between()
-                    .bg(hex_color(kd::BG_SIDEBAR))
-                    .border_t_1()
-                    .border_color(hex_color(kd::BORDER_SUBTLE))
-                    .child(
-                        Button::new(SharedString::from(format!("md-ch-prev-{tab_id}")))
-                            .ghost()
-                            .xsmall()
-                            .label("← Prev")
-                            .disabled(!can_prev)
-                            .on_click(cx.listener(move |app, _, _, cx| {
-                                if let Some(tab) = app.find_tab_mut(side, tab_id)
-                                    && let TabKind::Markdown { active_chapter, .. } = &mut tab.kind
-                                    && *active_chapter > 0
-                                {
-                                    *active_chapter -= 1;
-                                    cx.notify();
-                                }
-                            })),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .px_2()
-                            .text_xs()
-                            .text_color(hex_color(kd::FG_SUBTLE))
-                            .truncate()
-                            .child(format!("Chapter {} / {} · {title}", idx + 1, total)),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!("md-ch-next-{tab_id}")))
-                            .ghost()
-                            .xsmall()
-                            .label("Next →")
-                            .disabled(!can_next)
-                            .on_click(cx.listener(move |app, _, _, cx| {
-                                if let Some(tab) = app.find_tab_mut(side, tab_id)
-                                    && let TabKind::Markdown { active_chapter, .. } = &mut tab.kind
-                                {
-                                    *active_chapter = (*active_chapter + 1).min(total.saturating_sub(1));
-                                    cx.notify();
-                                }
-                            })),
-                    ),
-            )
-        })
+        .child(div().flex_1().min_h_0().w_full().child(content))
+        .child(
+            h_flex()
+                .h(px(40.))
+                .w_full()
+                .px_4()
+                .items_center()
+                .justify_between()
+                .bg(hex_color(kd::BG_SIDEBAR))
+                .border_t_1()
+                .border_color(hex_color(kd::BORDER_SUBTLE))
+                .child(
+                    Button::new(SharedString::from(format!("md-ch-prev-{tab_id}")))
+                        .ghost()
+                        .xsmall()
+                        .label("← Prev")
+                        .disabled(!can_prev)
+                        .on_click(cx.listener(move |app, _, _, cx| {
+                            if let Some(tab) = app.find_tab_mut(side, tab_id)
+                                && let TabKind::Markdown { active_chapter, .. } = &mut tab.kind
+                                && *active_chapter > 0
+                            {
+                                *active_chapter -= 1;
+                                cx.notify();
+                            }
+                        })),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .px_2()
+                        .text_xs()
+                        .text_color(hex_color(kd::FG_SUBTLE))
+                        .truncate()
+                        .child(format!("Chapter {} / {} · {title}", idx + 1, total)),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("md-ch-next-{tab_id}")))
+                        .ghost()
+                        .xsmall()
+                        .label("Next →")
+                        .disabled(!can_next)
+                        .on_click(cx.listener(move |app, _, _, cx| {
+                            if let Some(tab) = app.find_tab_mut(side, tab_id)
+                                && let TabKind::Markdown { active_chapter, .. } = &mut tab.kind
+                            {
+                                *active_chapter = (*active_chapter + 1).min(total.saturating_sub(1));
+                                cx.notify();
+                            }
+                        })),
+                ),
+        )
+        .into_any_element()
 }
 
 #[cfg(test)]

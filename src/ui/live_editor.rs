@@ -342,7 +342,19 @@ fn compute_table_layout(
 fn table_state_for_line(
     doc: &LiveDocBuffer,
     ctx: &LineBlockContext,
+    allow_active: bool,
 ) -> (Option<(usize, usize)>, bool, bool) {
+    if !allow_active {
+        if let LineBlockContext::Table {
+            table_start_line,
+            table_end_line,
+            ..
+        } = ctx
+        {
+            return (Some((*table_start_line, *table_end_line)), false, false);
+        }
+        return (None, false, false);
+    }
     if let LineBlockContext::Table {
         table_start_line,
         table_end_line,
@@ -1067,6 +1079,7 @@ pub struct LiveMarkdownEditor {
     vault: Arc<VaultIndex>,
     centered: bool,
     zen_mode: bool,
+    read_only: bool,
     scroll: Rc<RefCell<LiveScrollState>>,
     scrollbar: LiveEditorScrollbarHandle,
     height_table: LineHeightTable,
@@ -1113,6 +1126,7 @@ impl LiveMarkdownEditor {
             vault,
             centered: true,
             zen_mode: false,
+            read_only: false,
             scroll,
             scrollbar,
             height_table,
@@ -1147,11 +1161,28 @@ impl LiveMarkdownEditor {
         self.doc_path = path;
     }
 
-    /// Updates centering/Zen/vault context from the parent view during render without notifying.
-    pub fn sync_render_context(&mut self, centered: bool, zen_mode: bool, vault: Arc<VaultIndex>) {
+    /// Updates centering/Zen/vault/read-only context from the parent view during render without notifying.
+    pub fn sync_render_context(
+        &mut self,
+        centered: bool,
+        zen_mode: bool,
+        vault: Arc<VaultIndex>,
+        read_only: bool,
+    ) {
         self.centered = centered;
         self.zen_mode = zen_mode;
         self.vault = vault;
+        if self.read_only != read_only {
+            self.read_only = read_only;
+            self.selected_image_line = None;
+            self.active_image_resize = None;
+            self.dragging = false;
+            self.doc.marked_range = None;
+            if read_only {
+                self.caret_visible = false;
+            }
+            self.layout_cache.clear();
+        }
     }
 
     pub fn set_text(
@@ -1736,10 +1767,14 @@ impl LiveMarkdownEditor {
                 .map(|(w, h, _)| (w.round() as u32, h.round() as u32));
 
             let raw_line = &self.doc.text[dl.byte_start..dl.byte_end];
-            let cursor_local = cursor_range_for_line(&self.doc, &dl, true);
+            let cursor_local = if self.read_only {
+                None
+            } else {
+                cursor_range_for_line(&self.doc, &dl, true)
+            };
             let cursor_key = cursor_local.as_ref().map(|r| (r.start, r.end));
             let (table_span, table_active, delim_expanded) =
-                table_state_for_line(&self.doc, &dl.ctx);
+                table_state_for_line(&self.doc, &dl.ctx, !self.read_only);
 
             let hit = self.layout_cache.get(&ix).is_some_and(|c| {
                 c.doc_version == self.doc.version
@@ -1892,10 +1927,15 @@ impl LiveMarkdownEditor {
     ) -> Option<Rc<CachedLine>> {
         let dl = self.doc.lines.get(li)?.clone();
         let col_w = self.last_col_geo.map_or(760.0, |g| g.1);
-        let cursor_local = cursor_range_for_line(&self.doc, &dl, true);
+        let cursor_local = if self.read_only {
+            None
+        } else {
+            cursor_range_for_line(&self.doc, &dl, true)
+        };
         let key = cursor_local.as_ref().map(|r| (r.start, r.end));
         let raw_len = dl.byte_end - dl.byte_start;
-        let (table_span, table_active, delim_expanded) = table_state_for_line(&self.doc, &dl.ctx);
+        let (table_span, table_active, delim_expanded) =
+            table_state_for_line(&self.doc, &dl.ctx, !self.read_only);
 
         let hit = self.layout_cache.get(&li).is_some_and(|c| {
             c.doc_version == self.doc.version
@@ -2429,6 +2469,9 @@ impl LiveMarkdownEditor {
                 self.move_by_page(1, shift, window, cx);
             }
             "backspace" if !alt => {
+                if self.read_only {
+                    return;
+                }
                 cx.stop_propagation();
                 self.preferred_x = None;
                 if let Some(img_li) = self.selected_image_line
@@ -2453,6 +2496,9 @@ impl LiveMarkdownEditor {
                 cx.notify();
             }
             "delete" if !alt => {
+                if self.read_only {
+                    return;
+                }
                 cx.stop_propagation();
                 self.preferred_x = None;
                 if let Some(img_li) = self.selected_image_line
@@ -2477,6 +2523,9 @@ impl LiveMarkdownEditor {
                 cx.notify();
             }
             "enter" if !alt => {
+                if self.read_only {
+                    return;
+                }
                 cx.stop_propagation();
                 self.preferred_x = None;
                 if let Some(img_li) = self.selected_image_line
@@ -2515,6 +2564,9 @@ impl LiveMarkdownEditor {
                 cx.notify();
             }
             "tab" if !ctrl && !alt => {
+                if self.read_only {
+                    return;
+                }
                 cx.stop_propagation();
                 self.handle_tab_key(shift, cx);
             }
@@ -2563,6 +2615,9 @@ impl LiveMarkdownEditor {
                 }
             }
             "x" if ctrl && !alt && !shift => {
+                if self.read_only {
+                    return;
+                }
                 cx.stop_propagation();
                 if self.doc.has_selection() {
                     cx.write_to_clipboard(ClipboardItem::new_string(
@@ -2578,6 +2633,9 @@ impl LiveMarkdownEditor {
                 }
             }
             "v" if ctrl && !alt && !shift => {
+                if self.read_only {
+                    return;
+                }
                 cx.stop_propagation();
                 if let Some(item) = cx.read_from_clipboard() {
                     let has_image = item
@@ -2598,6 +2656,9 @@ impl LiveMarkdownEditor {
                 }
             }
             "z" if ctrl && !alt => {
+                if self.read_only {
+                    return;
+                }
                 cx.stop_propagation();
                 let changed = if shift {
                     self.doc.redo()
@@ -2614,6 +2675,9 @@ impl LiveMarkdownEditor {
                 }
             }
             "y" if ctrl && !alt && !shift => {
+                if self.read_only {
+                    return;
+                }
                 cx.stop_propagation();
                 if self.doc.redo() {
                     self.sync_height_table_after_edit();
@@ -2625,6 +2689,9 @@ impl LiveMarkdownEditor {
                 }
             }
             "i" if ctrl && !alt && !shift => {
+                if self.read_only {
+                    return;
+                }
                 cx.stop_propagation();
                 self.doc.toggle_wrap("*");
                 self.sync_height_table_after_edit();
@@ -2633,6 +2700,9 @@ impl LiveMarkdownEditor {
                 cx.notify();
             }
             "k" if ctrl && !alt && !shift => {
+                if self.read_only {
+                    return;
+                }
                 cx.stop_propagation();
                 self.doc.insert_or_wrap_link();
                 self.sync_height_table_after_edit();
@@ -2696,6 +2766,9 @@ impl EntityInputHandler for LiveMarkdownEditor {
     }
 
     fn paste(&mut self, item: ClipboardItem, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         let has_image = item
             .entries()
             .iter()
@@ -2716,6 +2789,9 @@ impl EntityInputHandler for LiveMarkdownEditor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         if text.is_empty() && range_utf16.is_none() && !self.doc.has_selection() {
             return;
         }
@@ -2749,6 +2825,9 @@ impl EntityInputHandler for LiveMarkdownEditor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let replace_u8 = if let Some(r16) = range_utf16 {
             utf16_to_utf8_offset(&self.doc.text, r16.start)
                 ..utf16_to_utf8_offset(&self.doc.text, r16.end)
@@ -3198,22 +3277,23 @@ impl Render for LiveMarkdownEditor {
                     .left(px(img_left))
                     .w(px(img_w))
                     .h(px(img_h))
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            this.dragging = false;
-                            this.selected_image_line = Some(ix);
-                            if ev.click_count >= 2 {
-                                this.doc.set_cursor(line_start_byte, false);
-                                this.preferred_x = None;
-                            }
-                            this.focus_handle.focus(window, cx);
-                            this.reset_caret_blink();
-                            cx.notify();
-                        }),
-                    )
+                    .when(!self.read_only, |d| {
+                        d.cursor_pointer().on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.dragging = false;
+                                this.selected_image_line = Some(ix);
+                                if ev.click_count >= 2 {
+                                    this.doc.set_cursor(line_start_byte, false);
+                                    this.preferred_x = None;
+                                }
+                                this.focus_handle.focus(window, cx);
+                                this.reset_caret_blink();
+                                cx.notify();
+                            }),
+                        )
+                    })
                     .child(img_frame);
 
                 if !is_resizing && let Some(caption) = spec.caption.clone() {
@@ -3448,7 +3528,8 @@ impl Render for LiveMarkdownEditor {
             }
 
             let caret_li = self.doc.line_index_for_byte(self.doc.head);
-            if let Some(caret_dl) = self.doc.lines.get(caret_li)
+            if !self.read_only
+                && let Some(caret_dl) = self.doc.lines.get(caret_li)
                 && let LineBlockContext::Table {
                     is_header,
                     is_delim,
@@ -3796,10 +3877,16 @@ impl Render for LiveMarkdownEditor {
                 }
             }))
             .on_action(cx.listener(|this, _: &LiveEditorTab, _window, cx| {
+                if this.read_only {
+                    return;
+                }
                 cx.stop_propagation();
                 this.handle_tab_key(false, cx);
             }))
             .on_action(cx.listener(|this, _: &LiveEditorShiftTab, _window, cx| {
+                if this.read_only {
+                    return;
+                }
                 cx.stop_propagation();
                 this.handle_tab_key(true, cx);
             }))
@@ -3819,7 +3906,9 @@ impl Render for LiveMarkdownEditor {
                         return;
                     };
 
-                    if let Some((row_li, col_ix)) = hit.phantom_table_cell {
+                    if !this.read_only
+                        && let Some((row_li, col_ix)) = hit.phantom_table_cell
+                    {
                         this.doc.table_ensure_cell(row_li, col_ix);
                         this.sync_height_table_after_edit();
                         this.preferred_x = None;
@@ -4018,6 +4107,7 @@ struct PaintSnapshot {
     hovered_checkbox_line: Option<usize>,
     caret_visible: bool,
     focused: bool,
+    read_only: bool,
     marked_range: Option<Range<usize>>,
     mono_font: Font,
     prose_bold_font: Font,
@@ -4228,6 +4318,7 @@ impl Element for LiveCanvasElement {
                 hovered_checkbox_line: ed.hovered_checkbox_line,
                 caret_visible: ed.caret_visible,
                 focused,
+                read_only: ed.read_only,
                 marked_range: ed.doc.marked_range.clone(),
                 mono_font,
                 prose_bold_font,
@@ -4259,11 +4350,13 @@ impl Element for LiveCanvasElement {
             return;
         };
 
-        window.handle_input(
-            &snap.focus_handle,
-            ElementInputHandler::new(bounds, self.editor.clone()),
-            cx,
-        );
+        if !snap.read_only {
+            window.handle_input(
+                &snap.focus_handle,
+                ElementInputHandler::new(bounds, self.editor.clone()),
+                cx,
+            );
+        }
 
         let sel_bg = cx.theme().selection;
         let col_left = snap.bounds.origin.x + px(snap.col_left_rel);
@@ -5000,7 +5093,8 @@ impl Element for LiveCanvasElement {
                 }
 
                 // IME marked-text underline
-                if let Some(mr) = &snap.marked_range
+                if !snap.read_only
+                    && let Some(mr) = &snap.marked_range
                     && mr.start < mr.end
                     && mr.start <= dl.byte_end
                     && mr.end >= dl.byte_start
@@ -5026,7 +5120,9 @@ impl Element for LiveCanvasElement {
             }
 
             // Pass 2: Blinking Caret
-            if snap.focused && snap.caret_visible
+            if !snap.read_only
+                && snap.focused
+                && snap.caret_visible
                 && let Some((vx, vy, lh)) = snap.caret_disp_x_y
                 && let Some(c) = snap.caret_cached.as_ref()
             {

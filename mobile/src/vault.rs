@@ -711,20 +711,105 @@ pub fn preprocess_obsidian_markdown(md: &str) -> String {
 
     let mut in_fence = false;
     let body = &md[fm_len..];
-    for chunk in body.split_inclusive('\n') {
-        let trimmed = chunk.trim_start();
+    let lines: Vec<&str> = body.split('\n').collect();
+    for (idx, raw_line) in lines.iter().enumerate() {
+        let line = raw_line.trim_end_matches('\r');
+        let trimmed = line.trim_start();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             in_fence = !in_fence;
-            out.push_str(chunk);
+            out.push_str(line);
+            if idx + 1 < lines.len() {
+                out.push('\n');
+            }
             continue;
         }
         if in_fence {
-            out.push_str(chunk);
+            out.push_str(line);
+            if idx + 1 < lines.len() {
+                out.push('\n');
+            }
             continue;
         }
-        rewrite_wikilinks_in_line(chunk, &mut out);
+        let line_start = out.len();
+        rewrite_wikilinks_in_line(line, &mut out);
+        if idx + 1 < lines.len() {
+            let next_raw = lines[idx + 1].trim_end_matches('\r');
+            let converted = &out[line_start..];
+            if should_insert_hard_break(line, converted, next_raw) {
+                out.push_str("  ");
+            }
+            out.push('\n');
+        }
     }
     out
+}
+
+fn should_insert_hard_break(raw_line: &str, converted_line: &str, next_raw: &str) -> bool {
+    let cur_trim = raw_line.trim();
+    let nxt_trim = next_raw.trim();
+    if cur_trim.is_empty() || nxt_trim.is_empty() {
+        return false;
+    }
+    if converted_line.ends_with('\n')
+        || converted_line.ends_with("  ")
+        || converted_line.ends_with('\\')
+    {
+        return false;
+    }
+    if is_block_boundary_line(cur_trim) || is_block_starter_line(nxt_trim) {
+        return false;
+    }
+    let cur_quote = cur_trim.starts_with('>');
+    let nxt_quote = nxt_trim.starts_with('>');
+    if cur_quote != nxt_quote {
+        return false;
+    }
+    if cur_quote && cur_trim.trim_start_matches('>').trim().is_empty() {
+        return false;
+    }
+    true
+}
+
+fn is_heading_line(trimmed: &str) -> bool {
+    let hash_cnt = trimmed.chars().take_while(|c| *c == '#').count();
+    (1..=6).contains(&hash_cnt) && trimmed[hash_cnt..].starts_with(char::is_whitespace)
+}
+
+fn is_thematic_break_line(trimmed: &str) -> bool {
+    if trimmed.len() < 3 {
+        return false;
+    }
+    let non_space: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    non_space.len() >= 3
+        && (non_space.chars().all(|c| c == '-')
+            || non_space.chars().all(|c| c == '*')
+            || non_space.chars().all(|c| c == '_'))
+}
+
+fn is_list_item_line(trimmed: &str) -> bool {
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 2 && matches!(bytes[0], b'-' | b'*' | b'+') && bytes[1] == b' ' {
+        return true;
+    }
+    let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+    digits > 0
+        && digits + 2 <= bytes.len()
+        && matches!(bytes[digits], b'.' | b')')
+        && bytes[digits + 1] == b' '
+}
+
+fn is_block_boundary_line(trimmed: &str) -> bool {
+    is_heading_line(trimmed)
+        || is_thematic_break_line(trimmed)
+        || trimmed.starts_with('|')
+        || trimmed.starts_with('<')
+}
+
+fn is_block_starter_line(trimmed: &str) -> bool {
+    is_block_boundary_line(trimmed)
+        || trimmed.starts_with("```")
+        || trimmed.starts_with("~~~")
+        || is_list_item_line(trimmed)
 }
 
 fn frontmatter_byte_len(md: &str) -> usize {
@@ -1612,5 +1697,15 @@ mod tests {
         assert_eq!(hit.note_count(), 1);
         assert_eq!(hit.notes[0].display_name, "Note");
         assert!(VaultIndex::load_cached_from(&cache_file, &vault_b).is_none());
+    }
+
+    #[test]
+    fn preprocess_obsidian_markdown_preserves_single_newlines_without_breaking_blocks() {
+        let raw = "# Heading\nFirst line\nSecond line\n- bullet one\n- bullet two\n\n```\ncode1\ncode2\n```";
+        let pre = preprocess_obsidian_markdown(raw);
+        assert!(pre.contains("First line  \nSecond line"));
+        assert!(!pre.contains("# Heading  \n"));
+        assert!(!pre.contains("- bullet one  \n"));
+        assert!(pre.contains("code1\ncode2\n"));
     }
 }

@@ -815,9 +815,18 @@ impl VKarmaMobileApp {
         }
     }
 
+    pub fn has_modal_overlay(&self) -> bool {
+        self.drawer_open
+            || self.quick_switcher_open
+            || self.new_note_modal_open
+            || self.more_sheet_open
+            || self.folder_picker.is_some()
+    }
+
     pub fn toggle_drawer(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
         if open {
             self.flush_active_note_sync(cx);
+            self.live_editor_focused = false;
             window.blur(cx);
             gpui_mobile::hide_keyboard();
             self.quick_switcher_open = false;
@@ -1125,6 +1134,7 @@ impl VKarmaMobileApp {
                 self.note_text_view
                     .update(cx, |tv, cx| tv.set_text(&rendered, cx));
             }
+            self.live_editor_focused = false;
             window.blur(cx);
             gpui_mobile::hide_keyboard();
         } else {

@@ -4,7 +4,6 @@ use crate::vault::{MarkdownFormatAction, find_line_matches};
 use gpui::{prelude::*, *};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::Input;
-use gpui_kit::component::text::TextView;
 use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
 use std::path::PathBuf;
 
@@ -322,6 +321,15 @@ pub fn render_notes_workspace(
         None
     };
 
+    let blocked = app.has_modal_overlay();
+    if app.active_note.is_some() {
+        let ed = app.live_editor.clone();
+        ed.update(cx, |editor, _| {
+            editor.set_read_only(reading_only);
+            editor.set_interaction_blocked(blocked);
+        });
+    }
+
     let canvas = match &app.active_note {
         Some(note) if note.reading_only => {
             render_reading_canvas(app, note, bottom_inset, cx).into_any_element()
@@ -629,8 +637,6 @@ fn render_reading_canvas(
     bottom_inset: f32,
     cx: &mut Context<VKarmaMobileApp>,
 ) -> impl IntoElement {
-    let wiki_weak: AnyWeakEntity = cx.entity().downgrade().into();
-
     v_flex()
         .size_full()
         .bg(hex_color(kd::BG_MAIN))
@@ -642,40 +648,9 @@ fn render_reading_canvas(
                 .flex_1()
                 .min_h_0()
                 .w_full()
-                .px_3p5()
-                .py_2()
                 .flex()
                 .flex_col()
-                .child(
-                    TextView::new(&app.note_text_view)
-                        .scrollable(true)
-                        .selectable(true)
-                        .markdown_extensions(app.markdown_extensions.clone())
-                        .on_link_click(move |url, _ev, window, cx| {
-                            if let Some(encoded) = url.strip_prefix("vkarma-wiki://") {
-                                let target = percent_encoding::percent_decode_str(encoded)
-                                    .decode_utf8_lossy()
-                                    .into_owned();
-                                let weak = wiki_weak.clone();
-                                window.defer(cx, move |window, cx| {
-                                    if let Some(any_ent) = weak.upgrade()
-                                        && let Ok(ent) = any_ent.downcast::<VKarmaMobileApp>()
-                                    {
-                                        ent.update(cx, |this, cx| {
-                                            this.open_wikilink(&target, window, cx);
-                                        });
-                                    }
-                                });
-                            } else {
-                                let url_str = url.to_string();
-                                if url_str.starts_with("http://") || url_str.starts_with("https://")
-                                {
-                                    cx.open_url(&url_str);
-                                }
-                            }
-                        })
-                        .size_full(),
-                ),
+                .child(app.live_editor.clone()),
         )
         .when(!note.wikilinks.is_empty(), |col| {
             col.child(render_links_strip(note, cx))
@@ -1047,17 +1022,25 @@ pub fn render_sidebar_drawer(
     let app_weak: AnyWeakEntity = cx.entity().downgrade().into();
 
     h_flex()
+        .id("obs-drawer-overlay")
         .size_full()
         .absolute()
         .inset_0()
+        .occlude()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_scroll(|_, _, cx| cx.stop_propagation())
         .child(
             v_flex()
+                .id("obs-drawer-panel")
                 .w(px(drawer_w))
                 .h_full()
                 .flex_shrink_0()
                 .bg(hex_color(kd::BG_SIDEBAR))
                 .border_r_1()
                 .border_color(hex_color(kd::BORDER))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(|_, _, cx| cx.stop_propagation())
                 .child(
                     h_flex()
                         .w_full()
@@ -1419,7 +1402,9 @@ pub fn render_sidebar_drawer(
                 .flex_1()
                 .h_full()
                 .bg(hex_alpha(0x00000092))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
                     this.toggle_drawer(false, window, cx);
                 })),
         )
@@ -1631,12 +1616,16 @@ pub fn render_quick_switcher(
         .size_full()
         .absolute()
         .inset_0()
+        .occlude()
         .p_3()
         .pb(px(bottom_inset + 12.0))
         .bg(hex_alpha(0x0000009a))
         .flex()
         .flex_col()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_scroll(|_, _, cx| cx.stop_propagation())
         .on_click(cx.listener(|this, _, window, cx| {
+            cx.stop_propagation();
             this.close_quick_switcher(window, cx);
         }))
         .child(
@@ -1651,6 +1640,7 @@ pub fn render_quick_switcher(
                 .border_1()
                 .border_color(hex_color(kd::BORDER))
                 .overflow_hidden()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(|_, _, cx| cx.stop_propagation())
                 .child(
                     v_flex()
@@ -1812,13 +1802,17 @@ pub fn render_new_note_modal(
         .size_full()
         .absolute()
         .inset_0()
+        .occlude()
         .p_4()
         .pb(px(bottom_inset + 16.0))
         .bg(hex_alpha(0x0000009a))
         .flex()
         .flex_col()
         .justify_center()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_scroll(|_, _, cx| cx.stop_propagation())
         .on_click(cx.listener(|this, _, window, cx| {
+            cx.stop_propagation();
             this.new_note_modal_open = false;
             window.blur(cx);
             gpui_mobile::hide_keyboard();
@@ -1834,6 +1828,7 @@ pub fn render_new_note_modal(
                 .bg(hex_color(kd::BG_SIDEBAR))
                 .border_1()
                 .border_color(hex_color(kd::BORDER))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(|_, _, cx| cx.stop_propagation())
                 .child(
                     h_flex()
@@ -1923,11 +1918,15 @@ pub fn render_more_sheet(
         .size_full()
         .absolute()
         .inset_0()
+        .occlude()
         .bg(hex_alpha(0x00000090))
         .flex()
         .flex_col()
         .justify_end()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_scroll(|_, _, cx| cx.stop_propagation())
         .on_click(cx.listener(|this, _, window, cx| {
+            cx.stop_propagation();
             this.more_sheet_open = false;
             this.rename_mode = false;
             window.blur(cx);
@@ -1945,6 +1944,7 @@ pub fn render_more_sheet(
                 .bg(hex_color(kd::BG_SIDEBAR))
                 .border_t_1()
                 .border_color(hex_color(kd::BORDER))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(|_, _, cx| cx.stop_propagation())
                 .child(
                     v_flex()

@@ -329,8 +329,15 @@ pub fn render_folder_picker_modal(
         .size_full()
         .absolute()
         .inset_0()
+        .occlude()
         .p_3()
         .bg(hex_alpha(0x000000b8))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_scroll(|_, _, cx| {
+            cx.stop_propagation();
+        })
         .on_click(cx.listener(|this, _, window, cx| {
             this.close_folder_picker(window, cx);
         }))
@@ -347,6 +354,12 @@ pub fn render_folder_picker_modal(
                 .bg(hex_color(kd::BG_SIDEBAR))
                 .border_1()
                 .border_color(hex_color(kd::BORDER))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .on_scroll(|_, _, cx| {
+                    cx.stop_propagation();
+                })
                 .on_click(|_, _, cx| {
                     cx.stop_propagation();
                 })

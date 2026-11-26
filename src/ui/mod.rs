@@ -368,6 +368,7 @@ pub enum TabKind {
         editor: Option<Entity<EditorState>>,
         editor_find: Option<Entity<EditorFindBar>>,
         live_doc: Entity<LiveMarkdownEditor>,
+        preview_live_doc: Entity<LiveMarkdownEditor>,
         view_mode: MdViewMode,
         source_mode: bool,
         preprocessed: SharedString,
@@ -381,6 +382,7 @@ pub enum TabKind {
         read_find: ReadFindState,
         read_scroll: ScrollHandle,
         _live_sub: Subscription,
+        _preview_sub: Subscription,
         _sub: Option<Subscription>,
     },
     Fountain {
@@ -751,6 +753,7 @@ pub struct VKarmaApp {
     pub workspace_root: PathBuf,
     pub vault: Arc<VaultIndex>,
     pub watcher: Option<WorkspaceWatcher>,
+    #[allow(dead_code)]
     pub markdown_extensions: MarkdownExtensions,
 
     pub left_pane: WorkspacePane,
@@ -1672,13 +1675,12 @@ impl VKarmaApp {
                 ..
             } => {
                 if *source_mode
+                    && *view_mode != MdViewMode::Reading
                     && let Some(ed) = editor
                 {
                     ed.focus_handle(cx).focus(window, cx);
-                } else if *view_mode != MdViewMode::Reading {
-                    live_doc.focus_handle(cx).focus(window, cx);
                 } else {
-                    self.focus_handle.focus(window, cx);
+                    live_doc.focus_handle(cx).focus(window, cx);
                 }
             }
             TabKind::Fountain { editor, .. }
@@ -1797,13 +1799,26 @@ impl VKarmaApp {
 
                 let live_doc = cx.new(|cx| {
                     LiveMarkdownEditor::new(
-                        raw,
+                        raw.clone(),
                         path.to_path_buf(),
                         Arc::clone(&self.vault),
                         is_mdx,
                         window,
                         cx,
                     )
+                });
+
+                let preview_live_doc = cx.new(|cx| {
+                    let mut ed = LiveMarkdownEditor::new(
+                        raw,
+                        path.to_path_buf(),
+                        Arc::clone(&self.vault),
+                        is_mdx,
+                        window,
+                        cx,
+                    );
+                    ed.sync_render_context(true, false, Arc::clone(&self.vault), true);
+                    ed
                 });
 
                 let _live_sub =
@@ -1838,6 +1853,34 @@ impl VKarmaApp {
                         }
                     });
 
+                let _preview_sub = cx.subscribe_in(
+                    &preview_live_doc,
+                    window,
+                    move |this, _ed, event, window, cx| {
+                        if let LiveEditorEvent::OpenLink {
+                            target,
+                            in_right_split,
+                        } = event
+                        {
+                            let dest = if *in_right_split {
+                                PaneSide::Right
+                            } else {
+                                side
+                            };
+                            let url: SharedString = match target {
+                                LinkTarget::Wikilink(note) => format!(
+                                    "{}{}",
+                                    crate::markdown::VKARMA_NOTE_SCHEME,
+                                    crate::markdown::encode_uri_payload(note)
+                                )
+                                .into(),
+                                LinkTarget::Url(u) => u.clone().into(),
+                            };
+                            this.handle_markdown_link(tab_id, dest, &url, window, cx);
+                        }
+                    },
+                );
+
                 let read_find_input = cx.new(|cx| {
                     InputState::new(window, cx).placeholder("Find in document…")
                 });
@@ -1868,6 +1911,7 @@ impl VKarmaApp {
                     editor,
                     editor_find,
                     live_doc,
+                    preview_live_doc,
                     view_mode,
                     source_mode,
                     preprocessed,
@@ -1889,6 +1933,7 @@ impl VKarmaApp {
                     },
                     read_scroll: ScrollHandle::new(),
                     _live_sub,
+                    _preview_sub,
                     _sub: sub,
                 }
             }
@@ -3311,6 +3356,7 @@ impl VKarmaApp {
         }
     }
 
+    #[allow(dead_code)]
     pub fn handle_task_toggle(
         &mut self,
         tab_id: u64,
@@ -3554,7 +3600,6 @@ impl VKarmaApp {
         enum FindAction {
             None,
             MdLive(Entity<LiveMarkdownEditor>),
-            MdRead,
             MdSwitchToEditLive(Entity<LiveMarkdownEditor>),
             MdSwitchToEditSource(Entity<EditorFindBar>),
             OpenFindBar(Entity<EditorFindBar>),
@@ -3578,8 +3623,10 @@ impl VKarmaApp {
             TabKind::Markdown {
                 editor_find,
                 live_doc,
+                preview_live_doc,
                 view_mode,
                 source_mode,
+                chapter_mode,
                 ..
             } => {
                 let eff = if zen_mode && *view_mode == MdViewMode::Split {
@@ -3596,8 +3643,10 @@ impl VKarmaApp {
                         } else {
                             FindAction::MdSwitchToEditLive(live_doc.clone())
                         }
+                    } else if *chapter_mode || *source_mode {
+                        FindAction::MdLive(preview_live_doc.clone())
                     } else {
-                        FindAction::MdRead
+                        FindAction::MdLive(live_doc.clone())
                     }
                 } else if *source_mode
                     && let Some(fb) = editor_find.as_ref()
@@ -3662,9 +3711,6 @@ impl VKarmaApp {
             FindAction::None => {}
             FindAction::MdLive(live_doc) => {
                 live_doc.update(cx, |ed, cx| ed.open_search(replace, window, cx));
-            }
-            FindAction::MdRead => {
-                self.open_md_read_find(side, tab_id, window, cx);
             }
             FindAction::MdSwitchToEditLive(live_doc) => {
                 if let Some(t) = self.find_tab_mut(side, tab_id)
