@@ -6,6 +6,8 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::time::Duration;
 
 fn svg_icon(name: IconName, sz: f32, color: u32) -> impl IntoElement {
     Icon::new(name).size(px(sz)).text_color(hex_color(color))
@@ -349,10 +351,16 @@ pub fn render_notes_workspace(
     let blocked = app.has_modal_overlay();
     if app.active_note.is_some() {
         let ed = app.live_editor.clone();
-        ed.update(cx, |editor, _| {
-            editor.set_read_only(reading_only);
-            editor.set_interaction_blocked(blocked);
-        });
+        let (cur_ro, cur_blk) = {
+            let r = ed.read(cx);
+            (r.is_read_only(), r.is_interaction_blocked())
+        };
+        if cur_ro != reading_only || cur_blk != blocked {
+            ed.update(cx, |editor, _| {
+                editor.set_read_only(reading_only);
+                editor.set_interaction_blocked(blocked);
+            });
+        }
     }
 
     let canvas = match &app.active_note {
@@ -1117,7 +1125,7 @@ pub fn render_sidebar_drawer(
         .unwrap_or("Vault")
         .to_string();
 
-    let rows = app.visible_tree.clone();
+    let rows = Rc::clone(&app.visible_tree);
     let row_count = rows.len();
     let active_path = app.active_note.as_ref().map(|n| n.path.clone());
     let app_weak: AnyWeakEntity = cx.entity().downgrade().into();
@@ -1521,7 +1529,13 @@ pub fn render_sidebar_drawer(
                         )
                         .when(app.safe_area.bottom > 0.0, |col| {
                             col.child(div().w_full().h(px(app.safe_area.bottom)))
-                        }),
+                        })
+                        .with_animation(
+                            "obs-drawer-slide",
+                            Animation::new(Duration::from_millis(220))
+                                .with_easing(ease_out_quint()),
+                            move |el, t| el.ml(px(-drawer_w * (1.0 - t))),
+                        ),
                 ),
         )
         .child(
@@ -1534,7 +1548,12 @@ pub fn render_sidebar_drawer(
                 .on_click(cx.listener(|this, _, window, cx| {
                     cx.stop_propagation();
                     this.toggle_drawer(false, window, cx);
-                })),
+                }))
+                .with_animation(
+                    "obs-drawer-scrim-fade",
+                    Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+                    |el, t| el.opacity(t),
+                ),
         )
 }
 
@@ -1887,7 +1906,17 @@ pub fn render_quick_switcher(
                             ),
                     )
                 })
-                .child(results_list),
+                .child(results_list)
+                .with_animation(
+                    "obs-qs-drop",
+                    Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+                    |el, t| el.mt(px(-14.0 * (1.0 - t))).opacity(t),
+                ),
+        )
+        .with_animation(
+            "obs-qs-fade",
+            Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+            |el, t| el.opacity(t),
         )
 }
 
@@ -2018,7 +2047,17 @@ pub fn render_new_note_modal(
                                         })),
                                 ),
                         ),
+                )
+                .with_animation(
+                    "obs-new-drop",
+                    Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+                    |el, t| el.mt(px(-14.0 * (1.0 - t))).opacity(t),
                 ),
+        )
+        .with_animation(
+            "obs-new-fade",
+            Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+            |el, t| el.opacity(t),
         )
 }
 
@@ -2172,7 +2211,17 @@ pub fn render_more_sheet(
                     cx.listener(|this, _, window, cx| {
                         this.delete_active_note(window, cx);
                     }),
-                )),
+                ))
+                .with_animation(
+                    "obs-more-rise",
+                    Animation::new(Duration::from_millis(210)).with_easing(ease_out_quint()),
+                    |el, t| el.mb(px(-64.0 * (1.0 - t))).opacity(t),
+                ),
+        )
+        .with_animation(
+            "obs-more-fade",
+            Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+            |el, t| el.opacity(t),
         )
         .into_any_element()
 }
@@ -2424,7 +2473,17 @@ pub fn render_item_context_menu(
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.close_item_context_menu(window, cx);
                         })),
+                )
+                .with_animation(
+                    "obs-item-ctx-rise",
+                    Animation::new(Duration::from_millis(210)).with_easing(ease_out_quint()),
+                    |el, t| el.mb(px(-64.0 * (1.0 - t))).opacity(t),
                 ),
+        )
+        .with_animation(
+            "obs-item-ctx-fade",
+            Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+            |el, t| el.opacity(t),
         )
         .into_any_element()
 }

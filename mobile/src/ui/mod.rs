@@ -8,16 +8,16 @@ use crate::vault::{
     VaultSort, WikilinkRef, app_storage_dir, atomic_write_string, can_read_dir,
     count_direct_matching_files, create_folder, detect_default_vault_root,
     discover_vault_candidates, extract_tags, extract_wikilinks, list_subdirectories,
-    normalize_rel_path, note_stats, preprocess_obsidian_markdown, rename_note_file,
-    sanitize_note_filename, search_vault, today_daily_note_name,
+    normalize_rel_path, note_stats, rename_note_file, sanitize_note_filename, search_vault,
+    today_daily_note_name,
 };
 use gpui::{prelude::*, *};
 use gpui_kit::component::input::{InputEvent, InputState};
-use gpui_kit::component::text::{FrontmatterPlugin, MarkdownExtensions, TextViewState};
 use live_editor::{LiveEditorEvent, LiveMarkdownEditor};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -101,7 +101,6 @@ pub struct ActiveNote {
     pub filename: String,
     pub rel_folder: String,
     pub content: String,
-    pub rendered_md: String,
     pub wikilinks: Vec<WikilinkRef>,
     pub tags: Vec<String>,
     pub stats: (usize, usize, usize),
@@ -124,13 +123,11 @@ pub struct VKarmaMobileApp {
     pub vault_indexing: bool,
     pub expanded_dirs: HashSet<String>,
     pub sort_mode: VaultSort,
-    pub visible_tree: Vec<TreeRow>,
+    pub visible_tree: Rc<Vec<TreeRow>>,
 
     pub active_note: Option<ActiveNote>,
     pub live_editor: Entity<LiveMarkdownEditor>,
     pub live_editor_focused: bool,
-    pub note_text_view: Entity<TextViewState>,
-    pub markdown_extensions: MarkdownExtensions,
     pub recent_notes: Vec<PathBuf>,
     pub history_back: Vec<PathBuf>,
     pub history_forward: Vec<PathBuf>,
@@ -176,8 +173,10 @@ pub struct VKarmaMobileApp {
 
     last_back_at: Option<Instant>,
     last_resume_epoch: u64,
+    open_note_gen: u64,
     _vault_task: Option<Task<()>>,
     _autosave_task: Option<Task<()>>,
+    _open_note_task: Option<Task<()>>,
     _search_task: Option<Task<()>>,
     _perm_poll_task: Option<Task<()>>,
     _subs: Vec<Subscription>,
@@ -210,14 +209,6 @@ impl VKarmaMobileApp {
             cx.new(|cx| InputState::new(window, cx).placeholder("Find in note…"));
         let folder_picker_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("/sdcard/Documents"));
-
-        let note_text_view =
-            cx.new(|cx| TextViewState::markdown("", cx).scrollable(true).selectable(true));
-        // Build MarkdownExtensions ONCE so TextView's parsed AST stays cached across frames.
-        let markdown_extensions = MarkdownExtensions::default()
-            .frontmatter()
-            .plugin(FrontmatterPlugin::new())
-            .parser_revision(1);
 
         let mut subs = Vec::new();
 
@@ -380,12 +371,10 @@ impl VKarmaMobileApp {
             vault_indexing: false,
             expanded_dirs,
             sort_mode: ws.sort_mode,
-            visible_tree: Vec::new(),
+            visible_tree: Rc::new(Vec::new()),
             active_note: None,
             live_editor,
             live_editor_focused: false,
-            note_text_view,
-            markdown_extensions,
             recent_notes,
             history_back: Vec::new(),
             history_forward: Vec::new(),
@@ -422,8 +411,10 @@ impl VKarmaMobileApp {
             folder_picker_scroll: ScrollHandle::new(),
             last_back_at: None,
             last_resume_epoch: crate::android_resume_epoch(),
+            open_note_gen: 0,
             _vault_task: None,
             _autosave_task: None,
+            _open_note_task: None,
             _search_task: None,
             _perm_poll_task: None,
             _subs: subs,
@@ -477,9 +468,10 @@ impl VKarmaMobileApp {
 
     pub fn rebuild_visible_tree(&mut self, cx: &App) {
         let filter = self.drawer_filter_input.read(cx).value().to_string();
-        self.visible_tree =
+        self.visible_tree = Rc::new(
             self.vault_index
-                .visible_tree_rows(&self.expanded_dirs, self.sort_mode, &filter);
+                .visible_tree_rows(&self.expanded_dirs, self.sort_mode, &filter),
+        );
     }
 
     pub fn rebuild_quick_hits(&mut self, cx: &App) {
@@ -587,7 +579,7 @@ impl VKarmaMobileApp {
         ensure_active_candidate(&mut self.vault_candidates, &new_root, "Current Vault Folder");
         self.expanded_dirs.clear();
         self.content_hits.clear();
-        self.visible_tree.clear();
+        self.visible_tree = Rc::new(Vec::new());
         self.quick_hits.clear();
         self.drawer_target_dir = Some(new_root);
         self.status_banner = Some(format!("Vault: {}", self.vault_root.display()));
@@ -1027,115 +1019,128 @@ impl VKarmaMobileApp {
         cx: &mut Context<Self>,
     ) {
         self.flush_active_note_sync(cx);
+        self.open_note_gen = self.open_note_gen.wrapping_add(1);
+        let note_seq = self.open_note_gen;
+        let path_bg = path.clone();
 
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(err) => {
-                self.status_banner = Some(format!("Cannot read note: {err}"));
-                cx.notify();
-                return;
-            }
-        };
-
-        if push_history
-            && let Some(prev) = &self.active_note
-            && prev.path != path
-        {
-            if self.history_back.last() != Some(&prev.path) {
-                self.history_back.push(prev.path.clone());
-                if self.history_back.len() > 40 {
-                    self.history_back.remove(0);
-                }
-            }
-            self.history_forward.clear();
-        }
-
-        self.recent_notes.retain(|p| p != &path);
-        self.recent_notes.insert(0, path.clone());
-        if self.recent_notes.len() > 20 {
-            self.recent_notes.truncate(20);
-        }
-
-        let filename = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("Note.md")
-            .to_string();
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let title = if matches!(ext.as_str(), "md" | "markdown") {
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&filename)
-                .to_string()
-        } else {
-            filename.clone()
-        };
-        let rel = normalize_rel_path(&self.vault_root, &path);
-        let rel_folder = rel
-            .rsplit_once('/')
-            .map(|(dir, _)| dir.to_string())
-            .unwrap_or_else(|| {
-                self.vault_root
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("Vault")
-                    .to_string()
-            });
-
-        let rendered_md = preprocess_obsidian_markdown(&content);
-        let wikilinks = extract_wikilinks(&content);
-        let tags = extract_tags(&content);
-        let stats = note_stats(&content);
-
-        self.live_editor
-            .update(cx, |ed, cx| ed.set_text(content.clone(), cx));
-        self.note_find_input
-            .update(cx, |inp, cx| inp.set_value("", window, cx));
-
-        self.expand_ancestors_for_path(&path);
-        self.drawer_target_dir = path.parent().map(Path::to_path_buf);
-        self.drawer_open = false;
-        self.drawer_creating = None;
-        self.quick_switcher_open = false;
-        self.more_sheet_open = false;
-        self.rename_mode = false;
-        self.new_note_modal_open = false;
-        self.surface = AppSurface::Notes;
-        self.status_banner = None;
-        self.live_editor_focused = start_in_edit;
-
-        self.active_note = Some(ActiveNote {
-            path,
-            title,
-            filename,
-            rel_folder,
-            content,
-            rendered_md,
-            wikilinks,
-            tags,
-            stats,
-            reading_only: false,
-            dirty: false,
-            saved_badge: None,
-            find_open: false,
-            delete_armed: false,
+        let bg_read = cx.background_executor().spawn(async move {
+            let content = fs::read_to_string(&path_bg).map_err(|e| e.to_string())?;
+            let wikilinks = extract_wikilinks(&content);
+            let tags = extract_tags(&content);
+            let stats = note_stats(&content);
+            Ok::<_, String>((content, wikilinks, tags, stats))
         });
 
-        self.rebuild_visible_tree(cx);
-        self.persist_workspace_state_async(cx);
+        self._open_note_task = Some(cx.spawn_in(window, async move |weak_self, cx| {
+            let loaded = bg_read.await;
+            _ = weak_self.update_in(cx, |this, window, cx| {
+                if this.open_note_gen != note_seq {
+                    return;
+                }
+                let (content, wikilinks, tags, stats) = match loaded {
+                    Ok(data) => data,
+                    Err(err) => {
+                        this.status_banner = Some(format!("Cannot read note: {err}"));
+                        cx.notify();
+                        return;
+                    }
+                };
 
-        if start_in_edit {
-            self.live_editor.update(cx, |ed, cx| ed.focus(window, cx));
-        } else {
-            window.blur(cx);
-            gpui_mobile::hide_keyboard();
-        }
+                if push_history
+                    && let Some(prev) = &this.active_note
+                    && prev.path != path
+                {
+                    if this.history_back.last() != Some(&prev.path) {
+                        this.history_back.push(prev.path.clone());
+                        if this.history_back.len() > 40 {
+                            this.history_back.remove(0);
+                        }
+                    }
+                    this.history_forward.clear();
+                }
 
-        cx.notify();
+                this.recent_notes.retain(|p| p != &path);
+                this.recent_notes.insert(0, path.clone());
+                if this.recent_notes.len() > 20 {
+                    this.recent_notes.truncate(20);
+                }
+
+                let filename = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Note.md")
+                    .to_string();
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                let title = if matches!(ext.as_str(), "md" | "markdown") {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&filename)
+                        .to_string()
+                } else {
+                    filename.clone()
+                };
+                let rel = normalize_rel_path(&this.vault_root, &path);
+                let rel_folder = rel
+                    .rsplit_once('/')
+                    .map(|(dir, _)| dir.to_string())
+                    .unwrap_or_else(|| {
+                        this.vault_root
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("Vault")
+                            .to_string()
+                    });
+
+                this.live_editor
+                    .update(cx, |ed, cx| ed.set_text(content.clone(), cx));
+                this.note_find_input
+                    .update(cx, |inp, cx| inp.set_value("", window, cx));
+
+                this.expand_ancestors_for_path(&path);
+                this.drawer_target_dir = path.parent().map(Path::to_path_buf);
+                this.drawer_open = false;
+                this.drawer_creating = None;
+                this.quick_switcher_open = false;
+                this.more_sheet_open = false;
+                this.rename_mode = false;
+                this.new_note_modal_open = false;
+                this.surface = AppSurface::Notes;
+                this.status_banner = None;
+                this.live_editor_focused = start_in_edit;
+
+                this.active_note = Some(ActiveNote {
+                    path,
+                    title,
+                    filename,
+                    rel_folder,
+                    content,
+                    wikilinks,
+                    tags,
+                    stats,
+                    reading_only: false,
+                    dirty: false,
+                    saved_badge: None,
+                    find_open: false,
+                    delete_armed: false,
+                });
+
+                this.rebuild_visible_tree(cx);
+                this.persist_workspace_state_async(cx);
+
+                if start_in_edit {
+                    this.live_editor.update(cx, |ed, cx| ed.focus(window, cx));
+                } else {
+                    window.blur(cx);
+                    gpui_mobile::hide_keyboard();
+                }
+
+                cx.notify();
+            });
+        }));
     }
 
     pub fn close_active_note_to_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1196,14 +1201,10 @@ impl VKarmaMobileApp {
             let latest = self.live_editor.read(cx).text().to_string();
             if let Some(note) = &mut self.active_note {
                 note.content = latest;
-                note.rendered_md = preprocess_obsidian_markdown(&note.content);
                 note.wikilinks = extract_wikilinks(&note.content);
                 note.tags = extract_tags(&note.content);
                 note.stats = note_stats(&note.content);
                 note.reading_only = true;
-                let rendered = note.rendered_md.clone();
-                self.note_text_view
-                    .update(cx, |tv, cx| tv.set_text(&rendered, cx));
             }
             self.live_editor_focused = false;
             window.blur(cx);
@@ -1264,7 +1265,13 @@ impl VKarmaMobileApp {
             let write_text = latest.clone();
             let res = cx
                 .background_executor()
-                .spawn(async move { atomic_write_string(&write_path, &write_text) })
+                .spawn(async move {
+                    atomic_write_string(&write_path, &write_text).map_err(|e| e.to_string())?;
+                    let wikilinks = extract_wikilinks(&write_text);
+                    let tags = extract_tags(&write_text);
+                    let stats = note_stats(&write_text);
+                    Ok::<_, String>((wikilinks, tags, stats))
+                })
                 .await;
 
             _ = weak_self.update(cx, |this, cx| {
@@ -1272,13 +1279,12 @@ impl VKarmaMobileApp {
                     && note.path == path
                 {
                     match res {
-                        Ok(()) => {
+                        Ok((wikilinks, tags, stats)) => {
                             if this.edit_revision == rev {
                                 note.content = latest;
-                                note.rendered_md = preprocess_obsidian_markdown(&note.content);
-                                note.wikilinks = extract_wikilinks(&note.content);
-                                note.tags = extract_tags(&note.content);
-                                note.stats = note_stats(&note.content);
+                                note.wikilinks = wikilinks;
+                                note.tags = tags;
+                                note.stats = stats;
                                 note.dirty = false;
                                 note.saved_badge = Some("Saved".to_string());
                             }
@@ -1304,17 +1310,11 @@ impl VKarmaMobileApp {
         match atomic_write_string(&note.path, &latest) {
             Ok(()) => {
                 note.content = latest;
-                note.rendered_md = preprocess_obsidian_markdown(&note.content);
                 note.wikilinks = extract_wikilinks(&note.content);
                 note.tags = extract_tags(&note.content);
                 note.stats = note_stats(&note.content);
                 note.dirty = false;
                 note.saved_badge = Some("Saved".to_string());
-                if note.reading_only {
-                    let rendered = note.rendered_md.clone();
-                    self.note_text_view
-                        .update(cx, |tv, cx| tv.set_text(&rendered, cx));
-                }
             }
             Err(err) => {
                 note.saved_badge = Some(format!("Save error: {err}"));

@@ -132,9 +132,14 @@ pub fn android_main(app: android_activity::AndroidApp) {
     use gpui::{App, AppContext as _, WindowOptions};
     use gpui_mobile::android::jni;
 
+    let log_level = if cfg!(debug_assertions) {
+        log::LevelFilter::Info
+    } else {
+        log::LevelFilter::Warn
+    };
     android_logger::init_once(
         android_logger::Config::default()
-            .with_max_level(log::LevelFilter::Info)
+            .with_max_level(log_level)
             .with_tag("vkarma-mobile"),
     );
 

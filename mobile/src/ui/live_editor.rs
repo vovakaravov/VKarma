@@ -1,8 +1,8 @@
 use crate::live_md::{
     DocLine, EditKind, InlineStyle, LineBlockContext, LineHeightTable, LinkTarget, LiveDocBuffer,
-    PrefixVisual, ProjectedLine, TableAlign, clamp_char_boundary, list_indent_px_from_cols,
-    parse_table_alignments, project_line, project_table_cells, utf8_to_utf16_offset,
-    utf16_to_utf8_offset,
+    PrefixVisual, ProjectedLine, TableAlign, clamp_char_boundary, fnv1a_line_ctx_hash,
+    list_indent_px_from_cols, parse_table_alignments, project_line, project_table_cells,
+    utf8_to_utf16_offset, utf16_to_utf8_offset,
 };
 use crate::theme::{accent_alpha, hex_alpha, hex_color, kd};
 use crate::vault::MarkdownFormatAction;
@@ -159,6 +159,7 @@ struct TableBlockLayout {
 
 struct CachedLine {
     doc_version: u64,
+    raw_hash: u64,
     cursor_key: Option<(usize, usize)>,
     wrap_width: f32,
     raw_len: usize,
@@ -567,6 +568,7 @@ fn shape_cached_line(
     window: &Window,
 ) -> CachedLine {
     let cursor_key = cursor_local.as_ref().map(|r| (r.start, r.end));
+    let raw_hash = fnv1a_line_ctx_hash(raw_line, &dl.ctx);
 
     if let LineBlockContext::Table {
         is_header,
@@ -588,6 +590,7 @@ fn shape_cached_line(
             if cursor_local.is_none() {
                 return CachedLine {
                     doc_version,
+                    raw_hash,
                     cursor_key,
                     wrap_width: col_width,
                     raw_len: raw_line.len(),
@@ -622,6 +625,7 @@ fn shape_cached_line(
             let total_height = 6.0 + wrap_rows * TABLE_LINE_HEIGHT + if *is_last { 8.0 } else { 4.0 };
             return CachedLine {
                 doc_version,
+                raw_hash,
                 cursor_key,
                 wrap_width: col_width,
                 raw_len: raw_line.len(),
@@ -690,6 +694,7 @@ fn shape_cached_line(
             };
             return CachedLine {
                 doc_version,
+                raw_hash,
                 cursor_key,
                 wrap_width: col_width,
                 raw_len: raw_line.len(),
@@ -808,6 +813,7 @@ fn shape_cached_line(
 
     CachedLine {
         doc_version,
+        raw_hash,
         cursor_key,
         wrap_width: col_width,
         raw_len: raw_line.len(),
@@ -1030,6 +1036,10 @@ impl LiveMarkdownEditor {
 
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    pub fn is_interaction_blocked(&self) -> bool {
+        self.interaction_blocked
     }
 
     pub fn text(&self) -> &str {
@@ -1296,8 +1306,13 @@ impl LiveMarkdownEditor {
         let (table_span, table_active, delim_expanded) =
             table_state_for_line(&self.doc, &dl.ctx, effective_focused);
 
+        let raw_hash =
+            fnv1a_line_ctx_hash(&self.doc.text[dl.byte_start..dl.byte_end], &dl.ctx);
+
         let hit = self.layout_cache.get(&li).is_some_and(|c| {
-            c.doc_version == self.doc.version
+            (table_span.is_none() || c.doc_version == self.doc.version)
+                && c.raw_hash == raw_hash
+                && c.ctx == dl.ctx
                 && c.cursor_key == key
                 && (c.wrap_width - col_w).abs() < 0.5
                 && c.raw_len == raw_len
@@ -1342,8 +1357,7 @@ impl LiveMarkdownEditor {
             .last_col_geo
             .is_none_or(|prev| (prev.1 - geo.1).abs() > 1.0)
         {
-            self.height_table
-                .sync_lines(&self.doc.lines, &self.doc.text, geo.1);
+            self.height_table = LineHeightTable::from_lines(&self.doc.lines, &self.doc.text, geo.1);
             self.layout_cache.clear();
         }
         self.last_col_geo = Some(geo);
@@ -1368,6 +1382,13 @@ impl LiveMarkdownEditor {
 
         let caret_li = self.doc.line_index_for_byte(self.doc.head);
         let _ = self.ensure_line_cached(caret_li, focused, window, cx);
+
+        if self.layout_cache.len() > 260 {
+            let keep_lo = first_li.saturating_sub(40);
+            let keep_hi = last_li.saturating_add(40);
+            self.layout_cache
+                .retain(|&ix, _| (keep_lo..=keep_hi).contains(&ix) || ix == caret_li);
+        }
 
         let total_doc_h = geo.2 + self.height_table.total_height() + MOBILE_BOTTOM_SCROLL_PAD;
         {
@@ -2242,7 +2263,13 @@ impl Render for LiveMarkdownEditor {
                     .absolute()
                     .top(px(menu_y))
                     .left(px(menu_x))
-                    .child(row),
+                    .child(
+                        row.with_animation(
+                            "live-ed-ctx-pop",
+                            Animation::new(Duration::from_millis(145)).with_easing(ease_out_quint()),
+                            |el, t| el.mt(px(8.0 * (1.0 - t))).opacity(t),
+                        ),
+                    ),
             )
         } else {
             None

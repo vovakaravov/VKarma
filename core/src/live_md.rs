@@ -1,6 +1,7 @@
 pub use crate::image_spec::{
     ImageAlign, StyledImageSpec, compute_image_display_size, format_image_spec, parse_image_spec,
 };
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
@@ -25,7 +26,7 @@ pub enum TableAlign {
     Right,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LineBlockContext {
     Frontmatter {
         is_delim: bool,
@@ -3455,36 +3456,105 @@ fn next_word_boundary(s: &str, pos: usize) -> usize {
     p
 }
 
+struct Fnv1a64(u64);
+
+impl Default for Fnv1a64 {
+    fn default() -> Self {
+        Self(0xcbf29ce484222325)
+    }
+}
+
+impl Hasher for Fnv1a64 {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= b as u64;
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+}
+
+pub fn fnv1a_line_ctx_hash(raw_line: &str, ctx: &LineBlockContext) -> u64 {
+    let mut h = Fnv1a64::default();
+    raw_line.hash(&mut h);
+    ctx.hash(&mut h);
+    h.finish()
+}
+
 /// Prefix-sum table tracking exact / estimated vertical line heights for O(log N) scroll lookups.
 pub struct LineHeightTable {
     heights: Vec<f32>,
+    hashes: Vec<u64>,
     prefix: Vec<f32>,
     dirty: bool,
 }
 
 impl LineHeightTable {
     pub fn from_lines(lines: &[DocLine], raw: &str, est_col_width: f32) -> Self {
-        let heights: Vec<f32> = lines
-            .iter()
-            .map(|l| estimate_line_height(&raw[l.byte_start..l.byte_end], &l.ctx, est_col_width))
-            .collect();
+        let mut heights = Vec::with_capacity(lines.len());
+        let mut hashes = Vec::with_capacity(lines.len());
+        for l in lines {
+            let slice = &raw[l.byte_start..l.byte_end];
+            heights.push(estimate_line_height(slice, &l.ctx, est_col_width));
+            hashes.push(fnv1a_line_ctx_hash(slice, &l.ctx));
+        }
         let len = heights.len();
         Self {
             heights,
+            hashes,
             prefix: vec![0.0; len + 1],
             dirty: true,
         }
     }
 
-    pub fn sync_lines(&mut self, lines: &[DocLine], raw: &str, est_col_width: f32) {
-        if self.heights.len() == lines.len() {
+    pub fn sync_lines_preserving(&mut self, lines: &[DocLine], raw: &str, est_col_width: f32) {
+        if self.heights.len() == lines.len() && self.hashes.len() == lines.len() {
             return;
         }
-        self.heights = lines
+        let old_len = self.heights.len().min(self.hashes.len());
+        let new_len = lines.len();
+        let new_hashes: Vec<u64> = lines
             .iter()
-            .map(|l| estimate_line_height(&raw[l.byte_start..l.byte_end], &l.ctx, est_col_width))
+            .map(|l| fnv1a_line_ctx_hash(&raw[l.byte_start..l.byte_end], &l.ctx))
             .collect();
+
+        let mut prefix_match = 0usize;
+        let min_len = old_len.min(new_len);
+        while prefix_match < min_len && self.hashes[prefix_match] == new_hashes[prefix_match] {
+            prefix_match += 1;
+        }
+
+        let mut suffix_match = 0usize;
+        while suffix_match < (min_len - prefix_match)
+            && self.hashes[old_len - 1 - suffix_match] == new_hashes[new_len - 1 - suffix_match]
+        {
+            suffix_match += 1;
+        }
+
+        let mut next_heights = Vec::with_capacity(new_len);
+        next_heights.extend_from_slice(&self.heights[..prefix_match]);
+        let mid_end = new_len - suffix_match;
+        for l in &lines[prefix_match..mid_end] {
+            next_heights.push(estimate_line_height(
+                &raw[l.byte_start..l.byte_end],
+                &l.ctx,
+                est_col_width,
+            ));
+        }
+        if suffix_match > 0 {
+            next_heights.extend_from_slice(&self.heights[old_len - suffix_match..old_len]);
+        }
+
+        self.heights = next_heights;
+        self.hashes = new_hashes;
         self.dirty = true;
+    }
+
+    pub fn sync_lines(&mut self, lines: &[DocLine], raw: &str, est_col_width: f32) {
+        self.sync_lines_preserving(lines, raw, est_col_width);
     }
 
     fn ensure_prefix(&mut self) {
@@ -4124,5 +4194,36 @@ mod tests {
         buf.toggle_wrap("==");
         assert_eq!(buf.text, "Alpha beta gamma");
         assert_eq!(buf.selection_range(), 6..10);
+    }
+
+    #[test]
+    fn line_height_table_preserves_measured_heights_across_inserts_and_deletes() {
+        let mut buf = LiveDocBuffer::new("One\nTwo\nThree\nFour".to_string(), false);
+        let mut tbl = LineHeightTable::from_lines(&buf.lines, &buf.text, 400.0);
+        // Simulate real shaped heights recorded by the renderer on unchanged lines
+        tbl.set_height(0, 33.5);
+        tbl.set_height(1, 41.0);
+        tbl.set_height(3, 52.25);
+
+        // Insert a new line in the middle between line 1 ("Two") and line 2 ("Three")
+        let pos = buf.lines[2].byte_start;
+        buf.replace_range(pos..pos, "Inserted line\n", EditKind::Atomic);
+        tbl.sync_lines_preserving(&buf.lines, &buf.text, 400.0);
+
+        assert_eq!(buf.lines.len(), 5);
+        assert!((tbl.y_for_line(1) - 33.5).abs() < 0.01);
+        assert!((tbl.y_for_line(2) - (33.5 + 41.0)).abs() < 0.01);
+        // Suffix line ("Four", now index 4) kept its exact 52.25 measured height
+        let total = tbl.total_height();
+        let y4 = tbl.y_for_line(4);
+        assert!(((total - y4) - 52.25).abs() < 0.01);
+
+        // Delete the inserted line -> prefix & suffix remain preserved
+        let del_start = buf.lines[2].byte_start;
+        let del_end = buf.lines[3].byte_start;
+        buf.replace_range(del_start..del_end, "", EditKind::Atomic);
+        tbl.sync_lines_preserving(&buf.lines, &buf.text, 400.0);
+        assert_eq!(buf.lines.len(), 4);
+        assert!(((tbl.total_height() - tbl.y_for_line(3)) - 52.25).abs() < 0.01);
     }
 }
