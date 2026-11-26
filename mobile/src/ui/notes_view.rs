@@ -44,6 +44,7 @@ pub fn render_notes_workspace(
     window: &Window,
     cx: &mut Context<VKarmaMobileApp>,
 ) -> impl IntoElement {
+    let vp_w = f32::from(window.viewport_size().width) - app.safe_area.left - app.safe_area.right;
     let vault_label = app
         .vault_root
         .file_name()
@@ -51,7 +52,7 @@ pub fn render_notes_workspace(
         .unwrap_or("Vault")
         .to_string();
 
-    let (title_text, subtitle_text, dirty, saved_badge, reading_only, find_open) =
+    let (title_text, subtitle_text, dirty, saved_badge, reading_only, source_mode, find_open) =
         if let Some(note) = &app.active_note {
             (
                 note.title.clone(),
@@ -59,6 +60,7 @@ pub fn render_notes_workspace(
                 note.dirty,
                 note.saved_badge.clone(),
                 note.reading_only,
+                note.source_mode,
                 note.find_open,
             )
         } else {
@@ -67,6 +69,7 @@ pub fn render_notes_workspace(
                 format!("{} notes", app.vault_index.note_count()),
                 false,
                 None,
+                false,
                 false,
                 false,
             )
@@ -164,62 +167,133 @@ pub fn render_notes_workspace(
                 ),
         )
         .child(if app.active_note.is_some() {
+            let source_label = if vp_w < 430.0 { "Src" } else { "Source" };
             h_flex()
                 .gap_1()
                 .flex_shrink_0()
                 .items_center()
                 .child(
-                    div()
-                        .id("obs-mode-toggle")
-                        .h(px(34.))
-                        .px_2p5()
-                        .rounded(px(8.))
-                        .cursor_pointer()
-                        .bg(if reading_only {
-                            accent_alpha(0x34)
-                        } else {
-                            hex_color(kd::BG_SIDEBAR)
-                        })
+                    h_flex()
+                        .id("obs-mode-switch")
+                        .p_0p5()
+                        .rounded(px(9.))
+                        .bg(hex_color(kd::BG_SIDEBAR))
                         .border_1()
-                        .border_color(hex_color(if reading_only {
-                            kd::ACCENT
-                        } else {
-                            kd::BORDER
-                        }))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .gap_1()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(hex_color(if reading_only {
-                            kd::ACCENT_HOVER
-                        } else {
-                            kd::FG
-                        }))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.toggle_note_reading_mode(window, cx);
-                        }))
-                        .child(svg_icon(
-                            if reading_only {
-                                IconName::FileText
+                        .border_color(hex_color(kd::BORDER_SUBTLE))
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .id("obs-mode-edit")
+                                .h(px(28.))
+                                .px_2()
+                                .rounded(px(7.))
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(if !reading_only {
+                                    accent_alpha(0x3a)
+                                } else {
+                                    gpui::transparent_black()
+                                })
+                                .text_size(px(11.5))
+                                .font_weight(if !reading_only {
+                                    FontWeight::BOLD
+                                } else {
+                                    FontWeight::MEDIUM
+                                })
+                                .text_color(hex_color(if !reading_only {
+                                    kd::ACCENT_HOVER
+                                } else {
+                                    kd::FG_MUTED
+                                }))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_note_reading_mode(false, window, cx);
+                                }))
+                                .child("Edit"),
+                        )
+                        .child(
+                            div()
+                                .id("obs-mode-read")
+                                .h(px(28.))
+                                .px_2()
+                                .rounded(px(7.))
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(if reading_only {
+                                    accent_alpha(0x3a)
+                                } else {
+                                    gpui::transparent_black()
+                                })
+                                .text_size(px(11.5))
+                                .font_weight(if reading_only {
+                                    FontWeight::BOLD
+                                } else {
+                                    FontWeight::MEDIUM
+                                })
+                                .text_color(hex_color(if reading_only {
+                                    kd::ACCENT_HOVER
+                                } else {
+                                    kd::FG_MUTED
+                                }))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_note_reading_mode(true, window, cx);
+                                }))
+                                .child("Read"),
+                        ),
+                )
+                .when(!reading_only, |row| {
+                    row.child(
+                        div()
+                            .id("obs-source-toggle")
+                            .h(px(32.))
+                            .px_2()
+                            .rounded(px(8.))
+                            .cursor_pointer()
+                            .bg(if source_mode {
+                                accent_alpha(0x34)
                             } else {
-                                IconName::Eye
-                            },
-                            13.,
-                            if reading_only {
+                                hex_color(kd::BG_SIDEBAR)
+                            })
+                            .border_1()
+                            .border_color(hex_color(if source_mode {
+                                kd::ACCENT
+                            } else {
+                                kd::BORDER_SUBTLE
+                            }))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap_1()
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(hex_color(if source_mode {
                                 kd::ACCENT_HOVER
                             } else {
                                 kd::FG_SUBTLE
-                            },
-                        ))
-                        .child(if reading_only { "Live" } else { "Read" }),
-                )
+                            }))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_note_source_mode(cx);
+                            }))
+                            .child(svg_icon(
+                                IconName::SquareTerminal,
+                                12.5,
+                                if source_mode {
+                                    kd::ACCENT_HOVER
+                                } else {
+                                    kd::FG_SUBTLE
+                                },
+                            ))
+                            .child(source_label),
+                    )
+                })
                 .child(
                     div()
                         .id("obs-more-btn")
-                        .w(px(36.))
-                        .h(px(34.))
+                        .w(px(32.))
+                        .h(px(32.))
                         .rounded(px(8.))
                         .cursor_pointer()
                         .flex()
@@ -349,15 +423,17 @@ pub fn render_notes_workspace(
     };
 
     let blocked = app.has_modal_overlay();
+    let effective_source = !reading_only && source_mode;
     if app.active_note.is_some() {
         let ed = app.live_editor.clone();
-        let (cur_ro, cur_blk) = {
+        let (cur_ro, cur_src, cur_blk) = {
             let r = ed.read(cx);
-            (r.is_read_only(), r.is_interaction_blocked())
+            (r.is_read_only(), r.is_source_mode(), r.is_interaction_blocked())
         };
-        if cur_ro != reading_only || cur_blk != blocked {
+        if cur_ro != reading_only || cur_src != effective_source || cur_blk != blocked {
             ed.update(cx, |editor, _| {
                 editor.set_read_only(reading_only);
+                editor.set_source_mode(effective_source);
                 editor.set_interaction_blocked(blocked);
             });
         }
@@ -2069,9 +2145,15 @@ pub fn render_more_sheet(
         note.stats.0, note.stats.2, note.stats.1
     );
     let edit_label = if note.reading_only {
-        "Switch to Live Edit"
+        "Switch to Edit mode"
     } else {
-        "Lock Reading View"
+        "Switch to Read mode"
+    };
+    let in_edit_mode = !note.reading_only;
+    let source_label = if note.source_mode {
+        "Source mode: On (switch to formatted)"
+    } else {
+        "Source mode: Off (view raw Markdown)"
     };
     let delete_armed = note.delete_armed;
 
@@ -2178,6 +2260,17 @@ pub fn render_more_sheet(
                         this.toggle_note_reading_mode(window, cx);
                     }),
                 ))
+                .when(in_edit_mode, |col| {
+                    col.child(sheet_action_row(
+                        "more-source",
+                        source_label,
+                        false,
+                        cx.listener(|this, _, _, cx| {
+                            this.more_sheet_open = false;
+                            this.toggle_note_source_mode(cx);
+                        }),
+                    ))
+                })
                 .child(sheet_action_row(
                     "more-daily",
                     "Open today's daily note",

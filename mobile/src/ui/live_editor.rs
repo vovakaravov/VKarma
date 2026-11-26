@@ -1,8 +1,8 @@
 use crate::live_md::{
     DocLine, EditKind, InlineStyle, LineBlockContext, LineHeightTable, LinkTarget, LiveDocBuffer,
-    PrefixVisual, ProjectedLine, TableAlign, clamp_char_boundary, fnv1a_line_ctx_hash,
-    list_indent_px_from_cols, parse_table_alignments, project_line, project_table_cells,
-    utf8_to_utf16_offset, utf16_to_utf8_offset,
+    OffsetSegment, PrefixVisual, ProjectedLine, TableAlign, clamp_char_boundary,
+    fnv1a_line_ctx_hash, list_indent_px_from_cols, parse_table_alignments, project_line,
+    project_table_cells, utf8_to_utf16_offset, utf16_to_utf8_offset,
 };
 use crate::theme::{accent_alpha, hex_alpha, hex_color, kd};
 use crate::vault::MarkdownFormatAction;
@@ -160,6 +160,7 @@ struct TableBlockLayout {
 struct CachedLine {
     doc_version: u64,
     raw_hash: u64,
+    source_mode: bool,
     cursor_key: Option<(usize, usize)>,
     wrap_width: f32,
     raw_len: usize,
@@ -560,6 +561,7 @@ fn shape_cached_line(
     cursor_local: Option<Range<usize>>,
     col_width: f32,
     doc_version: u64,
+    source_mode: bool,
     table_layout: Option<&TableBlockLayout>,
     table_active: bool,
     delim_expanded: bool,
@@ -569,6 +571,84 @@ fn shape_cached_line(
 ) -> CachedLine {
     let cursor_key = cursor_local.as_ref().map(|r| (r.start, r.end));
     let raw_hash = fnv1a_line_ctx_hash(raw_line, &dl.ctx);
+
+    if source_mode {
+        let projected = ProjectedLine {
+            display_text: raw_line.to_string(),
+            spans: Vec::new(),
+            segments: if raw_line.is_empty() {
+                Vec::new()
+            } else {
+                vec![OffsetSegment::Verbatim {
+                    raw: 0..raw_line.len(),
+                    disp: 0..raw_line.len(),
+                }]
+            },
+            links: Vec::new(),
+            prefix_visual: PrefixVisual::None,
+            raw_len: raw_line.len(),
+        };
+        let avail_w = (col_width - 4.0).max(100.0);
+        let shaped = if projected.display_text.is_empty() {
+            None
+        } else {
+            let color = match &dl.ctx {
+                LineBlockContext::Heading { level: 1, .. } => hex_color(kd::ACCENT_HOVER),
+                LineBlockContext::Heading { level: 2, .. } => hex_color(kd::BLUE),
+                LineBlockContext::Heading { .. } => hex_color(kd::AQUA),
+                LineBlockContext::CodeFence { .. }
+                | LineBlockContext::Frontmatter { .. }
+                | LineBlockContext::Blockquote { .. }
+                | LineBlockContext::Callout { .. } => hex_color(kd::FG_SUBTLE),
+                _ => hex_color(kd::FG),
+            };
+            let mut font = mono_font.clone();
+            if matches!(dl.ctx, LineBlockContext::Heading { .. }) {
+                font.weight = FontWeight::BOLD;
+            }
+            let run = TextRun {
+                len: projected.display_text.len(),
+                font,
+                color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let shared: SharedString = projected.display_text.clone().into();
+            window
+                .text_system()
+                .shape_text(shared, px(13.5), &[run], Some(px(avail_w)), None)
+                .ok()
+                .and_then(|mut v| if v.is_empty() { None } else { Some(v.remove(0)) })
+        };
+        let line_height = 21.5;
+        let wrap_rows = shaped
+            .as_ref()
+            .map_or(1, |wl| wl.wrap_boundaries.len() + 1) as f32;
+        let total_height = if raw_line.is_empty() {
+            line_height
+        } else {
+            (3.0 + wrap_rows * line_height).max(line_height)
+        };
+        return CachedLine {
+            doc_version,
+            raw_hash,
+            source_mode: true,
+            cursor_key,
+            wrap_width: col_width,
+            raw_len: raw_line.len(),
+            table_active: false,
+            delim_expanded: false,
+            ctx: dl.ctx.clone(),
+            projected,
+            shaped,
+            table_row: None,
+            line_height,
+            total_height,
+            text_x_rel: 0.0,
+            text_y_rel: 1.5,
+        };
+    }
 
     if let LineBlockContext::Table {
         is_header,
@@ -591,6 +671,7 @@ fn shape_cached_line(
                 return CachedLine {
                     doc_version,
                     raw_hash,
+                    source_mode: false,
                     cursor_key,
                     wrap_width: col_width,
                     raw_len: raw_line.len(),
@@ -626,6 +707,7 @@ fn shape_cached_line(
             return CachedLine {
                 doc_version,
                 raw_hash,
+                source_mode: false,
                 cursor_key,
                 wrap_width: col_width,
                 raw_len: raw_line.len(),
@@ -695,6 +777,7 @@ fn shape_cached_line(
             return CachedLine {
                 doc_version,
                 raw_hash,
+                source_mode: false,
                 cursor_key,
                 wrap_width: col_width,
                 raw_len: raw_line.len(),
@@ -814,6 +897,7 @@ fn shape_cached_line(
     CachedLine {
         doc_version,
         raw_hash,
+        source_mode: false,
         cursor_key,
         wrap_width: col_width,
         raw_len: raw_line.len(),
@@ -945,6 +1029,7 @@ pub struct LiveMarkdownEditor {
     caret_visible: bool,
     caret_blink_epoch: u64,
     read_only: bool,
+    source_mode: bool,
     interaction_blocked: bool,
     _subs: Vec<Subscription>,
 }
@@ -997,6 +1082,7 @@ impl LiveMarkdownEditor {
             caret_visible: true,
             caret_blink_epoch: 0,
             read_only: false,
+            source_mode: false,
             interaction_blocked: false,
             _subs: vec![sub_focus, sub_blur],
         };
@@ -1036,6 +1122,20 @@ impl LiveMarkdownEditor {
 
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    pub fn set_source_mode(&mut self, source_mode: bool) {
+        if self.source_mode != source_mode {
+            self.source_mode = source_mode;
+            self.layout_cache.clear();
+            self.checkbox_hit_rects.clear();
+            let col_w = self.last_col_geo.map_or(360.0, |g| g.1);
+            self.height_table = LineHeightTable::from_lines(&self.doc.lines, &self.doc.text, col_w);
+        }
+    }
+
+    pub fn is_source_mode(&self) -> bool {
+        self.source_mode
     }
 
     pub fn is_interaction_blocked(&self) -> bool {
@@ -1303,8 +1403,11 @@ impl LiveMarkdownEditor {
         let cursor_local = cursor_range_for_line(&self.doc, &dl, effective_focused);
         let key = cursor_local.as_ref().map(|r| (r.start, r.end));
         let raw_len = dl.byte_end - dl.byte_start;
-        let (table_span, table_active, delim_expanded) =
-            table_state_for_line(&self.doc, &dl.ctx, effective_focused);
+        let (table_span, table_active, delim_expanded) = if self.source_mode {
+            (None, false, false)
+        } else {
+            table_state_for_line(&self.doc, &dl.ctx, effective_focused)
+        };
 
         let raw_hash =
             fnv1a_line_ctx_hash(&self.doc.text[dl.byte_start..dl.byte_end], &dl.ctx);
@@ -1312,6 +1415,7 @@ impl LiveMarkdownEditor {
         let hit = self.layout_cache.get(&li).is_some_and(|c| {
             (table_span.is_none() || c.doc_version == self.doc.version)
                 && c.raw_hash == raw_hash
+                && c.source_mode == self.source_mode
                 && c.ctx == dl.ctx
                 && c.cursor_key == key
                 && (c.wrap_width - col_w).abs() < 0.5
@@ -1329,6 +1433,7 @@ impl LiveMarkdownEditor {
                 cursor_local,
                 col_w,
                 self.doc.version,
+                self.source_mode,
                 tbl.as_ref(),
                 table_active,
                 delim_expanded,
@@ -2445,6 +2550,7 @@ struct PaintSnapshot {
     caret_visible: bool,
     focused: bool,
     read_only: bool,
+    source_mode: bool,
     marked_range: Option<Range<usize>>,
     mono_font: Font,
     prose_bold_font: Font,
@@ -2508,8 +2614,9 @@ impl Element for LiveCanvasElement {
                     continue;
                 };
 
-                let checkbox_rect = if let PrefixVisual::Checkbox { indent_cols, .. } =
-                    &c_rc.projected.prefix_visual
+                let checkbox_rect = if !ed.source_mode
+                    && let PrefixVisual::Checkbox { indent_cols, .. } =
+                        &c_rc.projected.prefix_visual
                 {
                     let cb_x = col_left + px(list_indent_px_from_cols(*indent_cols) + 2.0);
                     let cb_y = bounds.origin.y + px(geo.2 + y_line - scroll_y)
@@ -2586,6 +2693,7 @@ impl Element for LiveCanvasElement {
                     caret_visible: ed.caret_visible,
                     focused,
                     read_only: ed.read_only,
+                    source_mode: ed.source_mode,
                     marked_range: ed.doc.marked_range.clone(),
                     mono_font,
                     prose_bold_font,
@@ -2794,8 +2902,9 @@ impl Element for LiveCanvasElement {
                     continue;
                 }
 
-                // Block decorations for prose lines
-                match &c.ctx {
+                // Block decorations & prefix visuals (suppressed in raw Source Mode)
+                if !snap.source_mode {
+                    match &c.ctx {
                     LineBlockContext::CodeFence {
                         is_first, is_last, ..
                     } => {
@@ -3042,6 +3151,7 @@ impl Element for LiveCanvasElement {
                         );
                     }
                     _ => {}
+                }
                 }
 
                 // Selection highlight rects

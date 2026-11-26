@@ -130,6 +130,7 @@ pub struct ActiveNote {
     pub tags: Vec<String>,
     pub stats: (usize, usize, usize),
     pub reading_only: bool,
+    pub source_mode: bool,
     pub dirty: bool,
     pub saved_badge: Option<String>,
     pub find_open: bool,
@@ -1361,6 +1362,7 @@ impl VKarmaMobileApp {
                     tags,
                     stats,
                     reading_only: false,
+                    source_mode: false,
                     dirty: false,
                     saved_badge: None,
                     find_open: false,
@@ -1431,11 +1433,19 @@ impl VKarmaMobileApp {
         }
     }
 
-    pub fn toggle_note_reading_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn set_note_reading_mode(
+        &mut self,
+        reading_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(currently_reading) = self.active_note.as_ref().map(|n| n.reading_only) else {
             return;
         };
-        if !currently_reading {
+        if currently_reading == reading_only {
+            return;
+        }
+        if reading_only {
             self.flush_active_note_sync(cx);
             let latest = self.live_editor.read(cx).text().to_string();
             if let Some(note) = &mut self.active_note {
@@ -1455,6 +1465,24 @@ impl VKarmaMobileApp {
             window.blur(cx);
             gpui_mobile::hide_keyboard();
         }
+        cx.notify();
+    }
+
+    pub fn toggle_note_reading_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(currently_reading) = self.active_note.as_ref().map(|n| n.reading_only) else {
+            return;
+        };
+        self.set_note_reading_mode(!currently_reading, window, cx);
+    }
+
+    pub fn toggle_note_source_mode(&mut self, cx: &mut Context<Self>) {
+        let Some(note) = &mut self.active_note else {
+            return;
+        };
+        if note.reading_only {
+            return;
+        }
+        note.source_mode = !note.source_mode;
         cx.notify();
     }
 
