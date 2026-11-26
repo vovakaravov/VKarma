@@ -1,5 +1,6 @@
 package dev.gpui.mobile;
 
+import android.Manifest;
 import android.app.NativeActivity;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
@@ -8,6 +9,8 @@ import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
+import android.provider.Settings;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.window.OnBackInvokedCallback;
@@ -173,6 +176,68 @@ public class GpuiActivity extends GpuiInputActivity {
         }
     }
 
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (sNativeLibLoaded) {
+            try {
+                nativeOnResume();
+            } catch (UnsatisfiedLinkError e) {
+                Log.w("GpuiActivity", "nativeOnResume unavailable");
+            }
+        }
+    }
+
+    /** Called from Rust via JNI to check Android All Files Access (API 30+) or legacy storage permission. */
+    public boolean gpuiHasAllFilesAccess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return Environment.isExternalStorageManager();
+        }
+        return checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+                && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    /** Called from Rust via JNI to jump straight to this app's All Files Access toggle in Android Settings. */
+    public void gpuiRequestAllFilesAccess() {
+        runOnUiThread(() -> {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                try {
+                    Intent intent = new Intent(
+                            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                            Uri.parse("package:" + getPackageName())
+                    );
+                    startActivity(intent);
+                    return;
+                } catch (Exception e) {
+                    Log.w("GpuiActivity", "Per-app all files access intent failed, trying general settings", e);
+                }
+                try {
+                    startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+                    return;
+                } catch (Exception e) {
+                    Log.w("GpuiActivity", "General all files access intent failed, falling back to app details", e);
+                }
+                try {
+                    Intent details = new Intent(
+                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.parse("package:" + getPackageName())
+                    );
+                    startActivity(details);
+                } catch (Exception e) {
+                    Log.e("GpuiActivity", "Failed to open app settings", e);
+                }
+            } else {
+                requestPermissions(
+                        new String[]{
+                                Manifest.permission.READ_EXTERNAL_STORAGE,
+                                Manifest.permission.WRITE_EXTERNAL_STORAGE
+                        },
+                        9003
+                );
+            }
+        });
+    }
+
     /** Called from Rust via JNI when Back reaches the root screen. */
     public void gpuiMoveTaskToBack() {
         runOnUiThread(() -> moveTaskToBack(true));
@@ -217,4 +282,9 @@ public class GpuiActivity extends GpuiInputActivity {
      * JNI bridge to forward Android Back gestures/buttons to Rust.
      */
     private static native void nativeOnBackPressed();
+
+    /**
+     * JNI bridge to notify Rust when the Activity returns to the foreground.
+     */
+    private static native void nativeOnResume();
 }

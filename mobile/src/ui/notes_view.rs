@@ -341,6 +341,38 @@ pub fn render_notes_workspace(
     v_flex()
         .size_full()
         .child(top_bar)
+        .when(!app.has_storage_access && app.active_note.is_some(), |col| {
+            col.child(
+                h_flex()
+                    .w_full()
+                    .px_3p5()
+                    .py_2()
+                    .gap_2()
+                    .justify_between()
+                    .items_center()
+                    .bg(hex_alpha(0xc4b28a20))
+                    .border_b_1()
+                    .border_color(hex_color(kd::YELLOW))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(hex_color(kd::YELLOW))
+                            .child("All files access needed for /sdcard notes"),
+                    )
+                    .child(
+                        Button::new("top-grant-storage")
+                            .primary()
+                            .small()
+                            .label("Grant Access")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.request_storage_permission(cx);
+                            })),
+                    ),
+            )
+        })
         .when_some(find_strip, |col, strip| col.child(strip))
         .when_some(app.status_banner.clone(), |col, msg| {
             col.child(
@@ -706,7 +738,7 @@ fn render_empty_tab_home(
                 v_flex()
                     .w_full()
                     .p_3p5()
-                    .gap_1()
+                    .gap_2()
                     .rounded(px(12.))
                     .bg(hex_alpha(0xc4b28a20))
                     .border_1()
@@ -716,13 +748,37 @@ fn render_empty_tab_home(
                             .text_xs()
                             .font_weight(FontWeight::BOLD)
                             .text_color(hex_color(kd::YELLOW))
-                            .child("Shared /sdcard/Documents access restricted"),
+                            .child("All files access required for /sdcard vaults"),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(hex_color(kd::FG_SUBTLE))
-                            .child("Grant All files access in Android Settings, then open drawer to rescan."),
+                            .child("Android needs All files access to read and sync your Markdown vault in /sdcard/Documents."),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(
+                                Button::new("home-grant-storage")
+                                    .primary()
+                                    .small()
+                                    .label("Grant All Files Access")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.request_storage_permission(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("home-recheck-storage")
+                                    .secondary()
+                                    .small()
+                                    .label("Recheck")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.recheck_storage_and_refresh(cx);
+                                    })),
+                            ),
                     ),
             )
         })

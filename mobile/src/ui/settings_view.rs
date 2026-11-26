@@ -199,7 +199,7 @@ pub fn render_settings_tab(
                                 .child(if app.has_storage_access {
                                     "All Files Granted"
                                 } else {
-                                    "Scoped Fallback"
+                                    "Permission Needed"
                                 }),
                         ),
                 )
@@ -208,7 +208,34 @@ pub fn render_settings_tab(
                         .text_xs()
                         .text_color(hex_color(kd::FG_SUBTLE))
                         .child("Android All Files access lets VKarma read & save notes in /sdcard folders directly."),
-                ),
+                )
+                .when(!app.has_storage_access, |card| {
+                    card.child(
+                        h_flex()
+                            .w_full()
+                            .pt_1()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(
+                                Button::new("set-grant-storage")
+                                    .primary()
+                                    .small()
+                                    .label("Grant All Files Access")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.request_storage_permission(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("set-recheck-perm")
+                                    .secondary()
+                                    .small()
+                                    .label("Recheck")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.recheck_storage_and_refresh(cx);
+                                    })),
+                            ),
+                    )
+                }),
         )
         .child(
             v_flex()

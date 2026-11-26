@@ -1240,6 +1240,9 @@ pub fn count_direct_matching_files(dir: &Path, exts: &[&str]) -> usize {
 pub fn detect_default_vault_root() -> (PathBuf, bool) {
     #[cfg(target_os = "android")]
     {
+        if !crate::has_all_files_access() {
+            return (app_storage_dir("vault"), false);
+        }
         for cand in [
             PathBuf::from("/sdcard/Documents"),
             PathBuf::from("/storage/emulated/0/Documents"),

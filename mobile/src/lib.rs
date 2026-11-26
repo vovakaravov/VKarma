@@ -1,9 +1,80 @@
 extern crate gpui_mobile;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 pub use vkarma_core::live_md;
 pub mod theme;
 pub mod ui;
 pub mod vault;
+
+static RESUME_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+pub fn android_resume_epoch() -> u64 {
+    RESUME_EPOCH.load(Ordering::SeqCst)
+}
+
+#[cfg(target_os = "android")]
+pub fn has_all_files_access() -> bool {
+    use gpui_mobile::android::jni as gpui_jni;
+    match gpui_jni::with_env(|env| {
+        let activity = gpui_jni::activity(env)?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiHasAllFilesAccess"),
+            jni::jni_sig!("()Z"),
+            &[],
+        )
+        .and_then(|v| v.z())
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })
+    }) {
+        Ok(val) => val,
+        Err(err) => {
+            log::warn!("VKarma Mobile: has_all_files_access failed: {err}");
+            false
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn has_all_files_access() -> bool {
+    true
+}
+
+#[cfg(target_os = "android")]
+pub fn request_all_files_access() {
+    use gpui_mobile::android::jni as gpui_jni;
+    if let Err(err) = gpui_jni::with_env(|env| {
+        let activity = gpui_jni::activity(env)?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiRequestAllFilesAccess"),
+            jni::jni_sig!("()V"),
+            &[],
+        )
+        .map(drop)
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })
+    }) {
+        log::warn!("VKarma Mobile: request_all_files_access failed: {err}");
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn request_all_files_access() {}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnResume(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+) {
+    RESUME_EPOCH.fetch_add(1, Ordering::SeqCst);
+}
 
 /// Minimize the Android task cleanly when Back is pressed at the root screen.
 #[cfg(target_os = "android")]
