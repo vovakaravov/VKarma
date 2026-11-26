@@ -62,7 +62,9 @@ jobs:
           workspaces: "mobile -> mobile/target"
 
       - name: Install cargo-ndk
-        uses: taiki-e/install-action@cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
 
       - name: Install Android NDK 27 & SDK 34
         shell: bash
