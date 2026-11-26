@@ -172,6 +172,51 @@ pub fn render_notes_workspace(
                 .gap_1()
                 .flex_shrink_0()
                 .items_center()
+                .when(!reading_only, |row| {
+                    row.child(
+                        div()
+                            .id("obs-source-toggle")
+                            .h(px(32.))
+                            .px_2()
+                            .rounded(px(8.))
+                            .cursor_pointer()
+                            .bg(if source_mode {
+                                accent_alpha(0x34)
+                            } else {
+                                hex_color(kd::BG_SIDEBAR)
+                            })
+                            .border_1()
+                            .border_color(hex_color(if source_mode {
+                                kd::ACCENT
+                            } else {
+                                kd::BORDER_SUBTLE
+                            }))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap_1()
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(hex_color(if source_mode {
+                                kd::ACCENT_HOVER
+                            } else {
+                                kd::FG_SUBTLE
+                            }))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_note_source_mode(cx);
+                            }))
+                            .child(svg_icon(
+                                IconName::SquareTerminal,
+                                12.5,
+                                if source_mode {
+                                    kd::ACCENT_HOVER
+                                } else {
+                                    kd::FG_SUBTLE
+                                },
+                            ))
+                            .child(source_label),
+                    )
+                })
                 .child(
                     h_flex()
                         .id("obs-mode-switch")
@@ -244,51 +289,6 @@ pub fn render_notes_workspace(
                                 .child("Read"),
                         ),
                 )
-                .when(!reading_only, |row| {
-                    row.child(
-                        div()
-                            .id("obs-source-toggle")
-                            .h(px(32.))
-                            .px_2()
-                            .rounded(px(8.))
-                            .cursor_pointer()
-                            .bg(if source_mode {
-                                accent_alpha(0x34)
-                            } else {
-                                hex_color(kd::BG_SIDEBAR)
-                            })
-                            .border_1()
-                            .border_color(hex_color(if source_mode {
-                                kd::ACCENT
-                            } else {
-                                kd::BORDER_SUBTLE
-                            }))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap_1()
-                            .text_size(px(11.5))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(hex_color(if source_mode {
-                                kd::ACCENT_HOVER
-                            } else {
-                                kd::FG_SUBTLE
-                            }))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_note_source_mode(cx);
-                            }))
-                            .child(svg_icon(
-                                IconName::SquareTerminal,
-                                12.5,
-                                if source_mode {
-                                    kd::ACCENT_HOVER
-                                } else {
-                                    kd::FG_SUBTLE
-                                },
-                            ))
-                            .child(source_label),
-                    )
-                })
                 .child(
                     div()
                         .id("obs-more-btn")
