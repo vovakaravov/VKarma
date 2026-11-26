@@ -1008,6 +1008,7 @@ fn render_empty_tab_home(
                 .min_h_0()
                 .w_full()
                 .overflow_y_scroll()
+                .restrict_scroll_to_axis()
                 .track_scroll(&app.home_scroll)
                 .child(body),
         )
@@ -1116,8 +1117,9 @@ pub fn render_sidebar_drawer(
     window: &Window,
     cx: &mut Context<VKarmaMobileApp>,
 ) -> impl IntoElement {
-    let vp_w = f32::from(window.viewport_size().width) - app.safe_area.left - app.safe_area.right;
-    let drawer_w = (vp_w * 0.84).clamp(240.0, 316.0);
+    let drawer_w = app.drawer_width_for_window(window);
+    let progress = app.drawer_progress.clamp(0.0, 1.0);
+    let panel_x = -drawer_w * (1.0 - progress);
     let vault_name = app
         .vault_root
         .file_name()
@@ -1130,7 +1132,7 @@ pub fn render_sidebar_drawer(
     let active_path = app.active_note.as_ref().map(|n| n.path.clone());
     let app_weak: AnyWeakEntity = cx.entity().downgrade().into();
 
-    h_flex()
+    div()
         .id("obs-drawer-overlay")
         .size_full()
         .absolute()
@@ -1140,14 +1142,30 @@ pub fn render_sidebar_drawer(
         .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_scroll(|_, _, cx| cx.stop_propagation())
         .child(
+            div()
+                .id("obs-drawer-scrim")
+                .absolute()
+                .inset_0()
+                .bg(hex_alpha(0x00000092))
+                .opacity(progress)
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.toggle_drawer(false, window, cx);
+                })),
+        )
+        .child(
             v_flex()
                 .id("obs-drawer-panel")
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(panel_x))
                 .w(px(drawer_w))
-                .h_full()
-                .flex_shrink_0()
                 .bg(hex_color(kd::BG_SIDEBAR))
                 .border_r_1()
                 .border_color(hex_color(kd::BORDER))
+                .shadow_lg()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(|_, _, cx| cx.stop_propagation())
                 .child(
@@ -1529,30 +1547,7 @@ pub fn render_sidebar_drawer(
                         )
                         .when(app.safe_area.bottom > 0.0, |col| {
                             col.child(div().w_full().h(px(app.safe_area.bottom)))
-                        })
-                        .with_animation(
-                            "obs-drawer-slide",
-                            Animation::new(Duration::from_millis(220))
-                                .with_easing(ease_out_quint()),
-                            move |el, t| el.ml(px(-drawer_w * (1.0 - t))),
-                        ),
-                ),
-        )
-        .child(
-            div()
-                .id("obs-drawer-scrim")
-                .flex_1()
-                .h_full()
-                .bg(hex_alpha(0x00000092))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(|this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.toggle_drawer(false, window, cx);
-                }))
-                .with_animation(
-                    "obs-drawer-scrim-fade",
-                    Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
-                    |el, t| el.opacity(t),
+                        }),
                 ),
         )
 }

@@ -95,6 +95,31 @@ fn ensure_active_candidate(
 }
 
 #[derive(Debug, Clone)]
+pub struct DrawerSnapAnim {
+    pub from_progress: f32,
+    pub to_progress: f32,
+    pub started_at: Instant,
+    pub duration_ms: u64,
+    pub target_open: bool,
+}
+
+pub(crate) fn resolve_drawer_snap_open(
+    started_open: bool,
+    progress: f32,
+    vel_x: f32,
+    ended_cleanly: bool,
+) -> bool {
+    if !ended_cleanly {
+        return progress >= 0.5;
+    }
+    if !started_open {
+        progress >= 0.28 || (vel_x >= 320.0 && progress >= 0.04)
+    } else {
+        !(progress <= 0.72 || (vel_x <= -320.0 && progress <= 0.96))
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ActiveNote {
     pub path: PathBuf,
     pub title: String,
@@ -133,6 +158,12 @@ pub struct VKarmaMobileApp {
     pub history_forward: Vec<PathBuf>,
 
     pub drawer_open: bool,
+    pub drawer_progress: f32,
+    pub drawer_drag_active: bool,
+    pub drawer_drag_started_open: bool,
+    pub drawer_drag_vel_x: f32,
+    pub drawer_drag_last_at: Option<Instant>,
+    pub drawer_anim: Option<DrawerSnapAnim>,
     pub drawer_creating: Option<DrawerCreateKind>,
     pub drawer_target_dir: Option<PathBuf>,
 
@@ -379,6 +410,12 @@ impl VKarmaMobileApp {
             history_back: Vec::new(),
             history_forward: Vec::new(),
             drawer_open: false,
+            drawer_progress: 0.0,
+            drawer_drag_active: false,
+            drawer_drag_started_open: false,
+            drawer_drag_vel_x: 0.0,
+            drawer_drag_last_at: None,
+            drawer_anim: None,
             drawer_creating: None,
             drawer_target_dir: None,
             quick_switcher_open: false,
@@ -592,7 +629,7 @@ impl VKarmaMobileApp {
         self.flush_active_note_sync(cx);
         window.blur(cx);
         gpui_mobile::hide_keyboard();
-        self.drawer_open = false;
+        self.close_drawer_immediately();
         self.quick_switcher_open = false;
         self.more_sheet_open = false;
         self.new_note_modal_open = false;
@@ -611,7 +648,7 @@ impl VKarmaMobileApp {
         self.flush_active_note_sync(cx);
         window.blur(cx);
         gpui_mobile::hide_keyboard();
-        self.drawer_open = false;
+        self.close_drawer_immediately();
         self.quick_switcher_open = false;
         self.more_sheet_open = false;
         self.new_note_modal_open = false;
@@ -838,7 +875,7 @@ impl VKarmaMobileApp {
                     self.close_quick_switcher(window, cx);
                     return;
                 }
-                if self.drawer_open {
+                if self.is_drawer_visible() {
                     if self.drawer_creating.is_some() {
                         self.drawer_creating = None;
                         window.blur(cx);
@@ -877,41 +914,236 @@ impl VKarmaMobileApp {
         }
     }
 
-    pub fn has_modal_overlay(&self) -> bool {
+    pub fn drawer_width_for_window(&self, window: &Window) -> f32 {
+        let vp_w =
+            f32::from(window.viewport_size().width) - self.safe_area.left - self.safe_area.right;
+        (vp_w * 0.84).clamp(240.0, 316.0)
+    }
+
+    pub fn is_drawer_visible(&self) -> bool {
         self.drawer_open
-            || self.quick_switcher_open
+            || self.drawer_progress > 0.001
+            || self.drawer_drag_active
+            || self.drawer_anim.is_some()
+    }
+
+    pub fn has_non_drawer_modal_overlay(&self) -> bool {
+        self.quick_switcher_open
             || self.new_note_modal_open
             || self.more_sheet_open
             || self.item_context_menu.is_some()
             || self.folder_picker.is_some()
     }
 
-    pub fn toggle_drawer(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if open {
-            self.flush_active_note_sync(cx);
-            self.live_editor_focused = false;
-            window.blur(cx);
-            gpui_mobile::hide_keyboard();
-            self.quick_switcher_open = false;
-            self.more_sheet_open = false;
-            self.new_note_modal_open = false;
-            self.drawer_creating = None;
-            if self.drawer_target_dir.is_none() {
-                self.drawer_target_dir = self
-                    .active_note
-                    .as_ref()
-                    .and_then(|n| n.path.parent().map(Path::to_path_buf))
-                    .or_else(|| Some(self.vault_root.clone()));
+    pub fn has_modal_overlay(&self) -> bool {
+        self.is_drawer_visible() || self.has_non_drawer_modal_overlay()
+    }
+
+    fn prepare_drawer_for_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_active_note_sync(cx);
+        self.live_editor_focused = false;
+        window.blur(cx);
+        gpui_mobile::hide_keyboard();
+        self.quick_switcher_open = false;
+        self.more_sheet_open = false;
+        self.new_note_modal_open = false;
+        self.drawer_creating = None;
+        if self.drawer_target_dir.is_none() {
+            self.drawer_target_dir = self
+                .active_note
+                .as_ref()
+                .and_then(|n| n.path.parent().map(Path::to_path_buf))
+                .or_else(|| Some(self.vault_root.clone()));
+        }
+        self.rebuild_visible_tree(cx);
+    }
+
+    fn close_drawer_immediately(&mut self) {
+        self.drawer_open = false;
+        self.drawer_progress = 0.0;
+        self.drawer_drag_active = false;
+        self.drawer_drag_last_at = None;
+        self.drawer_anim = None;
+        self.drawer_creating = None;
+    }
+
+    pub fn start_drawer_snap(
+        &mut self,
+        target_open: bool,
+        vel_x: f32,
+        drawer_w: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let from = self.drawer_progress.clamp(0.0, 1.0);
+        let to = if target_open { 1.0 } else { 0.0 };
+        let dist = (to - from).abs();
+        if dist < 0.005 {
+            self.drawer_progress = to;
+            self.drawer_open = target_open;
+            self.drawer_anim = None;
+            if !target_open {
+                self.drawer_creating = None;
             }
-            self.rebuild_visible_tree(cx);
-            self.drawer_open = true;
+            cx.notify();
+            return;
+        }
+
+        let base_ms = (120.0 + 130.0 * dist).round() as u64;
+        let aligned = (to > from && vel_x > 200.0) || (to < from && vel_x < -200.0);
+        let duration_ms = if aligned {
+            let vel_ms = ((dist * drawer_w) / vel_x.abs() * 1000.0 * 1.45).clamp(110.0, 220.0);
+            base_ms.min(vel_ms.round() as u64)
+        } else {
+            base_ms
+        };
+
+        self.drawer_open = target_open;
+        self.drawer_anim = Some(DrawerSnapAnim {
+            from_progress: from,
+            to_progress: to,
+            started_at: Instant::now(),
+            duration_ms,
+            target_open,
+        });
+        cx.notify();
+    }
+
+    fn drive_drawer_anim_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(anim) = self.drawer_anim.clone() else {
+            return;
+        };
+        let raw = (anim.started_at.elapsed().as_secs_f32() * 1000.0
+            / anim.duration_ms.max(1) as f32)
+            .clamp(0.0, 1.0);
+        if raw >= 1.0 {
+            self.drawer_progress = anim.to_progress;
+            self.drawer_open = anim.target_open;
+            if !anim.target_open {
+                self.drawer_creating = None;
+            }
+            self.drawer_anim = None;
+            return;
+        }
+        let eased = 1.0 - (1.0 - raw).powi(5);
+        self.drawer_progress = anim.from_progress + (anim.to_progress - anim.from_progress) * eased;
+        let weak = cx.entity().downgrade();
+        window.on_next_frame(move |_, cx| {
+            let _ = weak.update(cx, |_, cx| cx.notify());
+        });
+    }
+
+    pub fn handle_drawer_scroll_gesture(
+        &mut self,
+        ev: &ScrollEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if ev.source != ScrollSource::Touch
+            || self.surface != AppSurface::Notes
+            || self.has_non_drawer_modal_overlay()
+        {
+            return false;
+        }
+
+        let delta = ev.delta.pixel_delta(px(24.));
+        let dx = f32::from(delta.x);
+        let dy = f32::from(delta.y);
+
+        let toolbar_visible = self
+            .active_note
+            .as_ref()
+            .is_some_and(|n| !n.reading_only)
+            && (self.live_editor_focused
+                || gpui_mobile::keyboard_height() > self.safe_area.bottom + 40.0);
+        if toolbar_visible && !self.is_drawer_visible() {
+            let tb_bounds = self.toolbar_scroll.bounds();
+            if tb_bounds.size.width > px(0.)
+                && tb_bounds.size.height > px(0.)
+                && tb_bounds.contains(&ev.position)
+            {
+                return false;
+            }
+        }
+
+        let drawer_w = self.drawer_width_for_window(window).max(1.0);
+        match ev.touch_phase {
+            TouchPhase::Started => {
+                if dx.abs() <= 0.01 || dx.abs() < dy.abs() * 1.5 {
+                    return false;
+                }
+                let visible = self.is_drawer_visible();
+                if !visible && dx <= 0.0 {
+                    return false;
+                }
+                if visible && dx >= 0.0 && self.drawer_progress >= 0.999 {
+                    return false;
+                }
+                if !visible {
+                    self.prepare_drawer_for_open(window, cx);
+                }
+                self.drawer_anim = None;
+                self.drawer_drag_active = true;
+                self.drawer_drag_started_open = self.drawer_progress >= 0.5;
+                self.drawer_progress = (self.drawer_progress + dx / drawer_w).clamp(0.0, 1.0);
+                self.drawer_drag_vel_x = 0.0;
+                self.drawer_drag_last_at = Some(Instant::now());
+                cx.notify();
+                true
+            }
+            TouchPhase::Moved => {
+                if self.drawer_drag_active {
+                    let now = Instant::now();
+                    if let Some(prev) = self.drawer_drag_last_at {
+                        let dt = now.duration_since(prev).as_secs_f32().max(0.004);
+                        let inst = dx / dt;
+                        self.drawer_drag_vel_x = self.drawer_drag_vel_x * 0.5 + inst * 0.5;
+                    }
+                    self.drawer_drag_last_at = Some(now);
+                    self.drawer_progress = (self.drawer_progress + dx / drawer_w).clamp(0.0, 1.0);
+                    cx.notify();
+                    true
+                } else {
+                    dx.abs() > 0.01 && dy.abs() <= 0.01
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                if self.drawer_drag_active {
+                    let ended = ev.touch_phase == TouchPhase::Ended;
+                    if ended && dx.abs() > 0.01 {
+                        self.drawer_progress =
+                            (self.drawer_progress + dx / drawer_w).clamp(0.0, 1.0);
+                    }
+                    let target_open = resolve_drawer_snap_open(
+                        self.drawer_drag_started_open,
+                        self.drawer_progress,
+                        self.drawer_drag_vel_x,
+                        ended,
+                    );
+                    let vel_x = self.drawer_drag_vel_x;
+                    self.drawer_drag_active = false;
+                    self.drawer_drag_last_at = None;
+                    self.start_drawer_snap(target_open, vel_x, drawer_w, cx);
+                    true
+                } else {
+                    dx.abs() > 0.01 && dy.abs() <= 0.01
+                }
+            }
+        }
+    }
+
+    pub fn toggle_drawer(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.drawer_drag_active = false;
+        self.drawer_drag_last_at = None;
+        let drawer_w = self.drawer_width_for_window(window);
+        if open {
+            self.prepare_drawer_for_open(window, cx);
+            self.start_drawer_snap(true, 0.0, drawer_w, cx);
         } else {
             window.blur(cx);
             gpui_mobile::hide_keyboard();
-            self.drawer_open = false;
             self.drawer_creating = None;
+            self.start_drawer_snap(false, 0.0, drawer_w, cx);
         }
-        cx.notify();
     }
 
     pub fn toggle_tree_dir(&mut self, rel_path: String, cx: &mut Context<Self>) {
@@ -936,7 +1168,7 @@ impl VKarmaMobileApp {
         cx: &mut Context<Self>,
     ) {
         self.flush_active_note_sync(cx);
-        self.drawer_open = false;
+        self.close_drawer_immediately();
         self.more_sheet_open = false;
         self.new_note_modal_open = false;
         self.quick_switcher_open = true;
@@ -1102,8 +1334,15 @@ impl VKarmaMobileApp {
 
                 this.expand_ancestors_for_path(&path);
                 this.drawer_target_dir = path.parent().map(Path::to_path_buf);
-                this.drawer_open = false;
-                this.drawer_creating = None;
+                if this.is_drawer_visible() {
+                    let dw = this.drawer_width_for_window(window);
+                    this.drawer_creating = None;
+                    this.drawer_drag_active = false;
+                    this.drawer_drag_last_at = None;
+                    this.start_drawer_snap(false, -650.0, dw, cx);
+                } else {
+                    this.close_drawer_immediately();
+                }
                 this.quick_switcher_open = false;
                 this.more_sheet_open = false;
                 this.rename_mode = false;
@@ -1400,7 +1639,7 @@ impl VKarmaMobileApp {
 
     pub fn open_new_note_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.flush_active_note_sync(cx);
-        self.drawer_open = false;
+        self.close_drawer_immediately();
         self.quick_switcher_open = false;
         self.more_sheet_open = false;
         self.new_note_modal_open = true;
@@ -1834,6 +2073,10 @@ impl VKarmaMobileApp {
         self.context_rename_mode = false;
         self.context_delete_armed = false;
         self.drawer_open = true;
+        self.drawer_progress = 1.0;
+        self.drawer_anim = None;
+        self.drawer_drag_active = false;
+        self.drawer_drag_last_at = None;
         self.start_drawer_create(kind, window, cx);
     }
 }
@@ -1849,8 +2092,10 @@ impl Render for VKarmaMobileApp {
             }
         }
         self.safe_area = Self::query_safe_area();
+        self.drive_drawer_anim_frame(window, cx);
         let kb_height = gpui_mobile::keyboard_height();
         let bottom_inset = self.safe_area.bottom.max(kb_height);
+        let swipe_entity = cx.entity().downgrade();
 
         let top_bg = crate::theme::kd::BG_DEEP;
 
@@ -1889,6 +2134,29 @@ impl Render for VKarmaMobileApp {
                     .flex()
                     .flex_col()
                     .child(
+                        canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, _cx| {
+                                let app_swipe = swipe_entity.clone();
+                                window.on_mouse_event(move |ev: &ScrollEvent, phase, window, cx| {
+                                    if phase != DispatchPhase::Capture {
+                                        return;
+                                    }
+                                    let _ = app_swipe.update(cx, |this, cx| {
+                                        if this.drawer_drag_active || bounds.contains(&ev.position)
+                                        {
+                                            if this.handle_drawer_scroll_gesture(ev, window, cx) {
+                                                cx.stop_propagation();
+                                            }
+                                        }
+                                    });
+                                });
+                            },
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+                    .child(
                         div()
                             .flex_1()
                             .min_h_0()
@@ -1898,7 +2166,7 @@ impl Render for VKarmaMobileApp {
                             .child(body),
                     )
                     .when(
-                        self.surface == AppSurface::Notes && self.drawer_open,
+                        self.surface == AppSurface::Notes && self.is_drawer_visible(),
                         |frame| {
                             frame.child(notes_view::render_sidebar_drawer(
                                 self, window, cx,
@@ -1954,5 +2222,26 @@ impl Render for VKarmaMobileApp {
                         ))
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_drawer_snap_open;
+
+    #[test]
+    fn resolve_drawer_snap_open_handles_drags_flicks_and_cancellations() {
+        assert!(!resolve_drawer_snap_open(false, 0.20, 40.0, true));
+        assert!(resolve_drawer_snap_open(false, 0.30, 0.0, true));
+        assert!(resolve_drawer_snap_open(false, 0.06, 420.0, true));
+        assert!(!resolve_drawer_snap_open(false, 0.02, 500.0, true));
+
+        assert!(resolve_drawer_snap_open(true, 0.80, -40.0, true));
+        assert!(!resolve_drawer_snap_open(true, 0.70, 0.0, true));
+        assert!(!resolve_drawer_snap_open(true, 0.94, -420.0, true));
+        assert!(resolve_drawer_snap_open(true, 0.98, -500.0, true));
+
+        assert!(!resolve_drawer_snap_open(false, 0.40, 800.0, false));
+        assert!(resolve_drawer_snap_open(true, 0.60, -800.0, false));
     }
 }
