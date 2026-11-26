@@ -1051,6 +1051,7 @@ impl LiveMarkdownEditor {
 
         let sub_focus = cx.on_focus(&focus_handle, window, |this, _, cx| {
             this.reset_caret_blink();
+            this.sync_ime_context(true);
             cx.emit(LiveEditorEvent::FocusChanged(true));
             cx.notify();
         });
@@ -1148,6 +1149,18 @@ impl LiveMarkdownEditor {
 
     pub fn is_focused(&self, window: &Window) -> bool {
         self.focus_handle.is_focused(window)
+    }
+
+    fn sync_ime_context(&self, configure_mode: bool) {
+        if self.read_only || self.doc.marked_range.is_some() {
+            return;
+        }
+        let (before, after) = crate::ime_surrounding_context(&self.doc.text, self.doc.head);
+        if configure_mode {
+            crate::configure_android_ime(crate::AndroidImeMode::Prose, &before, &after, true);
+        } else {
+            crate::sync_android_ime_context(&before, &after);
+        }
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1276,6 +1289,7 @@ impl LiveMarkdownEditor {
         }
         self.focus_handle.focus(window, cx);
         self.reset_caret_blink();
+        self.sync_ime_context(false);
         cx.notify();
     }
 
@@ -1292,6 +1306,7 @@ impl LiveMarkdownEditor {
             self.preferred_x = None;
             self.ensure_caret_visible();
             self.reset_caret_blink();
+            self.sync_ime_context(false);
             cx.emit(LiveEditorEvent::Changed);
             cx.notify();
         }
@@ -1971,6 +1986,14 @@ impl EntityInputHandler for LiveMarkdownEditor {
             self.doc.replace_range(marked, text, EditKind::Atomic);
         } else if text == "\n" {
             self.doc.smart_enter();
+            self.sync_height_table_after_edit();
+            self.preferred_x = None;
+            self.ensure_caret_visible();
+            self.reset_caret_blink();
+            self.sync_ime_context(false);
+            cx.emit(LiveEditorEvent::Changed);
+            cx.notify();
+            return;
         } else {
             if text.is_empty() && !self.doc.has_selection() {
                 return;
@@ -2426,6 +2449,7 @@ impl Render for LiveMarkdownEditor {
                         this.sync_height_table_after_edit();
                         this.focus_handle.focus(window, cx);
                         this.reset_caret_blink();
+                        this.sync_ime_context(false);
                         cx.emit(LiveEditorEvent::Changed);
                         cx.notify();
                         return;
@@ -2472,6 +2496,7 @@ impl Render for LiveMarkdownEditor {
                     }
                     this.ensure_caret_visible();
                     this.reset_caret_blink();
+                    this.sync_ime_context(false);
                     cx.notify();
                 }),
             )

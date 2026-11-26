@@ -98,6 +98,108 @@ pub fn minimize_android_app() {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AndroidImeMode {
+    Prose = 0,
+    Title = 1,
+    Search = 2,
+    Plain = 3,
+}
+
+pub fn ime_surrounding_context(text: &str, cursor_byte: usize) -> (String, String) {
+    let mut cur = cursor_byte.min(text.len());
+    while cur > 0 && !text.is_char_boundary(cur) {
+        cur -= 1;
+    }
+    let before_slice = &text[..cur];
+    let before_start = before_slice
+        .char_indices()
+        .rev()
+        .nth(159)
+        .map(|(ix, _)| ix)
+        .unwrap_or(0);
+    let after_slice = &text[cur..];
+    let after_end = after_slice
+        .char_indices()
+        .nth(64)
+        .map(|(ix, _)| ix)
+        .unwrap_or(after_slice.len());
+    (
+        before_slice[before_start..].to_string(),
+        after_slice[..after_end].to_string(),
+    )
+}
+
+#[cfg(target_os = "android")]
+pub fn configure_android_ime(
+    mode: AndroidImeMode,
+    before: &str,
+    after: &str,
+    restart_if_open: bool,
+) {
+    use gpui_mobile::android::jni as gpui_jni;
+    use jni::objects::JValue;
+    if let Err(err) = gpui_jni::with_env(|env| {
+        let activity = gpui_jni::activity(env)?;
+        let j_before = env.new_string(before).map_err(|e| e.to_string())?;
+        let j_after = env.new_string(after).map_err(|e| e.to_string())?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiConfigureIme"),
+            jni::jni_sig!("(ILjava/lang/String;Ljava/lang/String;Z)V"),
+            &[
+                JValue::Int(mode as i32),
+                JValue::Object(&j_before),
+                JValue::Object(&j_after),
+                JValue::Bool(restart_if_open),
+            ],
+        )
+        .map(drop)
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })
+    }) {
+        log::warn!("VKarma Mobile: configure_android_ime failed: {err}");
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn configure_android_ime(
+    _mode: AndroidImeMode,
+    _before: &str,
+    _after: &str,
+    _restart_if_open: bool,
+) {
+}
+
+#[cfg(target_os = "android")]
+pub fn sync_android_ime_context(before: &str, after: &str) {
+    use gpui_mobile::android::jni as gpui_jni;
+    use jni::objects::JValue;
+    if let Err(err) = gpui_jni::with_env(|env| {
+        let activity = gpui_jni::activity(env)?;
+        let j_before = env.new_string(before).map_err(|e| e.to_string())?;
+        let j_after = env.new_string(after).map_err(|e| e.to_string())?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiSyncImeContext"),
+            jni::jni_sig!("(Ljava/lang/String;Ljava/lang/String;)V"),
+            &[JValue::Object(&j_before), JValue::Object(&j_after)],
+        )
+        .map(drop)
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })
+    }) {
+        log::warn!("VKarma Mobile: sync_android_ime_context failed: {err}");
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn sync_android_ime_context(_before: &str, _after: &str) {}
+
 #[cfg(not(target_os = "android"))]
 pub fn minimize_android_app() {}
 
@@ -190,4 +292,27 @@ pub fn android_main(app: android_activity::AndroidApp) {
     });
 
     log::info!("VKarma Mobile android_main event loop finished");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ime_surrounding_context;
+
+    #[test]
+    fn ime_surrounding_context_slices_utf8_safely() {
+        assert_eq!(
+            ime_surrounding_context("Hello мир", 6),
+            ("Hello ".to_string(), "мир".to_string())
+        );
+        assert_eq!(
+            ime_surrounding_context("Hello мир", 7),
+            ("Hello ".to_string(), "мир".to_string())
+        );
+        let prefix = "а".repeat(200);
+        let suffix = "😀".repeat(80);
+        let combined = format!("{prefix}{suffix}");
+        let (b, a) = ime_surrounding_context(&combined, prefix.len());
+        assert_eq!(b.chars().count(), 160);
+        assert_eq!(a.chars().count(), 64);
+    }
 }

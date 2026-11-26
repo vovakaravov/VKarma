@@ -245,8 +245,12 @@ impl VKarmaMobileApp {
         let mut subs = Vec::new();
 
         subs.push(
-            cx.subscribe_in(&drawer_filter_input, window, |this, _, ev, window, cx| match ev {
-                InputEvent::Focus => {}
+            cx.subscribe_in(&drawer_filter_input, window, |this, inp, ev, window, cx| match ev {
+                InputEvent::Focus => {
+                    let val = inp.read(cx).value().to_string();
+                    let (b, a) = crate::ime_surrounding_context(&val, val.len());
+                    crate::configure_android_ime(crate::AndroidImeMode::Search, &b, &a, true);
+                }
                 InputEvent::Blur => {}
                 InputEvent::Change => {
                     this.rebuild_visible_tree(cx);
@@ -260,15 +264,25 @@ impl VKarmaMobileApp {
         );
 
         subs.push(
-            cx.subscribe_in(&drawer_create_input, window, |this, _, ev, window, cx| match ev {
-                InputEvent::Focus | InputEvent::Blur | InputEvent::Change => {}
+            cx.subscribe_in(&drawer_create_input, window, |this, inp, ev, window, cx| match ev {
+                InputEvent::Focus => {
+                    let val = inp.read(cx).value().to_string();
+                    let (b, a) = crate::ime_surrounding_context(&val, val.len());
+                    crate::configure_android_ime(crate::AndroidImeMode::Title, &b, &a, true);
+                }
+                InputEvent::Blur | InputEvent::Change => {}
                 InputEvent::PressEnter { .. } => this.submit_drawer_create(window, cx),
             }),
         );
 
         subs.push(
             cx.subscribe_in(&quick_switcher_input, window, |this, inp, ev, window, cx| match ev {
-                InputEvent::Focus | InputEvent::Blur => {}
+                InputEvent::Focus => {
+                    let val = inp.read(cx).value().to_string();
+                    let (b, a) = crate::ime_surrounding_context(&val, val.len());
+                    crate::configure_android_ime(crate::AndroidImeMode::Search, &b, &a, true);
+                }
+                InputEvent::Blur => {}
                 InputEvent::Change => {
                     let q = inp.read(cx).value().to_string();
                     this.on_quick_switcher_query_changed(q, cx);
@@ -293,15 +307,25 @@ impl VKarmaMobileApp {
         );
 
         subs.push(
-            cx.subscribe_in(&new_note_input, window, |this, _, ev, window, cx| match ev {
-                InputEvent::Focus | InputEvent::Blur | InputEvent::Change => {}
+            cx.subscribe_in(&new_note_input, window, |this, inp, ev, window, cx| match ev {
+                InputEvent::Focus => {
+                    let val = inp.read(cx).value().to_string();
+                    let (b, a) = crate::ime_surrounding_context(&val, val.len());
+                    crate::configure_android_ime(crate::AndroidImeMode::Title, &b, &a, true);
+                }
+                InputEvent::Blur | InputEvent::Change => {}
                 InputEvent::PressEnter { .. } => this.submit_new_note_modal(window, cx),
             }),
         );
 
         subs.push(
-            cx.subscribe_in(&rename_note_input, window, |this, _, ev, window, cx| match ev {
-                InputEvent::Focus | InputEvent::Blur | InputEvent::Change => {}
+            cx.subscribe_in(&rename_note_input, window, |this, inp, ev, window, cx| match ev {
+                InputEvent::Focus => {
+                    let val = inp.read(cx).value().to_string();
+                    let (b, a) = crate::ime_surrounding_context(&val, val.len());
+                    crate::configure_android_ime(crate::AndroidImeMode::Title, &b, &a, true);
+                }
+                InputEvent::Blur | InputEvent::Change => {}
                 InputEvent::PressEnter { .. } => {
                     if this.context_rename_mode {
                         this.submit_context_rename(window, cx);
@@ -347,8 +371,13 @@ impl VKarmaMobileApp {
             }),
         );
 
-        subs.push(cx.subscribe_in(&note_find_input, window, |_, _, ev, window, cx| match ev {
-            InputEvent::Focus | InputEvent::Blur => {}
+        subs.push(cx.subscribe_in(&note_find_input, window, |_, inp, ev, window, cx| match ev {
+            InputEvent::Focus => {
+                let val = inp.read(cx).value().to_string();
+                let (b, a) = crate::ime_surrounding_context(&val, val.len());
+                crate::configure_android_ime(crate::AndroidImeMode::Search, &b, &a, true);
+            }
+            InputEvent::Blur => {}
             InputEvent::PressEnter { .. } => {
                 window.blur(cx);
                 gpui_mobile::hide_keyboard();
@@ -358,9 +387,14 @@ impl VKarmaMobileApp {
         }));
 
         subs.push(
-            cx.subscribe_in(&folder_picker_input, window, |this, _, ev, window, cx| {
+            cx.subscribe_in(&folder_picker_input, window, |this, inp, ev, window, cx| {
                 match ev {
-                    InputEvent::Focus | InputEvent::Blur | InputEvent::Change => {}
+                    InputEvent::Focus => {
+                        let val = inp.read(cx).value().to_string();
+                        let (b, a) = crate::ime_surrounding_context(&val, val.len());
+                        crate::configure_android_ime(crate::AndroidImeMode::Plain, &b, &a, true);
+                    }
+                    InputEvent::Blur | InputEvent::Change => {}
                     InputEvent::PressEnter { .. } => {
                         this.apply_folder_picker_input(window, cx);
                     }
@@ -1182,6 +1216,7 @@ impl VKarmaMobileApp {
         self.switcher_scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.quick_switcher_input
             .update(cx, |inp, cx| inp.focus(window, cx));
+        crate::configure_android_ime(crate::AndroidImeMode::Search, "", "", true);
         gpui_mobile::show_keyboard();
         cx.notify();
     }
@@ -1675,6 +1710,7 @@ impl VKarmaMobileApp {
             .update(cx, |inp, cx| inp.set_value("", window, cx));
         self.new_note_input
             .update(cx, |inp, cx| inp.focus(window, cx));
+        crate::configure_android_ime(crate::AndroidImeMode::Title, "", "", true);
         gpui_mobile::show_keyboard();
         cx.notify();
     }
@@ -1696,6 +1732,7 @@ impl VKarmaMobileApp {
             .update(cx, |inp, cx| inp.set_value("", window, cx));
         self.drawer_create_input
             .update(cx, |inp, cx| inp.focus(window, cx));
+        crate::configure_android_ime(crate::AndroidImeMode::Title, "", "", true);
         gpui_mobile::show_keyboard();
         cx.notify();
     }
@@ -1742,10 +1779,12 @@ impl VKarmaMobileApp {
         };
         let cur_title = note.title.clone();
         self.rename_mode = true;
+        let (b, a) = crate::ime_surrounding_context(&cur_title, cur_title.len());
         self.rename_note_input
             .update(cx, |inp, cx| inp.set_value(cur_title, window, cx));
         self.rename_note_input
             .update(cx, |inp, cx| inp.focus(window, cx));
+        crate::configure_android_ime(crate::AndroidImeMode::Title, &b, &a, true);
         gpui_mobile::show_keyboard();
         cx.notify();
     }
@@ -1833,10 +1872,12 @@ impl VKarmaMobileApp {
         };
         self.context_rename_mode = true;
         self.context_delete_armed = false;
+        let (b, a) = crate::ime_surrounding_context(&cur_name, cur_name.len());
         self.rename_note_input
             .update(cx, |inp, cx| inp.set_value(cur_name, window, cx));
         self.rename_note_input
             .update(cx, |inp, cx| inp.focus(window, cx));
+        crate::configure_android_ime(crate::AndroidImeMode::Title, &b, &a, true);
         gpui_mobile::show_keyboard();
         cx.notify();
     }
