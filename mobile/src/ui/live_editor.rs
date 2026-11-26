@@ -1961,9 +1961,27 @@ impl EntityInputHandler for LiveMarkdownEditor {
     }
 }
 
+fn compute_context_menu_y(sel_top: f32, sel_bottom: f32, menu_h: f32, vp_h: f32) -> f32 {
+    let above_gap = 16.0_f32;
+    let below_gap = 32.0_f32;
+    let max_y = (vp_h - menu_h - 8.0).max(8.0);
+    if sel_top - menu_h - above_gap >= 8.0 {
+        sel_top - menu_h - above_gap
+    } else if sel_bottom + below_gap + menu_h <= vp_h - 8.0 {
+        sel_bottom + below_gap
+    } else if sel_top > (vp_h - sel_bottom) {
+        8.0
+    } else {
+        max_y
+    }
+}
+
 impl Render for LiveMarkdownEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let show_menu = self.context_menu_open && !self.interaction_blocked;
+        let show_menu = self.context_menu_open
+            && !self.interaction_blocked
+            && !self.touch_selecting
+            && self.dragging_handle.is_none();
         if !show_menu {
             *self.context_menu_bounds.borrow_mut() = None;
         }
@@ -1979,11 +1997,29 @@ impl Render for LiveMarkdownEditor {
             let vp_h = f32::from(bounds.size.height).max(200.0);
             let has_sel = self.doc.has_selection();
 
-            let mut menu_x = (vp_w * 0.5 - 150.0).max(8.0);
+            let (est_w, menu_h) = {
+                let b = self.context_menu_bounds.borrow();
+                match *b {
+                    Some(rect) if f32::from(rect.size.height) > 18.0 => (
+                        f32::from(rect.size.width).clamp(120.0, (vp_w - 16.0).max(120.0)),
+                        f32::from(rect.size.height),
+                    ),
+                    _ => (
+                        if has_sel {
+                            (vp_w - 16.0).min(336.0)
+                        } else {
+                            180.0_f32.min((vp_w - 16.0).max(120.0))
+                        },
+                        46.0,
+                    ),
+                }
+            };
+
+            let mut menu_x = ((vp_w - est_w) * 0.5).clamp(8.0, (vp_w - est_w - 8.0).max(8.0));
             let mut menu_y = 24.0_f32;
             if has_sel {
                 let sel = self.doc.selection_range();
-                if let Some((sp, _)) =
+                if let Some((sp, slh)) =
                     self.visual_point_for_byte(sel.start, bounds, col_left_rel, top_pad, scroll_y)
                 {
                     let rel_sx = f32::from(sp.x - bounds.origin.x);
@@ -2001,39 +2037,35 @@ impl Render for LiveMarkdownEditor {
                         }
                         _ => vp_w * 0.5,
                     };
-                    let est_w = (vp_w - 16.0).min(336.0);
+                    let sel_top = rel_sy;
+                    let sel_bottom = ep_opt
+                        .map(|(ep, elh)| f32::from(ep.y - bounds.origin.y) + elh)
+                        .unwrap_or(rel_sy + slh);
                     menu_x = (center_x - est_w * 0.5).clamp(8.0, (vp_w - est_w - 8.0).max(8.0));
-                    menu_y = if rel_sy >= 68.0 {
-                        rel_sy - 56.0
-                    } else if let Some((ep, elh)) = ep_opt {
-                        f32::from(ep.y - bounds.origin.y) + elh + 26.0
-                    } else {
-                        rel_sy + 44.0
-                    }
-                    .clamp(8.0, (vp_h - 86.0).max(8.0));
+                    menu_y = compute_context_menu_y(sel_top, sel_bottom, menu_h, vp_h);
                 } else if let Some(anchor) = self.context_menu_anchor {
-                    let est_w = (vp_w - 16.0).min(336.0);
+                    let ay = f32::from(anchor.y - bounds.origin.y);
                     menu_x = (f32::from(anchor.x - bounds.origin.x) - est_w * 0.5)
                         .clamp(8.0, (vp_w - est_w - 8.0).max(8.0));
-                    menu_y = (f32::from(anchor.y - bounds.origin.y) - 60.0)
-                        .clamp(8.0, (vp_h - 86.0).max(8.0));
+                    menu_y = compute_context_menu_y(ay, ay + 24.0, menu_h, vp_h);
                 }
             } else if let Some(anchor) = self.context_menu_anchor {
-                let est_w = 180.0_f32.min((vp_w - 16.0).max(120.0));
+                let ay = f32::from(anchor.y - bounds.origin.y);
                 menu_x = (f32::from(anchor.x - bounds.origin.x) - est_w * 0.5)
                     .clamp(8.0, (vp_w - est_w - 8.0).max(8.0));
-                menu_y = (f32::from(anchor.y - bounds.origin.y) - 52.0)
-                    .clamp(8.0, (vp_h - 60.0).max(8.0));
+                menu_y = compute_context_menu_y(ay, ay + 24.0, menu_h, vp_h);
             }
 
             let menu_btn = |id: &'static str,
                             label: &'static str,
                             accent: bool,
+                            bold_style: bool,
+                            italic_style: bool,
                             on_click: Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>| {
                 div()
                     .id(id)
                     .h(px(32.))
-                    .px_2p5()
+                    .px_2()
                     .rounded(px(7.))
                     .cursor_pointer()
                     .bg(hex_color(if accent { kd::ACCENT } else { kd::BG_PANEL }))
@@ -2047,13 +2079,20 @@ impl Render for LiveMarkdownEditor {
                     .items_center()
                     .justify_center()
                     .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(if bold_style {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::SEMIBOLD
+                    })
+                    .when(italic_style, |el| el.italic())
                     .text_color(hex_color(if accent { kd::BG_MAIN } else { kd::FG }))
                     .on_click(move |ev, window, cx| on_click(ev, window, cx))
                     .child(label)
             };
 
             let bounds_tracker = self.context_menu_bounds.clone();
+            let ed_resize = cx.entity().clone();
+            let assumed_h = menu_h;
             let mut row = div()
                 .id("live-ed-ctx-menu")
                 .relative()
@@ -2075,8 +2114,20 @@ impl Render for LiveMarkdownEditor {
                 .on_click(|_, _, cx| cx.stop_propagation())
                 .child(
                     canvas(
-                        move |b, _, _| {
-                            *bounds_tracker.borrow_mut() = Some(b);
+                        move |b, window, _| {
+                            let h_now = f32::from(b.size.height);
+                            let mut slot = bounds_tracker.borrow_mut();
+                            let needs_relayout = match *slot {
+                                Some(prev) => (f32::from(prev.size.height) - h_now).abs() > 2.0,
+                                None => (h_now - assumed_h).abs() > 2.0,
+                            };
+                            *slot = Some(b);
+                            if needs_relayout {
+                                let ed_next = ed_resize.clone();
+                                window.on_next_frame(move |_, cx| {
+                                    let _ = ed_next.update(cx, |_, cx| cx.notify());
+                                });
+                            }
                         },
                         |_, _, _, _| {},
                     )
@@ -2090,6 +2141,8 @@ impl Render for LiveMarkdownEditor {
                         "ed-ctx-hl",
                         "Highlight",
                         true,
+                        false,
+                        false,
                         Box::new(cx.listener(|this, _, _, cx| {
                             this.toggle_highlight_selection(cx);
                         })),
@@ -2098,6 +2151,8 @@ impl Render for LiveMarkdownEditor {
                 row = row.child(menu_btn(
                     "ed-ctx-copy",
                     "Copy",
+                    false,
+                    false,
                     false,
                     Box::new(cx.listener(|this, _, _, cx| {
                         this.copy_selection(cx);
@@ -2109,6 +2164,8 @@ impl Render for LiveMarkdownEditor {
                             "ed-ctx-cut",
                             "Cut",
                             false,
+                            false,
+                            false,
                             Box::new(cx.listener(|this, _, _, cx| {
                                 this.cut_selection(cx);
                             })),
@@ -2117,13 +2174,17 @@ impl Render for LiveMarkdownEditor {
                             "ed-ctx-paste",
                             "Paste",
                             false,
+                            false,
+                            false,
                             Box::new(cx.listener(|this, _, _, cx| {
                                 this.paste_from_clipboard(cx);
                             })),
                         ))
                         .child(menu_btn(
                             "ed-ctx-bold",
-                            "Bold",
+                            "B",
+                            false,
+                            true,
                             false,
                             Box::new(cx.listener(|this, _, window, cx| {
                                 this.context_menu_open = false;
@@ -2132,8 +2193,10 @@ impl Render for LiveMarkdownEditor {
                         ))
                         .child(menu_btn(
                             "ed-ctx-italic",
-                            "Italic",
+                            "I",
                             false,
+                            false,
+                            true,
                             Box::new(cx.listener(|this, _, window, cx| {
                                 this.context_menu_open = false;
                                 this.apply_format(MarkdownFormatAction::Italic, window, cx);
@@ -2143,6 +2206,8 @@ impl Render for LiveMarkdownEditor {
                 row = row.child(menu_btn(
                     "ed-ctx-all",
                     "All",
+                    false,
+                    false,
                     false,
                     Box::new(cx.listener(|this, _, _, cx| {
                         this.select_all_text(cx);
@@ -2154,6 +2219,8 @@ impl Render for LiveMarkdownEditor {
                         "ed-ctx-paste",
                         "Paste",
                         false,
+                        false,
+                        false,
                         Box::new(cx.listener(|this, _, _, cx| {
                             this.paste_from_clipboard(cx);
                         })),
@@ -2161,6 +2228,8 @@ impl Render for LiveMarkdownEditor {
                     .child(menu_btn(
                         "ed-ctx-all",
                         "Select All",
+                        false,
+                        false,
                         false,
                         Box::new(cx.listener(|this, _, _, cx| {
                             this.select_all_text(cx);
@@ -3219,6 +3288,7 @@ impl Element for LiveCanvasElement {
                     }
                     TouchPhase::Ended | TouchPhase::Cancelled => {
                         if ed.dragging_handle.take().is_some() {
+                            ed.context_menu_open = ed.doc.has_selection();
                             cx.stop_propagation();
                             cx.notify();
                         }
@@ -3226,5 +3296,36 @@ impl Element for LiveCanvasElement {
                 }
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_context_menu_y;
+
+    #[test]
+    fn context_menu_never_overlaps_selection_or_handles() {
+        // Mid-screen selection: strictly above sel_top with >= 16px clearance
+        for menu_h in [46.0_f32, 86.0_f32] {
+            let sel_top = 260.0;
+            let sel_bottom = 284.0;
+            let y = compute_context_menu_y(sel_top, sel_bottom, menu_h, 720.0);
+            assert!(
+                y + menu_h <= sel_top - 16.0 + 1e-3,
+                "expected menu bottom ({}) <= {} for menu_h={menu_h}",
+                y + menu_h,
+                sel_top - 16.0
+            );
+        }
+
+        // Top-of-screen selection: placed strictly below selection + handles (>= 32px clearance)
+        let sel_top = 20.0;
+        let sel_bottom = 44.0;
+        let y_below = compute_context_menu_y(sel_top, sel_bottom, 46.0, 720.0);
+        assert!(y_below >= sel_bottom + 32.0 - 1e-3);
+
+        // Near-full-screen selection: clamped inside viewport [8.0, vp_h - menu_h - 8.0]
+        let y_full = compute_context_menu_y(10.0, 705.0, 46.0, 720.0);
+        assert!(y_full >= 8.0 && y_full <= 720.0 - 46.0 - 8.0);
     }
 }
