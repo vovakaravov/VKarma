@@ -21,12 +21,19 @@ android {
     namespace = "dev.vkarma.mobile"
     compileSdk = 34
 
+    val appVersionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull()
+        ?: System.getenv("ANDROID_VERSION_CODE")?.toIntOrNull()
+        ?: 1
+    val appVersionName = (project.findProperty("versionName") as String?)
+        ?: System.getenv("ANDROID_VERSION_NAME")
+        ?: "0.1.0"
+
     defaultConfig {
         applicationId = "dev.vkarma.mobile"
         minSdk = 26          // Vulkan 1.0 is mandatory from API 26+
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = appVersionCode
+        versionName = appVersionName
 
         // Tell NativeActivity which .so to load.
         // This must match the [lib] name in Cargo.toml.
@@ -38,8 +45,31 @@ android {
         manifestPlaceholders["nativeLibraryName"] = "vkarma_mobile"
     }
 
+    val releaseKeystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
+    val releaseKeystorePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+    val releaseKeyAlias = System.getenv("ANDROID_KEY_ALIAS")
+    val releaseKeyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+    val hasReleaseSigning = !releaseKeystorePath.isNullOrBlank()
+        && !releaseKeystorePassword.isNullOrBlank()
+        && !releaseKeyAlias.isNullOrBlank()
+        && !releaseKeyPassword.isNullOrBlank()
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(releaseKeystorePath!!)
+                storePassword = releaseKeystorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),

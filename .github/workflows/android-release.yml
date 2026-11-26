@@ -1,0 +1,129 @@
+name: Android Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: false
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-android:
+    name: Build & Publish Signed APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve version metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="${{ github.event.inputs.tag || 'v0.1.0' }}"
+          fi
+          VERSION_NAME="${TAG#v}"
+          BASE_VER="${VERSION_NAME%%-*}"
+          IFS='.' read -r MAJOR MINOR PATCH _ <<< "${BASE_VER}"
+          if [[ "${MAJOR:-}" =~ ^[0-9]+$ && "${MINOR:-}" =~ ^[0-9]+$ && "${PATCH:-}" =~ ^[0-9]+$ ]]; then
+            VERSION_CODE=$(( 10#$MAJOR * 10000 + 10#$MINOR * 100 + 10#$PATCH ))
+          else
+            VERSION_CODE=$(( GITHUB_RUN_NUMBER + 10 ))
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version_name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Rust (aarch64-linux-android)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Cargo dependencies & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "mobile -> mobile/target"
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@cargo-ndk
+
+      - name: Install Android NDK 27 & SDK 34
+        shell: bash
+        run: |
+          set +o pipefail
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          set -o pipefail
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;27.2.12479018" \
+            "platforms;android-34" \
+            "build-tools;34.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build libvkarma_mobile.so (arm64-v8a release)
+        working-directory: mobile
+        run: |
+          rm -rf android/app/src/main/jniLibs
+          ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018" \
+            cargo ndk -t arm64-v8a -P 31 -o android/app/src/main/jniLibs build --release
+
+      - name: Assemble & sign release APK
+        id: apk
+        working-directory: mobile/android
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PATH: /tmp/vk-release.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_VERSION_CODE: ${{ steps.meta.outputs.version_code }}
+          ANDROID_VERSION_NAME: ${{ steps.meta.outputs.version_name }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$ANDROID_KEYSTORE_PATH"
+          chmod 600 "$ANDROID_KEYSTORE_PATH"
+          ./gradlew assembleRelease
+          RAW_APK="app/build/outputs/apk/release/app-release.apk"
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose "$RAW_APK"
+          OUT_APK="/tmp/vkarma-${ANDROID_VERSION_NAME}-arm64-v8a.apk"
+          cp "$RAW_APK" "$OUT_APK"
+          echo "apk_path=${OUT_APK}" >> "$GITHUB_OUTPUT"
+
+      - name: Clean up temporary keystore
+        if: always()
+        shell: bash
+        run: rm -f /tmp/vk-release.jks
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          APK_PATH: ${{ steps.apk.outputs.apk_path }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "$APK_PATH" --clobber
+          else
+            gh release create "$TAG" "$APK_PATH" \
+              --target "$GITHUB_SHA" \
+              --title "VKarma $TAG" \
+              --generate-notes
+          fi
