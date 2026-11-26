@@ -124,6 +124,7 @@ pub struct StyledSpan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OffsetSegment {
     Verbatim { raw: Range<usize>, disp: Range<usize> },
+    Replaced { raw: Range<usize>, disp: Range<usize> },
     Hidden { raw: Range<usize>, disp_pos: usize },
 }
 
@@ -184,6 +185,12 @@ impl ProjectedLine {
                         return clamp_char_boundary(&self.display_text, d);
                     }
                 }
+                OffsetSegment::Replaced { raw, disp } => {
+                    if rb >= raw.start && rb <= raw.end {
+                        let d = if rb == raw.start { disp.start } else { disp.end };
+                        return clamp_char_boundary(&self.display_text, d);
+                    }
+                }
                 OffsetSegment::Hidden { raw, disp_pos } => {
                     if rb >= raw.start && rb <= raw.end {
                         return clamp_char_boundary(&self.display_text, *disp_pos);
@@ -198,12 +205,16 @@ impl ProjectedLine {
     pub fn display_to_raw(&self, raw_line: &str, disp_byte: usize) -> usize {
         let db = disp_byte.min(self.display_text.len());
         for seg in &self.segments {
-            if let OffsetSegment::Verbatim { raw, disp } = seg
-                && db >= disp.start
-                && db <= disp.end
-            {
-                let r = raw.start + (db - disp.start);
-                return clamp_char_boundary(raw_line, r);
+            match seg {
+                OffsetSegment::Verbatim { raw, disp } if db >= disp.start && db <= disp.end => {
+                    let r = raw.start + (db - disp.start);
+                    return clamp_char_boundary(raw_line, r);
+                }
+                OffsetSegment::Replaced { raw, disp } if db >= disp.start && db <= disp.end => {
+                    let r = if db == disp.start { raw.start } else { raw.end };
+                    return clamp_char_boundary(raw_line, r);
+                }
+                _ => {}
             }
         }
         for seg in &self.segments {
@@ -570,6 +581,38 @@ impl<'a> ProjectionBuilder<'a> {
                 disp: disp_start..disp_end,
             });
         }
+
+        self.raw_pos = end;
+    }
+
+    fn push_replaced(&mut self, raw_len: usize, replacement: &str, style: InlineStyle) {
+        if raw_len == 0 {
+            return;
+        }
+        let end = clamp_char_boundary(self.raw, self.raw_pos + raw_len);
+        if end <= self.raw_pos {
+            return;
+        }
+        let disp_start = self.display_text.len();
+        self.display_text.push_str(replacement);
+        let disp_end = self.display_text.len();
+
+        if let Some(last) = self.spans.last_mut()
+            && last.style == style
+            && last.range.end == disp_start
+        {
+            last.range.end = disp_end;
+        } else {
+            self.spans.push(StyledSpan {
+                range: disp_start..disp_end,
+                style,
+            });
+        }
+
+        self.segments.push(OffsetSegment::Replaced {
+            raw: self.raw_pos..end,
+            disp: disp_start..disp_end,
+        });
 
         self.raw_pos = end;
     }
@@ -1406,6 +1449,39 @@ fn emit_inline(
             continue;
         }
 
+        // 9. Bare URLs: keep verbatim so hyphens inside URLs never turn into em dashes.
+        if rem.starts_with("http://") || rem.starts_with("https://") {
+            let url_len = rem
+                .find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\''))
+                .unwrap_or(rem.len());
+            b.push_verbatim(url_len.max(1), base);
+            continue;
+        }
+
+        // 10. Double hyphen `--` -> em dash `—` (preserving `---`, HTML comments, and `--` under cursor).
+        if bytes[0] == b'-' {
+            let dash_len = bytes.iter().take_while(|&&c| c == b'-').count();
+            let prev_is_dash = i > 0 && raw.as_bytes()[i - 1] == b'-';
+            let is_html_comment_open =
+                i >= 2 && raw.as_bytes().get(i - 2..i) == Some(b"<!");
+            let is_html_comment_close =
+                dash_len == 2 && raw.as_bytes().get(i + 2) == Some(&b'>');
+            if dash_len == 2
+                && !prev_is_dash
+                && !is_html_comment_open
+                && !is_html_comment_close
+            {
+                if range_touched(cursor, i, i + 2) {
+                    b.push_verbatim(2, base);
+                } else {
+                    b.push_replaced(2, "—", base);
+                }
+            } else {
+                b.push_verbatim(dash_len, base);
+            }
+            continue;
+        }
+
         // Plain character run up to next interesting ASCII marker.
         let ch = rem.chars().next().unwrap();
         let mut step = ch.len_utf8();
@@ -1413,8 +1489,14 @@ fn emit_inline(
             let b0 = raw.as_bytes()[i + step];
             if matches!(
                 b0,
-                b'\\' | b'`' | b'[' | b'*' | b'_' | b'~' | b'='
+                b'\\' | b'`' | b'[' | b'*' | b'_' | b'~' | b'=' | b'-'
             ) {
+                break;
+            }
+            if b0 == b'h'
+                && (raw[i + step..limit].starts_with("http://")
+                    || raw[i + step..limit].starts_with("https://"))
+            {
                 break;
             }
             let next_ch = raw[i + step..limit].chars().next().unwrap();
@@ -3991,5 +4073,43 @@ mod tests {
         assert!(buf.apply_mobile_format(MarkdownFormatAction::Wikilink));
         assert_eq!(buf.text, "Hello world[[]]");
         assert_eq!(buf.head, "Hello world[[".len());
+    }
+
+    #[test]
+    fn projects_double_hyphen_as_em_dash_and_reveals_when_cursor_touches() {
+        // Read mode (cursor = None) and Live Edit when cursor is away: `--` -> `—`
+        let line = "Wait -- what? Not --- or `a--b` or https://example.com/a--b or \\--!";
+        let ctx = LineBlockContext::Paragraph;
+        let read_proj = project_line(line, &ctx, None);
+        assert_eq!(
+            read_proj.display_text,
+            "Wait — what? Not --- or a--b or https://example.com/a--b or --!"
+        );
+        // Raw byte right after `--` maps to right after `—` (1 char, 3 UTF-8 bytes)
+        let em_start_raw = line.find("--").unwrap();
+        let em_end_raw = em_start_raw + 2;
+        let em_start_disp = read_proj.display_text.find('—').unwrap();
+        let em_end_disp = em_start_disp + '—'.len_utf8();
+        assert_eq!(read_proj.raw_to_display(em_start_raw), em_start_disp);
+        assert_eq!(read_proj.raw_to_display(em_end_raw), em_end_disp);
+        assert_eq!(read_proj.display_to_raw(line, em_start_disp), em_start_raw);
+        assert_eq!(read_proj.display_to_raw(line, em_end_disp), em_end_raw);
+        // Plain text after `--` round-trips cleanly
+        let what_raw = line.find("what").unwrap();
+        let what_disp = read_proj.display_text.find("what").unwrap();
+        assert_eq!(read_proj.raw_to_display(what_raw), what_disp);
+        assert_eq!(read_proj.display_to_raw(line, what_disp), what_raw);
+
+        // Live Edit when cursor touches `--`: reveals raw `--`
+        let edit_touch = project_line(line, &ctx, Some(em_start_raw..em_start_raw));
+        assert!(edit_touch.display_text.starts_with("Wait -- what?"));
+
+        // HTML comment delimiters remain verbatim
+        let comment = project_line("<!-- note -->", &ctx, None);
+        assert_eq!(comment.display_text, "<!-- note -->");
+
+        // Bold formatting + em dash work together
+        let bold_dash = project_line("**Hello--World**", &ctx, None);
+        assert_eq!(bold_dash.display_text, "Hello—World");
     }
 }
